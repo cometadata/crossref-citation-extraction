@@ -141,7 +141,7 @@ JSONL with one record per arXiv work, sorted by citation count:
 
 Same format as invert output, split into valid and failed files based on whether the arXiv DOI could be verified.
 
-## ArXiv ID Patterns
+## arXiv ID Patterns
 
 The extractor recognizes these arXiv identifier formats:
 
