@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod common;
 mod extract;
+mod index;
 mod streaming;
 
 use anyhow::Result;
