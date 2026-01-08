@@ -1,4 +1,42 @@
 use clap::{Parser, Subcommand};
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Source {
+    #[default]
+    All,
+    Crossref,
+    Datacite,
+    Arxiv,
+}
+
+impl FromStr for Source {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "all" => Ok(Source::All),
+            "crossref" => Ok(Source::Crossref),
+            "datacite" => Ok(Source::Datacite),
+            "arxiv" => Ok(Source::Arxiv),
+            _ => Err(format!(
+                "Invalid source: {}. Valid options: all, crossref, datacite, arxiv",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::All => write!(f, "all"),
+            Source::Crossref => write!(f, "crossref"),
+            Source::Datacite => write!(f, "datacite"),
+            Source::Arxiv => write!(f, "arxiv"),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "crossref-arxiv-citation-extraction")]
