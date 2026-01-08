@@ -39,8 +39,8 @@ impl std::fmt::Display for Source {
 }
 
 #[derive(Parser)]
-#[command(name = "crossref-arxiv-citation-extraction")]
-#[command(about = "Extract, invert, and validate arXiv references from Crossref data using fused streaming")]
+#[command(name = "crossref-citation-extraction")]
+#[command(about = "Extract, invert, and validate DOI references from Crossref data")]
 #[command(version = "2.0.0")]
 pub struct Cli {
     #[command(subcommand)]
@@ -49,17 +49,14 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Run the full pipeline: fused convert+extract+invert -> validate
+    /// Run the full pipeline: extract DOIs, invert by cited work, validate
     ///
-    /// This command streams through the Crossref tar.gz archive, extracts arXiv
-    /// references inline, partitions by arXiv ID, and inverts in parallel.
-    /// Finally validates against DataCite records.
+    /// Streams through the Crossref tar.gz archive, extracts DOI references,
+    /// partitions by DOI prefix, inverts in parallel, and validates against
+    /// source-specific records.
     Pipeline(PipelineArgs),
 
-    /// Validate arXiv citations against DataCite records and DOI resolution
-    ///
-    /// Use this to validate a previously generated JSONL file without
-    /// re-running the full pipeline.
+    /// Validate citations against records without re-running extraction
     Validate(ValidateArgs),
 }
 
@@ -148,21 +145,33 @@ pub struct PipelineArgs {
 
 #[derive(Parser, Clone)]
 pub struct ValidateArgs {
-    /// Input arxiv_citations.jsonl file
+    /// Input citations JSONL file
     #[arg(short, long, required = true)]
     pub input: String,
 
-    /// DataCite records.jsonl.gz file
-    #[arg(short, long, required = true)]
-    pub records: String,
+    /// DataCite records.jsonl.gz file (for datacite/arxiv validation)
+    #[arg(long)]
+    pub datacite_records: Option<String>,
 
-    /// Output file for valid DOIs
-    #[arg(long, default_value = "arxiv_citations_valid.jsonl")]
+    /// Crossref DOI index Parquet file (for crossref validation)
+    #[arg(long)]
+    pub crossref_index: Option<String>,
+
+    /// Source type of the input file: crossref, datacite, arxiv
+    #[arg(long, required = true)]
+    pub source: Source,
+
+    /// Output file for valid citations
+    #[arg(long, required = true)]
     pub output_valid: String,
 
-    /// Output file for failed DOIs
-    #[arg(long, default_value = "arxiv_citations_failed.jsonl")]
+    /// Output file for failed citations
+    #[arg(long, required = true)]
     pub output_failed: String,
+
+    /// Enable HTTP fallback validation
+    #[arg(long, default_value = "false")]
+    pub http_fallback: bool,
 
     /// Concurrent HTTP requests
     #[arg(short, long, default_value = "50")]
