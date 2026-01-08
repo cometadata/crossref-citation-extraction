@@ -4,13 +4,12 @@ CLI for extracting and validating arXiv references from Crossref data files.
 
 ## Overview
 
-This tool processes Crossref snapshot data to identify works that cite arXiv preprints, then validates those citations against DataCite records and DOI resolution.
+This tool processes Crossref snapshot data to identify works that cite arXiv preprints, then validates those citations against DataCite records and DOI resolution. It works by:
 
-The pipeline uses fused streaming to process large snapshots efficiently:
-1. Stream through the tar.gz, extracting arXiv references inline
-2. Partition by arXiv ID prefix for parallel processing
-3. Invert to aggregate citations by arXiv work
-4. Validate against DataCite records and DOI resolution
+1. Streaming through the data file tar.gz, extracting arXiv references inline
+2. Partition by arXiv ID prefix to allow for parallel processing
+3. Inverting the data to aggregate citations by arXiv work
+4. Finally, validating against DataCite records in the DataCite data file and through DOI resolution
 
 ## Building
 
@@ -81,7 +80,7 @@ One record per arXiv work, sorted by citation count:
 }
 ```
 
-## ArXiv ID Patterns
+## arXiv ID Patterns
 
 The extractor recognizes these arXiv identifier formats:
 
