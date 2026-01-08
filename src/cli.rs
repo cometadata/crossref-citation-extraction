@@ -2,8 +2,8 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "crossref-arxiv-citation-extraction")]
-#[command(about = "Unified CLI for extracting, inverting, and validating arXiv references from Crossref data")]
-#[command(version = "1.0.0")]
+#[command(about = "Extract, invert, and validate arXiv references from Crossref data using fused streaming")]
+#[command(version = "2.0.0")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -11,77 +11,61 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Convert Crossref tar.gz to Parquet with flattened references
-    Convert(ConvertArgs),
-
-    /// Extract arXiv references from Parquet file (vectorized using Polars)
-    Extract(ExtractArgs),
-
-    /// Invert arXiv reference relationships: map arXiv IDs to citing DOIs (using Polars)
-    Invert(InvertArgs),
+    /// Run the full pipeline: fused convert+extract+invert -> validate
+    ///
+    /// This command streams through the Crossref tar.gz archive, extracts arXiv
+    /// references inline, partitions by arXiv ID, and inverts in parallel.
+    /// Finally validates against DataCite records.
+    Pipeline(PipelineArgs),
 
     /// Validate arXiv citations against DataCite records and DOI resolution
+    ///
+    /// Use this to validate a previously generated JSONL file without
+    /// re-running the full pipeline.
     Validate(ValidateArgs),
-
-    /// Run the full pipeline: convert -> extract -> invert -> validate
-    Pipeline(PipelineArgs),
 }
 
 #[derive(Parser, Clone)]
-pub struct ConvertArgs {
+pub struct PipelineArgs {
     /// Path to the Crossref snapshot tar.gz file
     #[arg(short, long, required = true)]
     pub input: String,
 
-    /// Output Parquet file
-    #[arg(short, long, default_value = "references.parquet")]
+    /// DataCite records.jsonl.gz file for validation
+    #[arg(short, long, required = true)]
+    pub records: String,
+
+    /// Output file for valid arXiv citations (JSONL)
+    #[arg(short, long, default_value = "arxiv_citations_valid.jsonl")]
     pub output: String,
 
-    /// Row group size for Parquet output
-    #[arg(long, default_value = "250000")]
-    pub row_group_size: usize,
+    /// Output file for failed validations (optional)
+    #[arg(long)]
+    pub output_failed: Option<String>,
 
-    /// Batch size (number of references) for chunked processing to limit memory usage
+    /// Logging level (DEBUG, INFO, WARN, ERROR)
+    #[arg(short, long, default_value = "INFO")]
+    pub log_level: String,
+
+    /// Concurrent HTTP requests for validation
+    #[arg(short, long, default_value = "50")]
+    pub concurrency: usize,
+
+    /// Timeout in seconds per validation request
+    #[arg(long, default_value = "5")]
+    pub timeout: u64,
+
+    /// Keep intermediate files (partitions, temp parquet) instead of deleting them
+    #[arg(long, default_value = "false")]
+    pub keep_intermediates: bool,
+
+    /// Directory for intermediate partition files (default: system temp)
+    #[arg(long)]
+    pub temp_dir: Option<String>,
+
+    /// Batch size for memory management during streaming (affects flush frequency)
     #[arg(long, default_value = "5000000")]
     pub batch_size: usize,
-
-    /// Logging level (DEBUG, INFO, WARN, ERROR)
-    #[arg(short, long, default_value = "INFO")]
-    pub log_level: String,
-}
-
-#[derive(Parser, Clone)]
-pub struct ExtractArgs {
-    /// Input Parquet file from convert step
-    #[arg(short, long, required = true)]
-    pub input: String,
-
-    /// Output Parquet file with extracted arXiv IDs
-    #[arg(short, long, default_value = "extracted.parquet")]
-    pub output: String,
-
-    /// Logging level (DEBUG, INFO, WARN, ERROR)
-    #[arg(short, long, default_value = "INFO")]
-    pub log_level: String,
-}
-
-#[derive(Parser, Clone)]
-pub struct InvertArgs {
-    /// Input Parquet file from extract step
-    #[arg(short, long, required = true)]
-    pub input: String,
-
-    /// Output Parquet file with inverted citations
-    #[arg(short, long, default_value = "inverted.parquet")]
-    pub output: String,
-
-    /// Logging level (DEBUG, INFO, WARN, ERROR)
-    #[arg(short, long, default_value = "INFO")]
-    pub log_level: String,
-
-    /// Also output as JSONL for compatibility with validate step
-    #[arg(long)]
-    pub output_jsonl: Option<String>,
 }
 
 #[derive(Parser, Clone)]
@@ -113,47 +97,4 @@ pub struct ValidateArgs {
     /// Logging level (DEBUG, INFO, WARN, ERROR)
     #[arg(short, long, default_value = "INFO")]
     pub log_level: String,
-}
-
-#[derive(Parser, Clone)]
-pub struct PipelineArgs {
-    /// Path to the Crossref snapshot tar.gz file
-    #[arg(short, long, required = true)]
-    pub input: String,
-
-    /// DataCite records.jsonl.gz file for validation
-    #[arg(short, long, required = true)]
-    pub records: String,
-
-    /// Output file for valid arXiv citations
-    #[arg(short, long, default_value = "arxiv_citations_valid.jsonl")]
-    pub output: String,
-
-    /// Also output failed validations to this file (optional)
-    #[arg(long)]
-    pub output_failed: Option<String>,
-
-    /// Logging level (DEBUG, INFO, WARN, ERROR)
-    #[arg(short, long, default_value = "INFO")]
-    pub log_level: String,
-
-    /// Concurrent HTTP requests for validation
-    #[arg(short, long, default_value = "50")]
-    pub concurrency: usize,
-
-    /// Timeout in seconds per validation request
-    #[arg(long, default_value = "5")]
-    pub timeout: u64,
-
-    /// Keep intermediate files instead of deleting them
-    #[arg(long, default_value = "false")]
-    pub keep_intermediates: bool,
-
-    /// Directory for intermediate files (default: system temp)
-    #[arg(long)]
-    pub temp_dir: Option<String>,
-
-    /// Batch size (number of references) for chunked processing in convert step
-    #[arg(long, default_value = "5000000")]
-    pub batch_size: usize,
 }
