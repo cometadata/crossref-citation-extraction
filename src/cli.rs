@@ -70,16 +70,56 @@ pub struct PipelineArgs {
     pub input: String,
 
     /// DataCite records.jsonl.gz file for validation
-    #[arg(short, long, required = true)]
-    pub records: String,
-
-    /// Output file for valid arXiv citations (JSONL)
-    #[arg(short, long, default_value = "arxiv_citations_valid.jsonl")]
-    pub output: String,
-
-    /// Output file for failed validations (optional)
     #[arg(long)]
-    pub output_failed: Option<String>,
+    pub datacite_records: Option<String>,
+
+    /// Source to extract: all, crossref, datacite, arxiv
+    #[arg(long, default_value = "all")]
+    pub source: Source,
+
+    /// Output file for Crossref citations (JSONL)
+    #[arg(long)]
+    pub output_crossref: Option<String>,
+
+    /// Output file for DataCite citations (JSONL)
+    #[arg(long)]
+    pub output_datacite: Option<String>,
+
+    /// Output file for arXiv citations (JSONL, arxiv mode only)
+    #[arg(long)]
+    pub output_arxiv: Option<String>,
+
+    /// Output file for failed Crossref validations
+    #[arg(long)]
+    pub output_crossref_failed: Option<String>,
+
+    /// Output file for failed DataCite validations
+    #[arg(long)]
+    pub output_datacite_failed: Option<String>,
+
+    /// Output file for failed arXiv validations
+    #[arg(long)]
+    pub output_arxiv_failed: Option<String>,
+
+    /// Enable HTTP fallback for specified sources (comma-separated: crossref,datacite)
+    #[arg(long, value_delimiter = ',')]
+    pub http_fallback: Vec<String>,
+
+    /// Load Crossref DOI index from Parquet file
+    #[arg(long)]
+    pub load_crossref_index: Option<String>,
+
+    /// Save Crossref DOI index to Parquet file
+    #[arg(long)]
+    pub save_crossref_index: Option<String>,
+
+    /// Load DataCite DOI index from Parquet file
+    #[arg(long)]
+    pub load_datacite_index: Option<String>,
+
+    /// Save DataCite DOI index to Parquet file
+    #[arg(long)]
+    pub save_datacite_index: Option<String>,
 
     /// Logging level (DEBUG, INFO, WARN, ERROR)
     #[arg(short, long, default_value = "INFO")]
@@ -93,7 +133,7 @@ pub struct PipelineArgs {
     #[arg(long, default_value = "5")]
     pub timeout: u64,
 
-    /// Keep intermediate files (partitions, temp parquet) instead of deleting them
+    /// Keep intermediate files (partitions, temp parquet)
     #[arg(long, default_value = "false")]
     pub keep_intermediates: bool,
 
@@ -101,7 +141,7 @@ pub struct PipelineArgs {
     #[arg(long)]
     pub temp_dir: Option<String>,
 
-    /// Batch size for memory management during streaming (affects flush frequency)
+    /// Batch size for memory management during streaming
     #[arg(long, default_value = "5000000")]
     pub batch_size: usize,
 }
