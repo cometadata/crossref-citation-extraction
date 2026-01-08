@@ -163,7 +163,7 @@ fn run_fused_convert_extract(
     progress_callback: impl Fn(usize, usize),
 ) -> Result<FusedStats> {
     let start = Instant::now();
-    info!("Opening tar.gz archive: {}", input_path);
+    info!("Streaming Crossref snapshot and extracting arXiv references: {}", input_path);
 
     let tar_file = File::open(input_path)
         .with_context(|| format!("Failed to open input file: {}", input_path))?;
@@ -331,7 +331,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
     // Phase 1: Fused Convert + Extract (if not already complete)
     if checkpoint.phase == PipelinePhase::ConvertExtract {
         info!("");
-        info!("=== PHASE 1/3: Fused Convert + Extract + Partition ===");
+        info!("=== Extracting arXiv references ===");
         info!("");
 
         let flush_threshold = args.batch_size / 50; // ~100K rows per partition flush
@@ -348,7 +348,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
 
         stats.fused = fused_stats;
 
-        info!("Phase 1 complete:");
+        info!("Extraction complete:");
         info!("  JSON files processed: {}", stats.fused.json_files_processed);
         info!("  Total records: {}", stats.fused.total_records);
         info!("  Total references: {}", stats.fused.total_references);
@@ -359,7 +359,12 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
         checkpoint.start_invert_phase();
         checkpoint.save(&ctx.checkpoint_path)?;
     } else {
-        info!("Resuming from phase: {:?}", checkpoint.phase);
+        let phase_name = match checkpoint.phase {
+            PipelinePhase::ConvertExtract => "extraction",
+            PipelinePhase::Invert => "aggregation",
+            PipelinePhase::Complete => "complete",
+        };
+        info!("Resuming from checkpoint ({})", phase_name);
         // Restore stats from checkpoint
         stats.fused = FusedStats {
             json_files_processed: checkpoint.stats.json_files_processed,
@@ -374,7 +379,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
     // Phase 2: Parallel Partition Invert
     if checkpoint.phase == PipelinePhase::Invert {
         info!("");
-        info!("=== PHASE 2/3: Parallel Partition Invert ===");
+        info!("=== Aggregating citations by arXiv work ===");
         info!("");
 
         let invert_stats = invert_partitions(
@@ -386,7 +391,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
 
         stats.invert = invert_stats;
 
-        info!("Phase 2 complete:");
+        info!("Aggregation complete:");
         info!("  Partitions processed: {}", stats.invert.partitions_processed);
         info!("  Unique arXiv works: {}", stats.invert.unique_arxiv_works);
         info!("  Total citations: {}", stats.invert.total_citations);
@@ -397,7 +402,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
 
     // Phase 3: Validate (optional, but part of original pipeline)
     info!("");
-    info!("=== PHASE 3/3: Validating citations ===");
+    info!("=== Validating arXiv DOIs ===");
     info!("");
 
     let validate_args = ValidateArgs {
@@ -418,7 +423,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
 
     setup_logging(&args.log_level)?;
 
-    info!("Phase 3 complete:");
+    info!("Validation complete:");
     info!("  Matched in DataCite: {}", validate_stats.matched_in_datacite);
     info!("  Resolution resolved: {}", validate_stats.resolution_resolved);
     info!("  Resolution failed: {}", validate_stats.resolution_failed);
@@ -443,20 +448,20 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
     info!("==================== PIPELINE COMPLETE ====================");
     info!("Total execution time: {}", format_elapsed(total_time));
     info!("");
-    info!("Fused Convert+Extract:");
+    info!("Extraction:");
     info!("  JSON files processed: {}", stats.fused.json_files_processed);
     info!("  Total records scanned: {}", stats.fused.total_records);
     info!("  Total references: {}", stats.fused.total_references);
     info!("  References with matches: {}", stats.fused.references_with_matches);
     info!("  Total arXiv IDs extracted: {}", stats.fused.total_arxiv_ids_extracted);
     info!("");
-    info!("Invert:");
+    info!("Aggregation:");
     info!("  Partitions processed: {}", stats.invert.partitions_processed);
     info!("  Unique arXiv works: {}", stats.invert.unique_arxiv_works);
     info!("  Total citations: {}", stats.invert.total_citations);
     info!("");
     if let Some(ref vs) = stats.validate {
-        info!("Validate:");
+        info!("Validation:");
         info!("  Matched in DataCite: {}", vs.matched_in_datacite);
         info!("  Total valid: {}", vs.total_valid);
         info!("  Total failed: {}", vs.total_failed);
