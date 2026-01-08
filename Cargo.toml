@@ -30,6 +30,18 @@ futures = "0.3"
 regex = "1.10"
 lazy_static = "1.4"
 
+# DataFrame processing (vectorized operations)
+polars = { version = "0.46", features = [
+    "lazy",
+    "parquet",
+    "regex",
+    "strings",
+    "streaming",
+    "dtype-struct",
+    "concat_str",
+    "list_eval",
+] }
+
 # Logging
 log = "0.4"
 simple_logger = "5.0"
@@ -45,6 +57,9 @@ anyhow = "1.0"
 
 # UUID for temp file naming
 uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

@@ -4,11 +4,13 @@ CLI for extracting and validating arXiv references from Crossref data files.
 
 ## Overview
 
-This tool processes Crossref snapshot data to identify works that cite arXiv preprints, then validates those citations against DataCite records and DOI resolution. The pipeline consists of three steps:
+This tool processes Crossref snapshot data to identify works that cite arXiv preprints, then validates those citations against DataCite records and DOI resolution.
 
-1. **Extract** - Scan Crossref snapshot for references containing arXiv identifiers
-2. **Invert** - Transform from "DOI → arXiv refs" to "arXiv DOI → citing DOIs"
-3. **Validate** - Verify arXiv DOIs exist in DataCite or resolve via doi.org
+The pipeline uses fused streaming to process large snapshots efficiently:
+1. Stream through the tar.gz, extracting arXiv references inline
+2. Partition by arXiv ID prefix for parallel processing
+3. Invert to aggregate citations by arXiv work
+4. Validate against DataCite records and DOI resolution
 
 ## Building
 
@@ -20,9 +22,9 @@ The binary will be at `target/release/crossref-arxiv-citation-extraction`.
 
 ## Usage
 
-### Full Pipeline
+### Pipeline
 
-Run all three steps automatically with intermediate file management:
+Run the full extraction and validation pipeline:
 
 ```bash
 crossref-arxiv-citation-extraction pipeline \
@@ -31,53 +33,17 @@ crossref-arxiv-citation-extraction pipeline \
   --output arxiv_citations_valid.jsonl
 ```
 
-With all options:
-
-```bash
-crossref-arxiv-citation-extraction pipeline \
-  --input crossref-snapshot.tar.gz \
-  --records datacite-records.jsonl.gz \
-  --output arxiv_citations_valid.jsonl \
-  --output-failed arxiv_citations_failed.jsonl \
-  --threads 8 \
-  --batch-size 1000 \
-  --concurrency 100 \
-  --timeout 10 \
-  --keep-intermediates \
-  --temp-dir /tmp/pipeline \
-  --log-level INFO
-```
-
-### Individual Commands
-
-#### Extract
-
-Scan a Crossref snapshot tar.gz for DOIs that reference arXiv works:
-
-```bash
-crossref-arxiv-citation-extraction extract \
-  --input crossref-snapshot.tar.gz \
-  --output arxiv_references.jsonl
-```
-
 Options:
-- `--threads` - Number of threads (0 = auto-detect)
-- `--batch-size` - Records per batch for parallel processing (default: 1000)
-- `--stats-interval` - Seconds between progress logs (default: 60)
+- `--output-failed` - Output file for failed validations
+- `--concurrency` - Concurrent HTTP requests for validation (default: 50)
+- `--timeout` - Seconds per validation request (default: 5)
+- `--keep-intermediates` - Keep partition files after completion
+- `--temp-dir` - Directory for intermediate files (default: system temp)
+- `--batch-size` - Batch size for memory management (default: 5000000)
 
-#### Invert
+### Validate
 
-Transform extract output to map arXiv DOIs to their citing works:
-
-```bash
-crossref-arxiv-citation-extraction invert \
-  --input arxiv_references.jsonl \
-  --output arxiv_citations.jsonl
-```
-
-#### Validate
-
-Validate arXiv DOIs against DataCite records and DOI resolution:
+Validate a previously generated JSONL file without re-running the full pipeline:
 
 ```bash
 crossref-arxiv-citation-extraction validate \
@@ -91,31 +57,9 @@ Options:
 - `--concurrency` - Concurrent HTTP requests (default: 50)
 - `--timeout` - Seconds per request (default: 5)
 
-## Output Formats
+## Output Format
 
-### Extract Output
-
-JSONL with one record per citing DOI:
-
-```json
-{
-  "doi": "10.1234/example.paper",
-  "arxiv_matches": [
-    {
-      "id": "2403.03542",
-      "raw": "arXiv:2403.03542",
-      "arxiv_doi": "10.48550/arXiv.2403.03542"
-    }
-  ],
-  "references": [
-    {"unstructured": "Smith J. (2024). arXiv:2403.03542", "key": "ref1"}
-  ]
-}
-```
-
-### Invert Output
-
-JSONL with one record per arXiv work, sorted by citation count:
+One record per arXiv work, sorted by citation count:
 
 ```json
 {
@@ -137,11 +81,7 @@ JSONL with one record per arXiv work, sorted by citation count:
 }
 ```
 
-### Validate Output
-
-Same format as invert output, split into valid and failed files based on whether the arXiv DOI could be verified.
-
-## arXiv ID Patterns
+## ArXiv ID Patterns
 
 The extractor recognizes these arXiv identifier formats:
 
