@@ -41,6 +41,10 @@ pub struct ConvertArgs {
     #[arg(long, default_value = "250000")]
     pub row_group_size: usize,
 
+    /// Batch size (number of references) for chunked processing to limit memory usage
+    #[arg(long, default_value = "5000000")]
+    pub batch_size: usize,
+
     /// Logging level (DEBUG, INFO, WARN, ERROR)
     #[arg(short, long, default_value = "INFO")]
     pub log_level: String,
@@ -148,4 +152,8 @@ pub struct PipelineArgs {
     /// Directory for intermediate files (default: system temp)
     #[arg(long)]
     pub temp_dir: Option<String>,
+
+    /// Batch size (number of references) for chunked processing in convert step
+    #[arg(long, default_value = "5000000")]
+    pub batch_size: usize,
 }

@@ -12,33 +12,115 @@ use tar::Archive;
 use crate::cli::ConvertArgs;
 use crate::common::{create_spinner, format_elapsed, setup_logging, ConvertStats};
 
+/// Holds a batch of reference data for efficient memory management
+struct ReferenceBatch {
+    citing_dois: Vec<String>,
+    ref_indices: Vec<u32>,
+    ref_dois: Vec<Option<String>>,
+    ref_unstructureds: Vec<Option<String>>,
+    ref_article_titles: Vec<Option<String>>,
+    ref_journal_titles: Vec<Option<String>>,
+    ref_urls: Vec<Option<String>>,
+    ref_jsons: Vec<Option<String>>,
+    has_arxiv_hints: Vec<bool>,
+}
+
+impl ReferenceBatch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            citing_dois: Vec::with_capacity(capacity),
+            ref_indices: Vec::with_capacity(capacity),
+            ref_dois: Vec::with_capacity(capacity),
+            ref_unstructureds: Vec::with_capacity(capacity),
+            ref_article_titles: Vec::with_capacity(capacity),
+            ref_journal_titles: Vec::with_capacity(capacity),
+            ref_urls: Vec::with_capacity(capacity),
+            ref_jsons: Vec::with_capacity(capacity),
+            has_arxiv_hints: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.citing_dois.len()
+    }
+
+    fn clear(&mut self) {
+        self.citing_dois.clear();
+        self.ref_indices.clear();
+        self.ref_dois.clear();
+        self.ref_unstructureds.clear();
+        self.ref_article_titles.clear();
+        self.ref_journal_titles.clear();
+        self.ref_urls.clear();
+        self.ref_jsons.clear();
+        self.has_arxiv_hints.clear();
+    }
+
+    fn to_dataframe(&self) -> Result<DataFrame> {
+        DataFrame::new(vec![
+            Column::new("citing_doi".into(), &self.citing_dois),
+            Column::new("ref_index".into(), &self.ref_indices),
+            Column::new("ref_doi".into(), &self.ref_dois),
+            Column::new("ref_unstructured".into(), &self.ref_unstructureds),
+            Column::new("ref_article_title".into(), &self.ref_article_titles),
+            Column::new("ref_journal_title".into(), &self.ref_journal_titles),
+            Column::new("ref_url".into(), &self.ref_urls),
+            Column::new("ref_json".into(), &self.ref_jsons),
+            Column::new("has_arxiv_hint".into(), &self.has_arxiv_hints),
+        ])
+        .map_err(|e| anyhow::anyhow!("Failed to create DataFrame: {}", e))
+    }
+}
+
+/// Create schema for consistent Parquet output
+fn create_output_schema() -> Schema {
+    Schema::from_iter([
+        Field::new("citing_doi".into(), DataType::String),
+        Field::new("ref_index".into(), DataType::UInt32),
+        Field::new("ref_doi".into(), DataType::String),
+        Field::new("ref_unstructured".into(), DataType::String),
+        Field::new("ref_article_title".into(), DataType::String),
+        Field::new("ref_journal_title".into(), DataType::String),
+        Field::new("ref_url".into(), DataType::String),
+        Field::new("ref_json".into(), DataType::String),
+        Field::new("has_arxiv_hint".into(), DataType::Boolean),
+    ])
+}
+
 pub fn run_convert(args: ConvertArgs) -> Result<ConvertStats> {
     let start_time = Instant::now();
 
     setup_logging(&args.log_level)?;
 
-    info!("Starting Crossref → Parquet Conversion");
+    info!("Starting Crossref -> Parquet Conversion (Batched Mode)");
     info!("Input: {}", args.input);
     info!("Output: {}", args.output);
+    info!("Batch size: {} references", args.batch_size);
 
     if !Path::new(&args.input).exists() {
         return Err(anyhow::anyhow!("Input file does not exist: {}", args.input));
     }
 
-    let mut citing_dois: Vec<String> = Vec::new();
-    let mut ref_indices: Vec<u32> = Vec::new();
-    let mut ref_dois: Vec<Option<String>> = Vec::new();
-    let mut ref_unstructureds: Vec<Option<String>> = Vec::new();
-    let mut ref_article_titles: Vec<Option<String>> = Vec::new();
-    let mut ref_journal_titles: Vec<Option<String>> = Vec::new();
-    let mut ref_urls: Vec<Option<String>> = Vec::new();
-    let mut ref_jsons: Vec<Option<String>> = Vec::new();
-    let mut has_arxiv_hints: Vec<bool> = Vec::new();
-
+    // Initialize statistics
     let mut json_files_processed: usize = 0;
     let mut total_records: usize = 0;
     let mut total_references: usize = 0;
     let mut references_with_hint: usize = 0;
+    let mut batches_written: usize = 0;
+
+    // Create output file and batched writer
+    let file = File::create(&args.output)
+        .with_context(|| format!("Failed to create output file: {}", args.output))?;
+
+    let schema = create_output_schema();
+    let mut batched_writer = ParquetWriter::new(file)
+        .with_compression(ParquetCompression::Zstd(None))
+        .with_row_group_size(Some(args.row_group_size))
+        .batched(&schema)
+        .context("Failed to create batched parquet writer")?;
+
+    // Initialize batch with pre-allocated capacity
+    let mut batch = ReferenceBatch::with_capacity(args.batch_size);
 
     info!("Opening tar.gz archive...");
     let tar_file = File::open(&args.input)
@@ -63,8 +145,8 @@ pub fn run_convert(args: ConvertArgs) -> Result<ConvertStats> {
             .unwrap_or_else(|| "unknown".to_string());
 
         progress.set_message(format!(
-            "Processing: {} | {} refs",
-            file_name, total_references
+            "Processing: {} | {} refs | {} batches",
+            file_name, total_references, batches_written
         ));
 
         let mut content = String::new();
@@ -79,6 +161,9 @@ pub fn run_convert(args: ConvertArgs) -> Result<ConvertStats> {
                 continue;
             }
         };
+
+        // Drop content immediately after parsing to free memory
+        drop(content);
 
         let items = match json_data.get("items") {
             Some(Value::Array(items)) => items,
@@ -134,15 +219,30 @@ pub fn run_convert(args: ConvertArgs) -> Result<ConvertStats> {
                     references_with_hint += 1;
                 }
 
-                citing_dois.push(doi.to_string());
-                ref_indices.push(idx as u32);
-                ref_dois.push(ref_doi);
-                ref_unstructureds.push(unstructured);
-                ref_article_titles.push(article_title);
-                ref_journal_titles.push(journal_title);
-                ref_urls.push(url);
-                ref_jsons.push(ref_json);
-                has_arxiv_hints.push(has_hint);
+                batch.citing_dois.push(doi.to_string());
+                batch.ref_indices.push(idx as u32);
+                batch.ref_dois.push(ref_doi);
+                batch.ref_unstructureds.push(unstructured);
+                batch.ref_article_titles.push(article_title);
+                batch.ref_journal_titles.push(journal_title);
+                batch.ref_urls.push(url);
+                batch.ref_jsons.push(ref_json);
+                batch.has_arxiv_hints.push(has_hint);
+
+                // Flush batch when it reaches capacity
+                if batch.len() >= args.batch_size {
+                    let df = batch.to_dataframe()?;
+                    batched_writer
+                        .write_batch(&df)
+                        .context("Failed to write batch to parquet")?;
+                    batches_written += 1;
+                    batch.clear();
+
+                    debug!(
+                        "Wrote batch {} ({} references total)",
+                        batches_written, total_references
+                    );
+                }
             }
         }
 
@@ -153,34 +253,21 @@ pub fn run_convert(args: ConvertArgs) -> Result<ConvertStats> {
         );
     }
 
+    // Write any remaining data in the final batch
+    if batch.len() > 0 {
+        let df = batch.to_dataframe()?;
+        batched_writer
+            .write_batch(&df)
+            .context("Failed to write final batch to parquet")?;
+        batches_written += 1;
+    }
+
+    // Finalize the parquet file
+    batched_writer
+        .finish()
+        .context("Failed to finalize parquet file")?;
+
     progress.finish_with_message("Archive processing complete");
-
-    info!(
-        "Building DataFrame with {} references...",
-        citing_dois.len()
-    );
-
-    let df = DataFrame::new(vec![
-        Column::new("citing_doi".into(), citing_dois),
-        Column::new("ref_index".into(), ref_indices),
-        Column::new("ref_doi".into(), ref_dois),
-        Column::new("ref_unstructured".into(), ref_unstructureds),
-        Column::new("ref_article_title".into(), ref_article_titles),
-        Column::new("ref_journal_title".into(), ref_journal_titles),
-        Column::new("ref_url".into(), ref_urls),
-        Column::new("ref_json".into(), ref_jsons),
-        Column::new("has_arxiv_hint".into(), has_arxiv_hints),
-    ])?;
-
-    info!("Writing Parquet file...");
-
-    let file = File::create(&args.output)
-        .with_context(|| format!("Failed to create output file: {}", args.output))?;
-
-    ParquetWriter::new(file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .with_row_group_size(Some(args.row_group_size))
-        .finish(&mut df.clone())?;
 
     let total_time = start_time.elapsed();
 
@@ -201,6 +288,7 @@ pub fn run_convert(args: ConvertArgs) -> Result<ConvertStats> {
         stats.references_with_hint,
         100.0 * stats.references_with_hint as f64 / stats.total_references.max(1) as f64
     );
+    info!("Batches written: {}", batches_written);
     info!("Output file: {}", args.output);
     info!("========================================================");
 
@@ -269,5 +357,30 @@ mod tests {
             Some("Nature"),
             Some("https://nature.com/paper")
         ));
+    }
+
+    #[test]
+    fn test_reference_batch_operations() {
+        let mut batch = ReferenceBatch::with_capacity(10);
+        assert_eq!(batch.len(), 0);
+
+        batch.citing_dois.push("10.1234/test".to_string());
+        batch.ref_indices.push(0);
+        batch.ref_dois.push(None);
+        batch.ref_unstructureds.push(Some("test ref".to_string()));
+        batch.ref_article_titles.push(None);
+        batch.ref_journal_titles.push(None);
+        batch.ref_urls.push(None);
+        batch.ref_jsons.push(Some("{}".to_string()));
+        batch.has_arxiv_hints.push(false);
+
+        assert_eq!(batch.len(), 1);
+
+        let df = batch.to_dataframe().unwrap();
+        assert_eq!(df.height(), 1);
+        assert_eq!(df.width(), 9);
+
+        batch.clear();
+        assert_eq!(batch.len(), 0);
     }
 }

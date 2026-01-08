@@ -107,6 +107,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<(ConvertStats, ExtractStats, I
         input: args.input.clone(),
         output: ctx.convert_output.to_string_lossy().to_string(),
         row_group_size: 250_000,
+        batch_size: args.batch_size,
         log_level: "OFF".to_string(),
     };
 
