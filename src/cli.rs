@@ -11,59 +11,73 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Extract DOIs that reference arXiv works from Crossref snapshot tar.gz files
+    /// Convert Crossref tar.gz to Parquet with flattened references
+    Convert(ConvertArgs),
+
+    /// Extract arXiv references from Parquet file (vectorized using Polars)
     Extract(ExtractArgs),
 
-    /// Invert arXiv reference relationships: map arXiv DOIs to citing DOIs
+    /// Invert arXiv reference relationships: map arXiv IDs to citing DOIs (using Polars)
     Invert(InvertArgs),
 
     /// Validate arXiv citations against DataCite records and DOI resolution
     Validate(ValidateArgs),
 
-    /// Run the full pipeline: extract -> invert -> validate
+    /// Run the full pipeline: convert -> extract -> invert -> validate
     Pipeline(PipelineArgs),
 }
 
 #[derive(Parser, Clone)]
-pub struct ExtractArgs {
+pub struct ConvertArgs {
     /// Path to the Crossref snapshot tar.gz file
     #[arg(short, long, required = true)]
     pub input: String,
 
-    /// Output JSONL file
-    #[arg(short, long, default_value = "arxiv_references.jsonl")]
+    /// Output Parquet file
+    #[arg(short, long, default_value = "references.parquet")]
+    pub output: String,
+
+    /// Row group size for Parquet output
+    #[arg(long, default_value = "250000")]
+    pub row_group_size: usize,
+
+    /// Logging level (DEBUG, INFO, WARN, ERROR)
+    #[arg(short, long, default_value = "INFO")]
+    pub log_level: String,
+}
+
+#[derive(Parser, Clone)]
+pub struct ExtractArgs {
+    /// Input Parquet file from convert step
+    #[arg(short, long, required = true)]
+    pub input: String,
+
+    /// Output Parquet file with extracted arXiv IDs
+    #[arg(short, long, default_value = "extracted.parquet")]
     pub output: String,
 
     /// Logging level (DEBUG, INFO, WARN, ERROR)
     #[arg(short, long, default_value = "INFO")]
     pub log_level: String,
-
-    /// Number of threads to use (0 for auto)
-    #[arg(short, long, default_value = "0")]
-    pub threads: usize,
-
-    /// Batch size for parallel processing
-    #[arg(short, long, default_value = "1000")]
-    pub batch_size: usize,
-
-    /// Interval in seconds to log statistics
-    #[arg(short, long, default_value = "60")]
-    pub stats_interval: u64,
 }
 
 #[derive(Parser, Clone)]
 pub struct InvertArgs {
-    /// Input JSONL file from extract step
+    /// Input Parquet file from extract step
     #[arg(short, long, required = true)]
     pub input: String,
 
-    /// Output JSONL file
-    #[arg(short, long, default_value = "arxiv_citations.jsonl")]
+    /// Output Parquet file with inverted citations
+    #[arg(short, long, default_value = "inverted.parquet")]
     pub output: String,
 
     /// Logging level (DEBUG, INFO, WARN, ERROR)
     #[arg(short, long, default_value = "INFO")]
     pub log_level: String,
+
+    /// Also output as JSONL for compatibility with validate step
+    #[arg(long)]
+    pub output_jsonl: Option<String>,
 }
 
 #[derive(Parser, Clone)]
@@ -118,14 +132,6 @@ pub struct PipelineArgs {
     /// Logging level (DEBUG, INFO, WARN, ERROR)
     #[arg(short, long, default_value = "INFO")]
     pub log_level: String,
-
-    /// Number of threads for extraction (0 for auto)
-    #[arg(short, long, default_value = "0")]
-    pub threads: usize,
-
-    /// Batch size for parallel extraction
-    #[arg(short, long, default_value = "1000")]
-    pub batch_size: usize,
 
     /// Concurrent HTTP requests for validation
     #[arg(short, long, default_value = "50")]

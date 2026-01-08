@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-/// Format a duration in human-readable format
 pub fn format_elapsed(elapsed: Duration) -> String {
     let total_secs = elapsed.as_secs();
     let hours = total_secs / 3600;

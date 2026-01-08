@@ -76,7 +76,6 @@ async fn check_doi_resolves(client: &Client, doi: &str, timeout: Duration) -> bo
     {
         Ok(resp) => {
             let status = resp.status();
-            // DOI exists if we get a redirect (302/301) or success (200)
             status.is_redirection() || status.is_success()
         }
         Err(e) => {
@@ -86,7 +85,6 @@ async fn check_doi_resolves(client: &Client, doi: &str, timeout: Duration) -> bo
     }
 }
 
-/// Run the validate command asynchronously
 pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
     let start_time = Instant::now();
 
@@ -282,7 +280,6 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
     Ok(stats)
 }
 
-/// Synchronous wrapper for run_validate_async
 pub fn run_validate(args: ValidateArgs) -> Result<ValidateStats> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run_validate_async(args))

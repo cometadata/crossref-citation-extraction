@@ -64,24 +64,19 @@ pub struct DataCiteRecord {
     pub id: String,
 }
 
-/// Statistics from extract step
+/// Statistics from extract step (vectorized extraction)
 #[derive(Debug, Clone, Default)]
 pub struct ExtractStats {
-    pub json_files_processed: usize,
-    pub total_records: usize,
-    pub records_with_refs: usize,
-    pub arxiv_matches: usize,
+    pub total_references: usize,
+    pub references_with_matches: usize,
     pub total_arxiv_ids: usize,
-    pub records_written: usize,
 }
 
-/// Statistics from invert step
+/// Statistics from invert step (hash-based aggregation)
 #[derive(Debug, Clone, Default)]
 pub struct InvertStats {
-    pub records_processed: usize,
-    pub records_failed: usize,
+    pub total_rows_processed: usize,
     pub unique_arxiv_works: usize,
-    pub total_references: usize,
     pub unique_citing_works: usize,
 }
 
@@ -94,4 +89,13 @@ pub struct ValidateStats {
     pub resolution_failed: usize,
     pub total_valid: usize,
     pub total_failed: usize,
+}
+
+/// Statistics from convert step (tar.gz → Parquet)
+#[derive(Debug, Clone, Default)]
+pub struct ConvertStats {
+    pub json_files_processed: usize,
+    pub total_records: usize,
+    pub total_references: usize,
+    pub references_with_hint: usize,
 }

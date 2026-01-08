@@ -7,12 +7,15 @@ use anyhow::Result;
 use clap::Parser;
 
 use cli::{Cli, Commands};
-use commands::{run_extract, run_invert, run_validate, run_pipeline};
+use commands::{run_convert, run_extract, run_invert, run_pipeline, run_validate};
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Convert(args) => {
+            run_convert(args)?;
+        }
         Commands::Extract(args) => {
             run_extract(args)?;
         }

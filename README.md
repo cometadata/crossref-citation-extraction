@@ -4,11 +4,12 @@ CLI for extracting and validating arXiv references from Crossref data files.
 
 ## Overview
 
-This tool processes Crossref snapshot data to identify works that cite arXiv preprints, then validates those citations against DataCite records and DOI resolution. The pipeline consists of three steps:
+This tool processes Crossref snapshot data to identify works that cite arXiv preprints, then validates those citations against DataCite records and DOI resolution. The pipeline consists of four steps:
 
-1. **Extract** - Scan Crossref snapshot for references containing arXiv identifiers
-2. **Invert** - Transform from "DOI → arXiv refs" to "arXiv DOI → citing DOIs"
-3. **Validate** - Verify arXiv DOIs exist in DataCite or resolve via doi.org
+1. The convert command is used to flatten Crossref snapshot to one row per reference, allowing for faster processing
+2. Extract then scans references for arXiv identifiers
+3. Invert transforms DOI-to-arXiv references to arXiv DOI-to-citing DOIs
+4. With validate, we then verify that the extracted arXiv DOIs exist in DataCite or resolve
 
 ## Building
 
@@ -20,62 +21,46 @@ The binary will be at `target/release/crossref-arxiv-citation-extraction`.
 
 ## Usage
 
-### Full Pipeline
+### Convert
 
-Run all three steps automatically with intermediate file management:
-
-```bash
-crossref-arxiv-citation-extraction pipeline \
-  --input crossref-snapshot.tar.gz \
-  --records datacite-records.jsonl.gz \
-  --output arxiv_citations_valid.jsonl
-```
-
-With all options:
+Flatten the Crossref snapshot to a Parquet file with one row per reference:
 
 ```bash
-crossref-arxiv-citation-extraction pipeline \
+crossref-arxiv-citation-extraction convert \
   --input crossref-snapshot.tar.gz \
-  --records datacite-records.jsonl.gz \
-  --output arxiv_citations_valid.jsonl \
-  --output-failed arxiv_citations_failed.jsonl \
-  --threads 8 \
-  --batch-size 1000 \
-  --concurrency 100 \
-  --timeout 10 \
-  --keep-intermediates \
-  --temp-dir /tmp/pipeline \
-  --log-level INFO
+  --output references.parquet
 ```
 
-### Individual Commands
+This step only needs to be run once per snapshot. The output can be reused for multiple extraction runs.
 
-#### Extract
+Options:
+- `--row-group-size` - Row group size for output (default: 250000)
 
-Scan a Crossref snapshot tar.gz for DOIs that reference arXiv works:
+### Extract
+
+Extract arXiv IDs from the flattened references:
 
 ```bash
 crossref-arxiv-citation-extraction extract \
-  --input crossref-snapshot.tar.gz \
-  --output arxiv_references.jsonl
+  --input references.parquet \
+  --output extracted.parquet
 ```
 
-Options:
-- `--threads` - Number of threads (0 = auto-detect)
-- `--batch-size` - Records per batch for parallel processing (default: 1000)
-- `--stats-interval` - Seconds between progress logs (default: 60)
+### Invert
 
-#### Invert
-
-Transform extract output to map arXiv DOIs to their citing works:
+Aggregate citations by arXiv ID:
 
 ```bash
 crossref-arxiv-citation-extraction invert \
-  --input arxiv_references.jsonl \
-  --output arxiv_citations.jsonl
+  --input extracted.parquet \
+  --output inverted.parquet \
+  --output-jsonl arxiv_citations.jsonl
 ```
 
-#### Validate
+Options:
+- `--output-jsonl` - Also write JSONL output for use with the validate step
+
+### Validate
 
 Validate arXiv DOIs against DataCite records and DOI resolution:
 
@@ -91,31 +76,37 @@ Options:
 - `--concurrency` - Concurrent HTTP requests (default: 50)
 - `--timeout` - Seconds per request (default: 5)
 
-## Output Formats
+### Complete Workflow
 
-### Extract Output
+```bash
+# Flatten references (one-time per snapshot)
+crossref-arxiv-citation-extraction convert \
+  --input crossref-snapshot.tar.gz \
+  --output references.parquet
 
-JSONL with one record per citing DOI:
+# Extract arXiv IDs
+crossref-arxiv-citation-extraction extract \
+  --input references.parquet \
+  --output extracted.parquet
 
-```json
-{
-  "doi": "10.1234/example.paper",
-  "arxiv_matches": [
-    {
-      "id": "2403.03542",
-      "raw": "arXiv:2403.03542",
-      "arxiv_doi": "10.48550/arXiv.2403.03542"
-    }
-  ],
-  "references": [
-    {"unstructured": "Smith J. (2024). arXiv:2403.03542", "key": "ref1"}
-  ]
-}
+# Aggregate by arXiv ID
+crossref-arxiv-citation-extraction invert \
+  --input extracted.parquet \
+  --output inverted.parquet \
+  --output-jsonl arxiv_citations.jsonl
+
+# Validate against DataCite
+crossref-arxiv-citation-extraction validate \
+  --input arxiv_citations.jsonl \
+  --records datacite-records.jsonl.gz \
+  --output-valid arxiv_citations_valid.jsonl
 ```
 
-### Invert Output
+## Output Formats
 
-JSONL with one record per arXiv work, sorted by citation count:
+### Invert Output (JSONL)
+
+One record per arXiv work, sorted by citation count:
 
 ```json
 {
@@ -140,6 +131,18 @@ JSONL with one record per arXiv work, sorted by citation count:
 ### Validate Output
 
 Same format as invert output, split into valid and failed files based on whether the arXiv DOI could be verified.
+
+### Parquet Files
+
+Intermediate Parquet files can be inspected with tools like DuckDB or pandas:
+
+```sql
+-- Example: query with DuckDB
+SELECT arxiv_id, citation_count
+FROM 'inverted.parquet'
+ORDER BY citation_count DESC
+LIMIT 10;
+```
 
 ## ArXiv ID Patterns
 

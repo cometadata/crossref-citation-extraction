@@ -161,7 +161,6 @@ mod tests {
 
     #[test]
     fn test_no_match_without_arxiv_context() {
-        // This should NOT match because there's no "arxiv" in the text
         let text = "Some paper 2403.03542";
         let matches = extract_arxiv_matches_from_text(text);
         assert!(matches.is_empty());

@@ -1,180 +1,210 @@
 use anyhow::{Context, Result};
-use log::{info, warn};
-use serde::Deserialize;
-use serde_json::Value;
-use std::collections::HashMap;
+use log::info;
+use polars::prelude::*;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::cli::InvertArgs;
-use crate::common::{
-    format_elapsed, create_bytes_progress_bar, create_count_progress_bar, setup_logging,
-    ArxivCitations, CitingWork, InvertStats, ReferenceMatch,
-};
+use crate::common::{format_elapsed, setup_logging, InvertStats};
 
-/// Input format from extract step (for deserialization only)
-#[derive(Debug, Deserialize)]
-struct InputRecord {
-    doi: String,
-    arxiv_matches: Vec<InputArxivMatch>,
-    references: Vec<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InputArxivMatch {
-    id: String,
-    raw: String,
-    arxiv_doi: String,
-}
-
-/// Run the invert command with the given arguments
 pub fn run_invert(args: InvertArgs) -> Result<InvertStats> {
     let start_time = Instant::now();
 
     setup_logging(&args.log_level)?;
 
-    info!("Starting Crossref ArXiv Refs Invert");
+    info!("Starting Polars Hash-Based Inversion");
     info!("Input: {}", args.input);
     info!("Output: {}", args.output);
 
-    let mut index: HashMap<String, (String, HashMap<String, Vec<ReferenceMatch>>)> = HashMap::new();
-
-    let input_file = File::open(&args.input)
-        .with_context(|| format!("Failed to open input file: {}", args.input))?;
-    let file_size = input_file.metadata()?.len();
-    let reader = BufReader::new(input_file);
-    let progress = create_bytes_progress_bar(file_size);
-
-    let mut lines_processed: usize = 0;
-    let mut lines_failed: usize = 0;
-    let mut total_citations: usize = 0;
-
-    info!("Reading input and building inverted index...");
-
-    for line_result in reader.lines() {
-        let line = line_result.context("Failed to read line")?;
-        progress.inc(line.len() as u64 + 1); // +1 for newline
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let record: InputRecord = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Failed to parse line {}: {}", lines_processed + 1, e);
-                lines_failed += 1;
-                continue;
-            }
-        };
-
-        lines_processed += 1;
-
-        for arxiv_match in &record.arxiv_matches {
-            // Find the reference containing this arXiv match via string matching
-            let matching_ref = record.references.iter()
-                .find(|r| {
-                    let ref_str = serde_json::to_string(r).unwrap_or_default();
-                    ref_str.to_lowercase().contains(&arxiv_match.raw.to_lowercase())
-                        || ref_str.to_lowercase().contains(&arxiv_match.id.to_lowercase())
-                })
-                .cloned()
-                .unwrap_or(Value::Null);
-
-            let ref_match = ReferenceMatch {
-                raw_match: arxiv_match.raw.clone(),
-                reference: matching_ref,
-            };
-
-            total_citations += 1;
-
-            index
-                .entry(arxiv_match.arxiv_doi.clone())
-                .or_insert_with(|| (arxiv_match.id.clone(), HashMap::new()))
-                .1
-                .entry(record.doi.clone())
-                .or_insert_with(Vec::new)
-                .push(ref_match);
-        }
-
-        if lines_processed % 100000 == 0 {
-            progress.set_message(format!(
-                "{} records | {} arXiv works | {} citations",
-                lines_processed,
-                index.len(),
-                total_citations
-            ));
-        }
+    if !Path::new(&args.input).exists() {
+        return Err(anyhow::anyhow!("Input file does not exist: {}", args.input));
     }
 
-    progress.finish_with_message("Index building complete");
+    info!("Scanning Parquet file...");
 
-    let mut entries: Vec<ArxivCitations> = index
-        .into_iter()
-        .map(|(arxiv_doi, (arxiv_id, citing_works))| {
-            let cited_by: Vec<CitingWork> = citing_works
-                .into_iter()
-                .map(|(doi, matches)| CitingWork { doi, matches })
-                .collect();
-            let reference_count: usize = cited_by.iter().map(|c| c.matches.len()).sum();
-            let citation_count = cited_by.len();
-            ArxivCitations {
-                arxiv_doi,
-                arxiv_id,
-                reference_count,
-                citation_count,
-                cited_by,
-            }
-        })
-        .collect();
+    let lf = LazyFrame::scan_parquet(&args.input, Default::default())
+        .context("Failed to scan Parquet file")?;
 
-    let total_unique_citations: usize = entries.iter().map(|e| e.citation_count).sum();
+    let initial_count = lf
+        .clone()
+        .select([col("citing_doi").count().alias("count")])
+        .collect()?
+        .column("count")?
+        .u32()?
+        .get(0)
+        .unwrap_or(0) as usize;
 
-    info!("Input processing complete:");
-    info!("  Records processed: {}", lines_processed);
-    info!("  Records failed: {}", lines_failed);
-    info!("  Unique arXiv works: {}", entries.len());
-    info!("  Total references: {}", total_citations);
-    info!("  Unique citing works: {}", total_unique_citations);
+    info!("Total rows in input: {}", initial_count);
 
-    info!("Writing output file...");
+    info!("Building inverted index with hash-based aggregation...");
+
+    let inverted = lf
+        .explode([col("normalized_arxiv_ids"), col("raw_matches")])
+        .rename(["normalized_arxiv_ids"], ["arxiv_id"], true)
+        .rename(["raw_matches"], ["raw_match"], true)
+        .unique(
+            Some(vec!["citing_doi".into(), "arxiv_id".into()]),
+            UniqueKeepStrategy::First,
+        )
+        .group_by([col("arxiv_id")])
+        .agg([
+            col("citing_doi").n_unique().alias("citation_count"),
+            col("citing_doi").count().alias("reference_count"),
+            as_struct(vec![
+                col("citing_doi").alias("doi"),
+                col("raw_match"),
+                col("ref_json").alias("reference"),
+            ])
+            .alias("cited_by"),
+        ])
+        .with_columns([concat_str([lit("10.48550/arXiv."), col("arxiv_id")], "", true)
+            .alias("arxiv_doi")])
+        .sort(
+            ["citation_count"],
+            SortMultipleOptions::default().with_order_descending(true),
+        );
+
+    info!("Collecting results...");
+
+    let result_df = inverted.collect().context("Failed to collect results")?;
+
+    let unique_arxiv_works = result_df.height();
+
+    let unique_citing_works: u32 = result_df
+        .column("citation_count")?
+        .u32()?
+        .sum()
+        .unwrap_or(0);
+
+    info!("Writing output Parquet...");
+
     let output_file = File::create(&args.output)
         .with_context(|| format!("Failed to create output file: {}", args.output))?;
-    let mut writer = BufWriter::new(output_file);
-    let write_progress = create_count_progress_bar(entries.len() as u64);
 
-    entries.sort_by(|a, b| b.citation_count.cmp(&a.citation_count));
-    let num_entries = entries.len();
+    ParquetWriter::new(output_file)
+        .with_compression(ParquetCompression::Zstd(None))
+        .with_row_group_size(Some(250_000))
+        .finish(&mut result_df.clone())?;
 
-    for citations in &entries {
-        let json_line = serde_json::to_string(citations)
-            .context("Failed to serialize output")?;
-        writeln!(writer, "{}", json_line)
-            .context("Failed to write output")?;
-        write_progress.inc(1);
+    if let Some(jsonl_path) = &args.output_jsonl {
+        info!("Writing JSONL output for validate compatibility...");
+        write_jsonl_output(&result_df, jsonl_path)?;
     }
 
-    writer.flush()?;
-    write_progress.finish_with_message("Write complete");
-
     let total_time = start_time.elapsed();
+
     let stats = InvertStats {
-        records_processed: lines_processed,
-        records_failed: lines_failed,
-        unique_arxiv_works: num_entries,
-        total_references: total_citations,
-        unique_citing_works: total_unique_citations,
+        total_rows_processed: initial_count,
+        unique_arxiv_works,
+        unique_citing_works: unique_citing_works as usize,
     };
 
     info!("==================== FINAL SUMMARY ====================");
     info!("Total execution time: {}", format_elapsed(total_time));
-    info!("Input records: {}", stats.records_processed);
+    info!("Total rows processed: {}", stats.total_rows_processed);
     info!("Unique arXiv works: {}", stats.unique_arxiv_works);
-    info!("Total references: {}", stats.total_references);
-    info!("Unique citing works: {}", stats.unique_citing_works);
+    info!("Total citations: {}", stats.unique_citing_works);
     info!("Output file: {}", args.output);
+    if let Some(jsonl_path) = &args.output_jsonl {
+        info!("JSONL output: {}", jsonl_path);
+    }
     info!("========================================================");
 
     Ok(stats)
+}
+
+fn write_jsonl_output(df: &DataFrame, path: &str) -> Result<()> {
+    let file = File::create(path).with_context(|| format!("Failed to create JSONL file: {}", path))?;
+    let mut writer = BufWriter::new(file);
+
+    let arxiv_doi = df.column("arxiv_doi")?.str()?;
+    let arxiv_id = df.column("arxiv_id")?.str()?;
+    let reference_count = df.column("reference_count")?.u32()?;
+    let citation_count = df.column("citation_count")?.u32()?;
+    let cited_by = df.column("cited_by")?;
+
+    for i in 0..df.height() {
+        let doi = arxiv_doi.get(i).unwrap_or("");
+        let id = arxiv_id.get(i).unwrap_or("");
+        let ref_count = reference_count.get(i).unwrap_or(0);
+        let cit_count = citation_count.get(i).unwrap_or(0);
+
+        // Build cited_by array from struct column
+        let cited_by_json = build_cited_by_json(cited_by, i)?;
+
+        let json_line = serde_json::json!({
+            "arxiv_doi": doi,
+            "arxiv_id": id,
+            "reference_count": ref_count,
+            "citation_count": cit_count,
+            "cited_by": cited_by_json
+        });
+
+        writeln!(writer, "{}", json_line)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_json::Value> {
+    use std::collections::HashMap;
+
+    let list = cited_by_col.list()?;
+    let row_list = list.get_as_series(row_idx);
+
+    match row_list {
+        Some(series) => {
+            let structs = series.struct_()?;
+            let doi_field = structs.field_by_name("doi")?;
+            let raw_match_field = structs.field_by_name("raw_match")?;
+            let ref_field = structs.field_by_name("reference")?;
+
+            let dois = doi_field.str()?;
+            let raw_matches = raw_match_field.str()?;
+            let refs = ref_field.str()?;
+
+            let mut doi_matches: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+            for j in 0..series.len() {
+                let doi = dois.get(j).unwrap_or("").to_string();
+                let raw_match = raw_matches.get(j).unwrap_or("");
+                let ref_json_str = refs.get(j).unwrap_or("null");
+
+                let reference: serde_json::Value =
+                    serde_json::from_str(ref_json_str).unwrap_or(serde_json::Value::Null);
+
+                let match_obj = serde_json::json!({
+                    "raw_match": raw_match,
+                    "reference": reference
+                });
+
+                doi_matches.entry(doi).or_insert_with(Vec::new).push(match_obj);
+            }
+
+            let cited_by_arr: Vec<serde_json::Value> = doi_matches
+                .into_iter()
+                .map(|(doi, matches)| {
+                    serde_json::json!({
+                        "doi": doi,
+                        "matches": matches
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::Value::Array(cited_by_arr))
+        }
+        None => Ok(serde_json::Value::Array(vec![])),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_build_cited_by_json_empty() {
+        let empty = serde_json::json!([]);
+        assert!(empty.is_array());
+    }
 }

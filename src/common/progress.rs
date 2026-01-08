@@ -1,6 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// Create a spinner progress bar for indeterminate progress
 pub fn create_spinner(message: &str) -> ProgressBar {
     let pb = ProgressBar::new_spinner();
     pb.set_style(
@@ -12,7 +11,6 @@ pub fn create_spinner(message: &str) -> ProgressBar {
     pb
 }
 
-/// Create a progress bar for file reading (bytes)
 pub fn create_bytes_progress_bar(total_bytes: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_bytes);
     pb.set_style(
@@ -24,7 +22,6 @@ pub fn create_bytes_progress_bar(total_bytes: u64) -> ProgressBar {
     pb
 }
 
-/// Create a progress bar for item counting
 pub fn create_count_progress_bar(total_items: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_items);
     pb.set_style(

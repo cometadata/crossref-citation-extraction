@@ -3,7 +3,6 @@ use log::LevelFilter;
 use simple_logger::SimpleLogger;
 use time::macros::format_description;
 
-/// Parse a log level string into a LevelFilter
 pub fn parse_log_level(level: &str) -> LevelFilter {
     match level.to_uppercase().as_str() {
         "DEBUG" => LevelFilter::Debug,
@@ -17,7 +16,6 @@ pub fn parse_log_level(level: &str) -> LevelFilter {
     }
 }
 
-/// Set up logging with the specified level
 pub fn setup_logging(log_level: &str) -> Result<()> {
     let level = parse_log_level(log_level);
     SimpleLogger::new()

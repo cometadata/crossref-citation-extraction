@@ -17,6 +17,10 @@ Thumbs.db
 *.jsonl
 *.json
 !package.json
+*.parquet
+
+# Sample/test data
+*.tar.gz
 
 # Logs
 *.log
