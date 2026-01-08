@@ -1,5 +1,5 @@
+pub mod arxiv;
 pub mod doi;
-pub mod patterns;
 
+pub use arxiv::*;
 pub use doi::*;
-pub use patterns::*;
