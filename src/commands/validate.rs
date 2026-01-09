@@ -6,7 +6,8 @@ use crate::cli::{Source, ValidateArgs};
 use crate::common::setup_logging;
 use crate::index::{build_index_from_jsonl_gz, load_index_from_parquet, DoiIndex};
 use crate::validation::{
-    validate_citations, write_arxiv_validation_results, write_validation_results,
+    validate_citations, write_arxiv_validation_results_with_split,
+    write_validation_results_with_split,
 };
 
 pub fn run_validate(args: ValidateArgs) -> Result<()> {
@@ -77,17 +78,22 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<()> {
     )
     .await?;
 
-    // Write results
+    // Write results with provenance split
     match args.source {
         Source::Arxiv => {
-            write_arxiv_validation_results(
+            write_arxiv_validation_results_with_split(
                 &results,
                 &args.output_valid,
                 Some(&args.output_failed),
             )?;
         }
         _ => {
-            write_validation_results(&results, &args.output_valid, Some(&args.output_failed))?;
+            write_validation_results_with_split(
+                &results.valid,
+                &results.failed,
+                &args.output_valid,
+                Some(&args.output_failed),
+            )?;
         }
     }
 
