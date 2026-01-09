@@ -55,6 +55,7 @@ fn invert_single_partition(partition_path: &Path, output_mode: OutputMode) -> Re
                 col("citing_doi").alias("doi"),
                 col("raw_match"),
                 col("ref_json").alias("reference"),
+                col("provenance"),
             ])
             .alias("cited_by"),
         ]);
@@ -300,10 +301,12 @@ fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_js
             let doi_field = structs.field_by_name("doi")?;
             let raw_match_field = structs.field_by_name("raw_match")?;
             let ref_field = structs.field_by_name("reference")?;
+            let provenance_field = structs.field_by_name("provenance")?;
 
             let dois = doi_field.str()?;
             let raw_matches = raw_match_field.str()?;
             let refs = ref_field.str()?;
+            let provenances = provenance_field.str()?;
 
             let mut doi_matches: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
@@ -311,13 +314,15 @@ fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_js
                 let doi = dois.get(j).unwrap_or("").to_string();
                 let raw_match = raw_matches.get(j).unwrap_or("");
                 let ref_json_str = refs.get(j).unwrap_or("null");
+                let provenance = provenances.get(j).unwrap_or("mined");
 
                 let reference: serde_json::Value =
                     serde_json::from_str(ref_json_str).unwrap_or(serde_json::Value::Null);
 
                 let match_obj = serde_json::json!({
                     "raw_match": raw_match,
-                    "reference": reference
+                    "reference": reference,
+                    "provenance": provenance
                 });
 
                 doi_matches.entry(doi).or_default().push(match_obj);
@@ -326,8 +331,20 @@ fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_js
             let cited_by_arr: Vec<serde_json::Value> = doi_matches
                 .into_iter()
                 .map(|(doi, matches)| {
+                    // Determine overall provenance for this citing DOI (best available)
+                    let best_provenance = matches
+                        .iter()
+                        .filter_map(|m| m.get("provenance").and_then(|p| p.as_str()))
+                        .max_by_key(|p| match *p {
+                            "publisher" => 2,
+                            "crossref" => 1,
+                            _ => 0,
+                        })
+                        .unwrap_or("mined");
+
                     serde_json::json!({
                         "doi": doi,
+                        "provenance": best_provenance,
                         "matches": matches
                     })
                 })
@@ -349,11 +366,25 @@ mod tests {
         name: &str,
         rows: Vec<(&str, u32, &str, &str, &str)>,
     ) -> Result<()> {
+        // Default to "mined" provenance for backward compatibility
+        let rows_with_provenance: Vec<_> = rows
+            .into_iter()
+            .map(|(a, b, c, d, e)| (a, b, c, d, e, "mined"))
+            .collect();
+        create_test_partition_with_provenance(dir, name, rows_with_provenance)
+    }
+
+    fn create_test_partition_with_provenance(
+        dir: &Path,
+        name: &str,
+        rows: Vec<(&str, u32, &str, &str, &str, &str)>,
+    ) -> Result<()> {
         let citing_dois: Vec<String> = rows.iter().map(|r| r.0.to_string()).collect();
         let ref_indices: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let ref_jsons: Vec<String> = rows.iter().map(|r| r.2.to_string()).collect();
         let raw_matches: Vec<String> = rows.iter().map(|r| r.3.to_string()).collect();
         let cited_ids: Vec<String> = rows.iter().map(|r| r.4.to_string()).collect();
+        let provenances: Vec<String> = rows.iter().map(|r| r.5.to_string()).collect();
 
         let mut df = DataFrame::new(vec![
             Column::new("citing_doi".into(), &citing_dois),
@@ -361,6 +392,7 @@ mod tests {
             Column::new("ref_json".into(), &ref_jsons),
             Column::new("raw_match".into(), &raw_matches),
             Column::new("cited_id".into(), &cited_ids),
+            Column::new("provenance".into(), &provenances),
         ])?;
 
         let file = File::create(dir.join(format!("{}.parquet", name)))?;
@@ -438,5 +470,142 @@ mod tests {
 
         // Generic mode should NOT have arxiv_doi column
         assert!(df.column("arxiv_doi").is_err());
+    }
+
+    #[test]
+    fn test_invert_partition_includes_provenance() {
+        let dir = tempdir().unwrap();
+
+        // Create partition with different provenances for same cited work
+        create_test_partition_with_provenance(
+            dir.path(),
+            "10.5678",
+            vec![
+                (
+                    "10.1234/a",
+                    0,
+                    r#"{"key": "ref1"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "publisher",
+                ),
+                (
+                    "10.1234/b",
+                    1,
+                    r#"{"key": "ref2"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "mined",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result =
+            invert_single_partition(&dir.path().join("10.5678.parquet"), OutputMode::Generic)
+                .unwrap();
+
+        // Verify we have one cited work with two citations
+        assert_eq!(result.height(), 1);
+
+        // Verify cited_by struct includes provenance field
+        let cited_by = result.column("cited_by").unwrap();
+        let list = cited_by.list().unwrap();
+        let row_list = list.get_as_series(0).unwrap();
+        let structs = row_list.struct_().unwrap();
+
+        // The struct should have provenance field
+        let provenance_field = structs.field_by_name("provenance");
+        assert!(
+            provenance_field.is_ok(),
+            "cited_by struct should have provenance field"
+        );
+
+        // Verify provenance values are preserved
+        let provenances = provenance_field.unwrap();
+        let prov_strs = provenances.str().unwrap();
+        let prov_values: Vec<_> = (0..prov_strs.len())
+            .filter_map(|i| prov_strs.get(i).map(|s| s.to_string()))
+            .collect();
+        assert!(prov_values.contains(&"publisher".to_string()));
+        assert!(prov_values.contains(&"mined".to_string()));
+    }
+
+    #[test]
+    fn test_build_cited_by_json_with_provenance() {
+        let dir = tempdir().unwrap();
+
+        // Create partition with provenance
+        // Note: The inversion deduplicates by (citing_doi, cited_id) pair,
+        // so multiple references from the same citing DOI to the same cited work
+        // are collapsed to one entry (keeping the first).
+        create_test_partition_with_provenance(
+            dir.path(),
+            "10.5678",
+            vec![
+                (
+                    "10.1234/a",
+                    0,
+                    r#"{"key": "ref1"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "publisher",
+                ),
+                (
+                    "10.1234/b",
+                    0,
+                    r#"{"key": "ref2"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "crossref",
+                ),
+                (
+                    "10.1234/c",
+                    0,
+                    r#"{"key": "ref3"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "mined",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result =
+            invert_single_partition(&dir.path().join("10.5678.parquet"), OutputMode::Generic)
+                .unwrap();
+
+        let cited_by_col = result.column("cited_by").unwrap();
+        let json = build_cited_by_json(cited_by_col, 0).unwrap();
+
+        // JSON should be an array of citing DOIs
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 3); // Three citing DOIs: 10.1234/a, 10.1234/b, 10.1234/c
+
+        // Find the entry for 10.1234/a (should have "publisher" provenance)
+        let entry_a = arr
+            .iter()
+            .find(|e| e["doi"] == "10.1234/a")
+            .expect("Should have entry for 10.1234/a");
+        assert_eq!(entry_a["provenance"], "publisher");
+
+        // Entry should have one match with provenance
+        let matches_a = entry_a["matches"].as_array().unwrap();
+        assert_eq!(matches_a.len(), 1);
+        assert_eq!(matches_a[0]["provenance"], "publisher");
+
+        // Find the entry for 10.1234/b (should have "crossref" as provenance)
+        let entry_b = arr
+            .iter()
+            .find(|e| e["doi"] == "10.1234/b")
+            .expect("Should have entry for 10.1234/b");
+        assert_eq!(entry_b["provenance"], "crossref");
+
+        // Find the entry for 10.1234/c (should have "mined" as provenance)
+        let entry_c = arr
+            .iter()
+            .find(|e| e["doi"] == "10.1234/c")
+            .expect("Should have entry for 10.1234/c");
+        assert_eq!(entry_c["provenance"], "mined");
     }
 }
