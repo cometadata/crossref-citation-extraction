@@ -15,7 +15,10 @@ use crate::index::{
     build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex,
 };
 use crate::streaming::{invert_partitions, Checkpoint, OutputMode, PartitionWriter};
-use crate::validation::{validate_citations, write_validation_results};
+use crate::validation::{
+    validate_citations, write_arxiv_validation_results, write_split_validation_results,
+    write_validation_results,
+};
 
 /// Progress logging interval (every N files)
 const PROGRESS_LOG_INTERVAL: usize = 100;
@@ -321,14 +324,6 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
         if let Some(ref jsonl_path) = output_jsonl {
             let validation_input = jsonl_path.to_string_lossy().to_string();
 
-            // Determine the failed output path based on source
-            let failed_output = match args.source {
-                Source::Arxiv => args.output_arxiv_failed.as_deref(),
-                Source::Crossref => args.output_crossref_failed.as_deref(),
-                Source::Datacite => args.output_datacite_failed.as_deref(),
-                Source::All => None, // Handle separately for multi-source
-            };
-
             let rt = tokio::runtime::Runtime::new()?;
             let validation_results = rt.block_on(validate_citations(
                 &validation_input,
@@ -363,8 +358,43 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
             info!("  Total valid: {}", validation_results.valid.len());
             info!("  Total failed: {}", validation_results.failed.len());
 
-            // Write validated results back to the output file
-            write_validation_results(&validation_results, &validation_input, failed_output)?;
+            // Write outputs based on source mode
+            match args.source {
+                Source::All => {
+                    let (crossref_written, datacite_written) = write_split_validation_results(
+                        &validation_results,
+                        args.output_crossref.as_deref(),
+                        args.output_datacite.as_deref(),
+                        args.output_crossref_failed.as_deref(),
+                        args.output_datacite_failed.as_deref(),
+                    )?;
+                    info!(
+                        "Output written: {} Crossref, {} DataCite",
+                        crossref_written, datacite_written
+                    );
+                }
+                Source::Crossref => {
+                    write_validation_results(
+                        &validation_results,
+                        args.output_crossref.as_ref().unwrap(),
+                        args.output_crossref_failed.as_deref(),
+                    )?;
+                }
+                Source::Datacite => {
+                    write_validation_results(
+                        &validation_results,
+                        args.output_datacite.as_ref().unwrap(),
+                        args.output_datacite_failed.as_deref(),
+                    )?;
+                }
+                Source::Arxiv => {
+                    write_arxiv_validation_results(
+                        &validation_results,
+                        args.output_arxiv.as_ref().unwrap(),
+                        args.output_arxiv_failed.as_deref(),
+                    )?;
+                }
+            }
         } else {
             info!("No JSONL output specified, skipping validation...");
         }

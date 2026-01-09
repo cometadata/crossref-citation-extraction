@@ -160,7 +160,8 @@ pub fn write_validation_results(
         output_valid
     );
 
-    let file = File::create(output_valid)?;
+    let file = File::create(output_valid)
+        .with_context(|| format!("Failed to create output file: {}", output_valid))?;
     let mut writer = BufWriter::new(file);
 
     for (record, _source) in &results.valid {
@@ -174,11 +175,146 @@ pub fn write_validation_results(
             results.failed.len(),
             failed_path
         );
-        let file = File::create(failed_path)?;
+        let file = File::create(failed_path)
+            .with_context(|| format!("Failed to create output file: {}", failed_path))?;
         let mut writer = BufWriter::new(file);
 
         for record in &results.failed {
             writeln!(writer, "{}", serde_json::to_string(record)?)?;
+        }
+        writer.flush()?;
+    }
+
+    Ok(())
+}
+
+/// Write validation results split by source
+pub fn write_split_validation_results(
+    results: &ValidationResults,
+    output_crossref: Option<&str>,
+    output_datacite: Option<&str>,
+    output_crossref_failed: Option<&str>,
+    output_datacite_failed: Option<&str>,
+) -> Result<(usize, usize)> {
+    // Split valid results by source
+    let (crossref_valid, datacite_valid): (Vec<_>, Vec<_>) = results
+        .valid
+        .iter()
+        .partition(|(_, source)| *source == Source::Crossref);
+
+    let crossref_count = crossref_valid.len();
+    let datacite_count = datacite_valid.len();
+
+    // Write Crossref valid
+    if let Some(path) = output_crossref {
+        info!("Writing {} Crossref citations to: {}", crossref_count, path);
+        let file = File::create(path)
+            .with_context(|| format!("Failed to create output file: {}", path))?;
+        let mut writer = BufWriter::new(file);
+        for (record, _) in &crossref_valid {
+            writeln!(writer, "{}", serde_json::to_string(record)?)?;
+        }
+        writer.flush()?;
+    }
+
+    // Write DataCite valid
+    if let Some(path) = output_datacite {
+        info!("Writing {} DataCite citations to: {}", datacite_count, path);
+        let file = File::create(path)
+            .with_context(|| format!("Failed to create output file: {}", path))?;
+        let mut writer = BufWriter::new(file);
+        for (record, _) in &datacite_valid {
+            writeln!(writer, "{}", serde_json::to_string(record)?)?;
+        }
+        writer.flush()?;
+    }
+
+    // Write failed (to both files if provided - we can't know which source they belong to)
+    if let Some(path) = output_crossref_failed {
+        let file = File::create(path)
+            .with_context(|| format!("Failed to create output file: {}", path))?;
+        let mut writer = BufWriter::new(file);
+        for record in &results.failed {
+            writeln!(writer, "{}", serde_json::to_string(record)?)?;
+        }
+        writer.flush()?;
+    }
+
+    if let Some(path) = output_datacite_failed {
+        let file = File::create(path)
+            .with_context(|| format!("Failed to create output file: {}", path))?;
+        let mut writer = BufWriter::new(file);
+        for record in &results.failed {
+            writeln!(writer, "{}", serde_json::to_string(record)?)?;
+        }
+        writer.flush()?;
+    }
+
+    Ok((crossref_count, datacite_count))
+}
+
+/// Write arXiv validation results (converts generic to arXiv format)
+pub fn write_arxiv_validation_results(
+    results: &ValidationResults,
+    output_arxiv: &str,
+    output_arxiv_failed: Option<&str>,
+) -> Result<()> {
+    info!(
+        "Writing {} arXiv citations to: {}",
+        results.valid.len(),
+        output_arxiv
+    );
+
+    let file = File::create(output_arxiv)
+        .with_context(|| format!("Failed to create output file: {}", output_arxiv))?;
+    let mut writer = BufWriter::new(file);
+
+    for (record, _) in &results.valid {
+        // Convert generic CitationRecord to arXiv format
+        let arxiv_id = record
+            .doi
+            .strip_prefix("10.48550/arXiv.")
+            .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
+            .unwrap_or(&record.doi);
+
+        let arxiv_record = serde_json::json!({
+            "arxiv_doi": record.doi,
+            "arxiv_id": arxiv_id,
+            "reference_count": record.reference_count,
+            "citation_count": record.citation_count,
+            "cited_by": record.cited_by
+        });
+
+        writeln!(writer, "{}", arxiv_record)?;
+    }
+    writer.flush()?;
+
+    if let Some(failed_path) = output_arxiv_failed {
+        info!(
+            "Writing {} failed arXiv citations to: {}",
+            results.failed.len(),
+            failed_path
+        );
+        let file = File::create(failed_path)
+            .with_context(|| format!("Failed to create output file: {}", failed_path))?;
+        let mut writer = BufWriter::new(file);
+
+        for record in &results.failed {
+            let arxiv_id = record
+                .doi
+                .strip_prefix("10.48550/arXiv.")
+                .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
+                .unwrap_or(&record.doi);
+
+            let arxiv_record = serde_json::json!({
+                "arxiv_doi": record.doi,
+                "arxiv_id": arxiv_id,
+                "reference_count": record.reference_count,
+                "citation_count": record.citation_count,
+                "cited_by": record.cited_by
+            });
+
+            writeln!(writer, "{}", arxiv_record)?;
         }
         writer.flush()?;
     }
