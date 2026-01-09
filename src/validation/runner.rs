@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use crate::cli::Source;
-use crate::common::{format_elapsed, CitationRecord, MultiValidateStats};
+use crate::common::{format_elapsed, CitationRecord, MultiValidateStats, SplitOutputPaths};
 use crate::index::DoiIndex;
 
 use super::{check_doi_resolves, create_doi_client, lookup_doi, LookupResult};
@@ -326,6 +326,149 @@ pub fn write_arxiv_validation_results(
     Ok(())
 }
 
+/// Filter cited_by entries by provenance
+fn filter_cited_by_by_provenance(
+    cited_by: &[serde_json::Value],
+    keep_asserted: bool,
+) -> Vec<serde_json::Value> {
+    cited_by
+        .iter()
+        .filter(|entry| {
+            let provenance = entry
+                .get("provenance")
+                .and_then(|p| p.as_str())
+                .unwrap_or("mined");
+            let is_asserted = provenance == "publisher" || provenance == "crossref";
+            if keep_asserted {
+                is_asserted
+            } else {
+                !is_asserted
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Write validation results with automatic split by provenance
+pub fn write_validation_results_with_split(
+    valid: &[(CitationRecord, Source)],
+    failed: &[CitationRecord],
+    output_path: &str,
+    output_failed: Option<&str>,
+) -> Result<()> {
+    let paths = SplitOutputPaths::from_base(output_path);
+
+    // Open all three output files
+    let file_all =
+        File::create(&paths.all).with_context(|| format!("Failed to create: {:?}", paths.all))?;
+    let file_asserted = File::create(&paths.asserted)
+        .with_context(|| format!("Failed to create: {:?}", paths.asserted))?;
+    let file_mined = File::create(&paths.mined)
+        .with_context(|| format!("Failed to create: {:?}", paths.mined))?;
+
+    let mut writer_all = BufWriter::new(file_all);
+    let mut writer_asserted = BufWriter::new(file_asserted);
+    let mut writer_mined = BufWriter::new(file_mined);
+
+    for (record, _source) in valid {
+        // Write to main file
+        writeln!(writer_all, "{}", serde_json::to_string(record)?)?;
+
+        // Filter and write to asserted file
+        let asserted_cited_by = filter_cited_by_by_provenance(&record.cited_by, true);
+        if !asserted_cited_by.is_empty() {
+            let asserted_record = serde_json::json!({
+                "doi": record.doi,
+                "arxiv_id": record.arxiv_id,
+                "reference_count": record.reference_count,
+                "citation_count": asserted_cited_by.len(),
+                "cited_by": asserted_cited_by,
+            });
+            writeln!(writer_asserted, "{}", asserted_record)?;
+        }
+
+        // Filter and write to mined file
+        let mined_cited_by = filter_cited_by_by_provenance(&record.cited_by, false);
+        if !mined_cited_by.is_empty() {
+            let mined_record = serde_json::json!({
+                "doi": record.doi,
+                "arxiv_id": record.arxiv_id,
+                "reference_count": record.reference_count,
+                "citation_count": mined_cited_by.len(),
+                "cited_by": mined_cited_by,
+            });
+            writeln!(writer_mined, "{}", mined_record)?;
+        }
+    }
+
+    writer_all.flush()?;
+    writer_asserted.flush()?;
+    writer_mined.flush()?;
+
+    // Handle failed outputs with split (similar logic)
+    if let Some(failed_base) = output_failed {
+        let failed_paths = SplitOutputPaths::from_base(failed_base);
+
+        let file_all = File::create(&failed_paths.all)
+            .with_context(|| format!("Failed to create: {:?}", failed_paths.all))?;
+        let file_asserted = File::create(&failed_paths.asserted)
+            .with_context(|| format!("Failed to create: {:?}", failed_paths.asserted))?;
+        let file_mined = File::create(&failed_paths.mined)
+            .with_context(|| format!("Failed to create: {:?}", failed_paths.mined))?;
+
+        let mut writer_all = BufWriter::new(file_all);
+        let mut writer_asserted = BufWriter::new(file_asserted);
+        let mut writer_mined = BufWriter::new(file_mined);
+
+        for record in failed {
+            // Write to main file
+            writeln!(writer_all, "{}", serde_json::to_string(record)?)?;
+
+            // Filter and write to asserted file
+            let asserted_cited_by = filter_cited_by_by_provenance(&record.cited_by, true);
+            if !asserted_cited_by.is_empty() {
+                let asserted_record = serde_json::json!({
+                    "doi": record.doi,
+                    "arxiv_id": record.arxiv_id,
+                    "reference_count": record.reference_count,
+                    "citation_count": asserted_cited_by.len(),
+                    "cited_by": asserted_cited_by,
+                });
+                writeln!(writer_asserted, "{}", asserted_record)?;
+            }
+
+            // Filter and write to mined file
+            let mined_cited_by = filter_cited_by_by_provenance(&record.cited_by, false);
+            if !mined_cited_by.is_empty() {
+                let mined_record = serde_json::json!({
+                    "doi": record.doi,
+                    "arxiv_id": record.arxiv_id,
+                    "reference_count": record.reference_count,
+                    "citation_count": mined_cited_by.len(),
+                    "cited_by": mined_cited_by,
+                });
+                writeln!(writer_mined, "{}", mined_record)?;
+            }
+        }
+
+        writer_all.flush()?;
+        writer_asserted.flush()?;
+        writer_mined.flush()?;
+
+        info!("Wrote split failed output files:");
+        info!("  All: {:?}", failed_paths.all);
+        info!("  Asserted: {:?}", failed_paths.asserted);
+        info!("  Mined: {:?}", failed_paths.mined);
+    }
+
+    info!("Wrote split output files:");
+    info!("  All: {:?}", paths.all);
+    info!("  Asserted: {:?}", paths.asserted);
+    info!("  Mined: {:?}", paths.mined);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +654,46 @@ mod tests {
         let record: CitationRecord = serde_json::from_str(generic_json).unwrap();
         assert_eq!(record.doi, "10.1234/test");
         assert_eq!(record.arxiv_id, None);
+    }
+
+    #[test]
+    fn test_write_split_by_provenance() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().join("output.jsonl");
+
+        // Create records with different provenances in cited_by
+        let record_mixed = CitationRecord {
+            doi: "10.1234/mixed".to_string(),
+            arxiv_id: None,
+            reference_count: 2,
+            citation_count: 2,
+            cited_by: vec![
+                serde_json::json!({"doi": "10.5555/a", "provenance": "publisher"}),
+                serde_json::json!({"doi": "10.5555/b", "provenance": "mined"}),
+            ],
+        };
+
+        let records = vec![(record_mixed, Source::Crossref)];
+
+        write_validation_results_with_split(&records, &[], base_path.to_str().unwrap(), None)
+            .unwrap();
+
+        // Verify main file exists
+        assert!(base_path.exists());
+
+        // Verify asserted file has only publisher/crossref entries
+        let asserted_path = dir.path().join("output_asserted.jsonl");
+        assert!(asserted_path.exists());
+        let asserted_content = std::fs::read_to_string(&asserted_path).unwrap();
+        assert!(asserted_content.contains("publisher"));
+        assert!(!asserted_content.contains("\"provenance\":\"mined\""));
+
+        // Verify mined file has only mined entries
+        let mined_path = dir.path().join("output_mined.jsonl");
+        assert!(mined_path.exists());
+        let mined_content = std::fs::read_to_string(&mined_path).unwrap();
+        assert!(mined_content.contains("mined"));
     }
 }
