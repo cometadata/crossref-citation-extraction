@@ -4,6 +4,36 @@ use std::path::Path;
 
 use crate::cli::{PipelineArgs, Source};
 use crate::common::setup_logging;
+use crate::index::{build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex};
+
+struct PipelineIndexes {
+    crossref: Option<DoiIndex>,
+    datacite: Option<DoiIndex>,
+}
+
+fn load_indexes(args: &PipelineArgs) -> Result<PipelineIndexes> {
+    let mut indexes = PipelineIndexes {
+        crossref: None,
+        datacite: None,
+    };
+
+    // Load or defer Crossref index (built during streaming)
+    if let Some(ref path) = args.load_crossref_index {
+        info!("Loading Crossref index from: {}", path);
+        indexes.crossref = Some(load_index_from_parquet(path)?);
+    }
+
+    // Load or build DataCite index
+    if let Some(ref path) = args.load_datacite_index {
+        info!("Loading DataCite index from: {}", path);
+        indexes.datacite = Some(load_index_from_parquet(path)?);
+    } else if let Some(ref path) = args.datacite_records {
+        info!("Building DataCite index from: {}", path);
+        indexes.datacite = Some(build_index_from_jsonl_gz(path, "id")?);
+    }
+
+    Ok(indexes)
+}
 
 pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     setup_logging(&args.log_level)?;
@@ -12,15 +42,32 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     info!("Input: {}", args.input);
     info!("Source mode: {}", args.source);
 
-    // Validate required arguments based on source mode
     validate_args(&args)?;
 
     if !Path::new(&args.input).exists() {
         return Err(anyhow::anyhow!("Input file does not exist: {}", args.input));
     }
 
-    // TODO: Implement full pipeline
-    info!("Pipeline stub - implementation in progress");
+    // Phase 1: Load indexes
+    info!("");
+    info!("=== Loading Indexes ===");
+    let mut indexes = load_indexes(&args)?;
+
+    // TODO: Phase 2: Extract and build Crossref index
+    // TODO: Phase 3: Invert partitions
+    // TODO: Phase 4: Validate
+
+    // Save indexes if requested
+    if let Some(ref path) = args.save_crossref_index {
+        if let Some(ref index) = indexes.crossref {
+            save_index_to_parquet(index, path)?;
+        }
+    }
+    if let Some(ref path) = args.save_datacite_index {
+        if let Some(ref index) = indexes.datacite {
+            save_index_to_parquet(index, path)?;
+        }
+    }
 
     Ok(())
 }
