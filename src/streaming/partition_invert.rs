@@ -87,7 +87,7 @@ pub fn invert_partitions(
         .with_context(|| format!("Failed to read partition directory: {:?}", partition_dir))?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().map_or(false, |ext| ext == "parquet"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
         .filter(|path| {
             // Skip already-inverted partitions (from checkpoint)
             let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");

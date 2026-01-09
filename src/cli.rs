@@ -54,7 +54,7 @@ pub enum Commands {
     /// Streams through the Crossref tar.gz archive, extracts DOI references,
     /// partitions by DOI prefix, inverts in parallel, and validates against
     /// source-specific records.
-    Pipeline(PipelineArgs),
+    Pipeline(Box<PipelineArgs>),
 
     /// Validate citations against records without re-running extraction
     Validate(ValidateArgs),

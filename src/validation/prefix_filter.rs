@@ -3,6 +3,7 @@ use crate::index::DoiIndex;
 
 /// Fast prefix-based filter for DOIs
 /// Returns true if the DOI's prefix exists in any of the provided indexes
+#[allow(dead_code)]
 pub fn has_known_prefix(
     doi: &str,
     crossref: Option<&DoiIndex>,
@@ -30,6 +31,7 @@ pub fn has_known_prefix(
 
 /// Determine which source(s) might contain a DOI based on prefix
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum PrefixMatch {
     None,
     Crossref,
@@ -37,6 +39,7 @@ pub enum PrefixMatch {
     Both,
 }
 
+#[allow(dead_code)]
 pub fn prefix_source(
     doi: &str,
     crossref: Option<&DoiIndex>,
@@ -47,8 +50,8 @@ pub fn prefix_source(
         None => return PrefixMatch::None,
     };
 
-    let in_crossref = crossref.map_or(false, |idx| idx.has_prefix(&prefix));
-    let in_datacite = datacite.map_or(false, |idx| idx.has_prefix(&prefix));
+    let in_crossref = crossref.is_some_and(|idx| idx.has_prefix(&prefix));
+    let in_datacite = datacite.is_some_and(|idx| idx.has_prefix(&prefix));
 
     match (in_crossref, in_datacite) {
         (true, true) => PrefixMatch::Both,

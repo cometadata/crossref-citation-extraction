@@ -5,13 +5,17 @@ pub mod runner;
 
 pub use http::*;
 pub use lookup::*;
-pub use prefix_filter::*;
 pub use runner::*;
+
+// Re-export prefix_filter for library users
+#[allow(unused_imports)]
+pub use prefix_filter::{has_known_prefix, prefix_source, PrefixMatch};
 
 use crate::cli::Source;
 use crate::index::DoiIndex;
 
 /// Combined validation context for multi-source validation
+#[allow(dead_code)]
 pub struct ValidationContext {
     pub crossref_index: Option<DoiIndex>,
     pub datacite_index: Option<DoiIndex>,
@@ -21,6 +25,7 @@ pub struct ValidationContext {
     pub timeout_secs: u64,
 }
 
+#[allow(dead_code)]
 impl ValidationContext {
     pub fn new() -> Self {
         Self {

@@ -18,6 +18,7 @@ impl ArxivMatch {
 
 /// Simplified ArxivCitations for validate step (doesn't need full CitingWork structure)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ArxivCitationsSimple {
     pub arxiv_doi: String,
     pub arxiv_id: String,
@@ -28,12 +29,14 @@ pub struct ArxivCitationsSimple {
 
 /// DataCite record - we only need the id (DOI)
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct DataCiteRecord {
     pub id: String,
 }
 
 /// Statistics from validate step
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct ValidateStats {
     pub total_records: usize,
     pub matched_in_datacite: usize,

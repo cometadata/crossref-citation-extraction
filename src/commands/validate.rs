@@ -5,7 +5,9 @@ use std::path::Path;
 use crate::cli::{Source, ValidateArgs};
 use crate::common::setup_logging;
 use crate::index::{build_index_from_jsonl_gz, load_index_from_parquet, DoiIndex};
-use crate::validation::{validate_citations, write_arxiv_validation_results, write_validation_results};
+use crate::validation::{
+    validate_citations, write_arxiv_validation_results, write_validation_results,
+};
 
 pub fn run_validate(args: ValidateArgs) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -72,7 +74,8 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<()> {
         args.http_fallback,
         args.concurrency,
         args.timeout,
-    ).await?;
+    )
+    .await?;
 
     // Write results
     match args.source {
@@ -84,11 +87,7 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<()> {
             )?;
         }
         _ => {
-            write_validation_results(
-                &results,
-                &args.output_valid,
-                Some(&args.output_failed),
-            )?;
+            write_validation_results(&results, &args.output_valid, Some(&args.output_failed))?;
         }
     }
 

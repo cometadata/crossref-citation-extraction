@@ -17,7 +17,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Pipeline(args) => {
-            run_pipeline(args)?;
+            run_pipeline(*args)?;
         }
         Commands::Validate(args) => {
             run_validate(args)?;

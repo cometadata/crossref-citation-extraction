@@ -60,8 +60,8 @@ fn bench_doi_index_lookup(c: &mut Criterion) {
     }
 
     let test_dois = vec![
-        "10.1234/500000",  // exists
-        "10.5678/999999",  // exists
+        "10.1234/500000",   // exists
+        "10.5678/999999",   // exists
         "10.9999/notfound", // doesn't exist
     ];
 

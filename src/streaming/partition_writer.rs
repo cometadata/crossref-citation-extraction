@@ -206,6 +206,7 @@ impl PartitionWriter {
     }
 
     /// Get count of unique partitions
+    #[allow(dead_code)]
     pub fn partition_count(&self) -> usize {
         self.buffers.len()
     }

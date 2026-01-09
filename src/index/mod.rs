@@ -42,6 +42,7 @@ impl DoiIndex {
     }
 
     /// Check if a prefix exists in the index
+    #[allow(dead_code)]
     pub fn has_prefix(&self, prefix: &str) -> bool {
         self.prefixes.contains(&prefix.to_lowercase())
     }
@@ -52,6 +53,7 @@ impl DoiIndex {
     }
 
     /// Check if empty
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.dois.is_empty()
     }
@@ -62,6 +64,7 @@ impl DoiIndex {
     }
 
     /// Merge another index into this one
+    #[allow(dead_code)]
     pub fn merge(&mut self, other: DoiIndex) {
         self.dois.extend(other.dois);
         self.prefixes.extend(other.prefixes);

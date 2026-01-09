@@ -3,8 +3,12 @@ pub mod partition_invert;
 pub mod partition_writer;
 
 pub use checkpoint::*;
-pub use partition_invert::{invert_partitions, InvertStats, OutputMode};
+pub use partition_invert::{invert_partitions, OutputMode};
 pub use partition_writer::*;
+
+// Re-export InvertStats for library users
+#[allow(unused_imports)]
+pub use partition_invert::InvertStats;
 
 /// Extract partition key from a DOI or arXiv ID.
 /// For DOIs: uses prefix (e.g., "10.1234" -> "10.1234")
