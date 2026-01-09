@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::cli::{PipelineArgs, Source};
 use crate::common::setup_logging;
-use crate::extract::{extract_arxiv_matches_from_text, extract_doi_matches_from_text};
+use crate::extract::{extract_arxiv_matches_from_text, extract_doi_matches_from_text, Provenance};
 use crate::index::{
     build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex,
 };
@@ -204,16 +204,19 @@ fn run_extraction(
                         }
 
                         // Extract matches based on source mode
-                        let (raw_matches, cited_ids): (Vec<String>, Vec<String>) = match args.source
+                        let (raw_matches, cited_ids, provenances): (Vec<String>, Vec<String>, Vec<Provenance>) = match args.source
                         {
                             Source::Arxiv => {
                                 // Extract arXiv IDs (just the ID, not the DOI - DOI is constructed in invert step)
+                                // ArxivMatch doesn't have provenance yet, so default to Mined
                                 let matches = extract_arxiv_matches_from_text(&search_text);
                                 let raws: Vec<String> =
                                     matches.iter().map(|m| m.raw.clone()).collect();
                                 let ids: Vec<String> =
                                     matches.iter().map(|m| m.id.clone()).collect();
-                                (raws, ids)
+                                let provs: Vec<Provenance> =
+                                    matches.iter().map(|_| Provenance::Mined).collect();
+                                (raws, ids, provs)
                             }
                             Source::All | Source::Crossref | Source::Datacite => {
                                 // Extract DOIs
@@ -222,21 +225,29 @@ fn run_extraction(
                                     matches.iter().map(|m| m.raw.clone()).collect();
                                 let ids: Vec<String> =
                                     matches.iter().map(|m| m.doi.clone()).collect();
-                                (raws, ids)
+                                let provs: Vec<Provenance> =
+                                    matches.iter().map(|m| m.provenance).collect();
+                                (raws, ids, provs)
                             }
                         };
 
                         if !cited_ids.is_empty() {
                             // Filter out self-citations
-                            let (filtered_raw_matches, filtered_cited_ids): (Vec<_>, Vec<_>) =
+                            let (filtered_raw_matches, filtered_cited_ids, filtered_provenances): (Vec<_>, Vec<_>, Vec<_>) =
                                 raw_matches
                                     .iter()
                                     .zip(cited_ids.iter())
-                                    .filter(|(_, cited_id)| {
+                                    .zip(provenances.iter())
+                                    .filter(|((_, cited_id), _)| {
                                         should_include_citation(&work_doi, cited_id)
                                     })
-                                    .map(|(raw, cited)| (raw.clone(), cited.clone()))
-                                    .unzip();
+                                    .map(|((raw, cited), prov)| (raw.clone(), cited.clone(), *prov))
+                                    .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, (raw, cited, prov)| {
+                                        acc.0.push(raw);
+                                        acc.1.push(cited);
+                                        acc.2.push(prov);
+                                        acc
+                                    });
 
                             if !filtered_cited_ids.is_empty() {
                                 stats.refs_with_matches += 1;
@@ -248,6 +259,7 @@ fn run_extraction(
                                     &ref_json,
                                     &filtered_raw_matches,
                                     &filtered_cited_ids,
+                                    &filtered_provenances,
                                 )?;
                             }
                         }
