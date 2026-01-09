@@ -4,6 +4,7 @@ mod common;
 mod extract;
 mod index;
 mod streaming;
+mod validation;
 
 use anyhow::Result;
 use clap::Parser;
