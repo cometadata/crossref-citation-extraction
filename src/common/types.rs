@@ -42,3 +42,24 @@ pub struct ValidateStats {
     pub total_valid: usize,
     pub total_failed: usize,
 }
+
+/// Generic citation record for Crossref/DataCite output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationRecord {
+    pub doi: String,
+    pub reference_count: usize,
+    pub citation_count: usize,
+    pub cited_by: Vec<Value>,
+}
+
+/// Statistics from multi-source validation
+#[derive(Debug, Clone, Default)]
+pub struct MultiValidateStats {
+    pub total_records: usize,
+    pub crossref_matched: usize,
+    pub crossref_http_resolved: usize,
+    pub crossref_failed: usize,
+    pub datacite_matched: usize,
+    pub datacite_http_resolved: usize,
+    pub datacite_failed: usize,
+}
