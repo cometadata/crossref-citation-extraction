@@ -7,10 +7,10 @@ CLI for extracting and validating DOI references from Crossref data files.
 This tool processes Crossref snapshot data to identify works that cite other DOIs, validates those citations against Crossref and DataCite records, and outputs citation data organized by cited work.
 
 Supported extraction modes:
-- **all**: Extract all DOIs, validate against both Crossref and DataCite
-- **crossref**: Extract DOIs, validate only against Crossref records
-- **datacite**: Extract DOIs, validate only against DataCite records
-- **arxiv**: Extract arXiv references using pattern matching, validate against DataCite
+- `all`: Extract all DOIs asserted in references, validate against both Crossref and DataCite
+- `crossref`: Extract DOIs asserted in references, validate only against Crossref records
+- `datacite`: Extract DOI asserted in references, validate only against DataCite records
+- `arxiv`: Extract arXiv references using pattern matching, validate against DataCite
 
 ## Building
 
@@ -42,7 +42,7 @@ crossref-citation-extraction pipeline \
   --output-crossref crossref_citations.jsonl
 ```
 
-### arXiv Only (Original Behavior)
+### arXiv Only
 
 ```bash
 crossref-citation-extraction pipeline \
@@ -54,31 +54,31 @@ crossref-citation-extraction pipeline \
 
 ### Options
 
-**Source selection:**
+`Source selection:`
 - `--source all|crossref|datacite|arxiv` - Which source to extract and validate
 
-**Input files:**
+`Input files:`
 - `--input` - Crossref snapshot tar.gz (required)
 - `--datacite-records` - DataCite records JSONL.gz (required for datacite/arxiv modes)
 
-**Output files:**
+`Output files:`
 - `--output-crossref` - Crossref citations output
 - `--output-datacite` - DataCite citations output
 - `--output-arxiv` - arXiv citations output (arxiv mode)
 - `--output-*-failed` - Failed validation output for each source
 
-**Index persistence:**
+`Index persistence:`
 - `--save-crossref-index path.parquet` - Save Crossref DOI index
 - `--load-crossref-index path.parquet` - Load Crossref DOI index
 - `--save-datacite-index path.parquet` - Save DataCite DOI index
 - `--load-datacite-index path.parquet` - Load DataCite DOI index
 
-**Validation:**
+`Validation:`
 - `--http-fallback crossref,datacite` - Enable HTTP validation for specified sources
 - `--concurrency N` - Concurrent HTTP requests (default: 50)
 - `--timeout N` - Seconds per request (default: 5)
 
-**Other:**
+`Other:`
 - `--keep-intermediates` - Keep partition files after completion
 - `--temp-dir` - Directory for intermediate files
 - `--batch-size` - Batch size for memory management
@@ -158,7 +158,7 @@ The extractor recognizes these DOI formats:
 - Prefixed: `doi:10.1234/example`
 - URL: `https://doi.org/10.1234/example`, `http://dx.doi.org/10.1234/example`
 
-## arXiv ID Patterns (arxiv mode)
+## arXiv ID Patterns
 
 - Modern: `arXiv:2403.03542`, `arXiv.2403.03542v2`
 - Old format: `arXiv:hep-ph/9901234`, `arXiv:cs.DM/9910013`
@@ -167,6 +167,6 @@ The extractor recognizes these DOI formats:
 
 ## Validation Logic
 
-1. Check DOI against local index (fast, O(1) lookup)
+1. Check DOI against local index
 2. For unmatched DOIs with `--http-fallback`, attempt HTTP HEAD to doi.org
 3. DOI is valid if found in index OR doi.org returns 2xx/3xx
