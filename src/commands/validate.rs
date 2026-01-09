@@ -92,13 +92,15 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
 
     info!("Starting Crossref ArXiv Citations Validator");
     info!("Input: {}", args.input);
-    info!("Records: {}", args.records);
+    info!("Source: {}", args.source);
     info!("Output valid: {}", args.output_valid);
     info!("Output failed: {}", args.output_failed);
     info!("Concurrency: {}", args.concurrency);
     info!("Timeout: {}s", args.timeout);
 
-    let datacite_dois = load_datacite_dois(&args.records)?;
+    let datacite_records = args.datacite_records.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DataCite records file required for validation"))?;
+    let datacite_dois = load_datacite_dois(datacite_records)?;
 
     let input_file = File::open(&args.input)
         .with_context(|| format!("Failed to open input file: {}", args.input))?;

@@ -15,7 +15,7 @@ use crate::commands::validate;
 use crate::common::{format_elapsed, setup_logging, ValidateStats};
 use crate::common::ArxivMatch;
 use crate::extract::extract_arxiv_matches_from_text;
-use crate::streaming::{invert_partitions, Checkpoint, InvertStats, PartitionWriter, PipelinePhase};
+use crate::streaming::{invert_partitions, Checkpoint, InvertStats, OutputMode, PartitionWriter, PipelinePhase};
 
 /// Statistics from the fused convert+extract step
 #[derive(Debug, Clone, Default)]
@@ -306,8 +306,10 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
 
     info!("Starting arXiv citation pipeline (Fused Streaming)");
     info!("Input: {}", args.input);
-    info!("DataCite records: {}", args.records);
-    info!("Output: {}", args.output);
+    info!("Source: {}", args.source);
+    if let Some(ref records) = args.datacite_records {
+        info!("DataCite records: {}", records);
+    }
 
     if !Path::new(&args.input).exists() {
         return Err(anyhow::anyhow!("Input file does not exist: {}", args.input));
@@ -387,6 +389,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
             &ctx.output_parquet,
             Some(&ctx.output_jsonl),
             &mut checkpoint,
+            OutputMode::Arxiv,
         )?;
 
         stats.invert = invert_stats;
@@ -400,44 +403,57 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
         checkpoint.save(&ctx.checkpoint_path)?;
     }
 
-    // Phase 3: Validate (optional, but part of original pipeline)
-    info!("");
-    info!("=== Validating arXiv DOIs ===");
-    info!("");
+    // Phase 3: Validate (optional, requires datacite_records)
+    if let Some(ref datacite_records) = args.datacite_records {
+        info!("");
+        info!("=== Validating arXiv DOIs ===");
+        info!("");
 
-    let validate_args = ValidateArgs {
-        input: ctx.output_jsonl.to_string_lossy().to_string(),
-        records: args.records.clone(),
-        output_valid: args.output.clone(),
-        output_failed: args.output_failed.clone().unwrap_or_else(|| {
+        let output_valid = args.output_arxiv.clone().unwrap_or_else(|| {
+            ctx.partition_dir.join("valid.jsonl").to_string_lossy().to_string()
+        });
+        let output_failed = args.output_arxiv_failed.clone().unwrap_or_else(|| {
             ctx.partition_dir.join("failed_temp.jsonl").to_string_lossy().to_string()
-        }),
-        concurrency: args.concurrency,
-        timeout: args.timeout,
-        log_level: "OFF".to_string(),
-    };
+        });
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let validate_stats = rt.block_on(validate::run_validate_async(validate_args))
-        .context("Validate step failed")?;
+        let validate_args = ValidateArgs {
+            input: ctx.output_jsonl.to_string_lossy().to_string(),
+            datacite_records: Some(datacite_records.clone()),
+            crossref_index: None,
+            source: crate::cli::Source::Arxiv,
+            output_valid: output_valid.clone(),
+            output_failed: output_failed.clone(),
+            http_fallback: args.http_fallback.contains(&"datacite".to_string()),
+            concurrency: args.concurrency,
+            timeout: args.timeout,
+            log_level: "OFF".to_string(),
+        };
 
-    setup_logging(&args.log_level)?;
+        let rt = tokio::runtime::Runtime::new()?;
+        let validate_stats = rt.block_on(validate::run_validate_async(validate_args))
+            .context("Validate step failed")?;
 
-    info!("Validation complete:");
-    info!("  Matched in DataCite: {}", validate_stats.matched_in_datacite);
-    info!("  Resolution resolved: {}", validate_stats.resolution_resolved);
-    info!("  Resolution failed: {}", validate_stats.resolution_failed);
-    info!("  Total valid: {}", validate_stats.total_valid);
-    info!("  Total failed: {}", validate_stats.total_failed);
+        setup_logging(&args.log_level)?;
 
-    stats.validate = Some(validate_stats.clone());
+        info!("Validation complete:");
+        info!("  Matched in DataCite: {}", validate_stats.matched_in_datacite);
+        info!("  Resolution resolved: {}", validate_stats.resolution_resolved);
+        info!("  Resolution failed: {}", validate_stats.resolution_failed);
+        info!("  Total valid: {}", validate_stats.total_valid);
+        info!("  Total failed: {}", validate_stats.total_failed);
 
-    // Cleanup temp failed file if not requested
-    if args.output_failed.is_none() {
-        let temp_failed = ctx.partition_dir.join("failed_temp.jsonl");
-        if temp_failed.exists() {
-            let _ = fs::remove_file(temp_failed);
+        stats.validate = Some(validate_stats.clone());
+
+        // Cleanup temp failed file if not requested
+        if args.output_arxiv_failed.is_none() {
+            let temp_failed = ctx.partition_dir.join("failed_temp.jsonl");
+            if temp_failed.exists() {
+                let _ = fs::remove_file(temp_failed);
+            }
         }
+    } else {
+        info!("");
+        info!("Skipping validation (no datacite_records provided)");
     }
 
     ctx.cleanup()?;
@@ -467,9 +483,14 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
         info!("  Total failed: {}", vs.total_failed);
         info!("");
     }
-    info!("Output: {}", args.output);
-    if let Some(ref failed) = args.output_failed {
-        info!("Output failed: {}", failed);
+    if let Some(ref output) = args.output_arxiv {
+        info!("Output (arXiv): {}", output);
+    }
+    if let Some(ref output) = args.output_crossref {
+        info!("Output (Crossref): {}", output);
+    }
+    if let Some(ref output) = args.output_datacite {
+        info!("Output (DataCite): {}", output);
     }
     info!("===========================================================");
 

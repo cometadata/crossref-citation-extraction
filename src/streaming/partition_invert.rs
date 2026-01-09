@@ -9,6 +9,16 @@ use std::path::Path;
 
 use super::Checkpoint;
 
+/// Output mode for inverted data
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// arXiv-specific output with arxiv_doi and arxiv_id fields
+    #[default]
+    Arxiv,
+    /// Generic DOI output with just doi field
+    Generic,
+}
+
 /// Statistics from inverting partitions
 #[derive(Debug, Clone, Default)]
 pub struct InvertStats {
@@ -19,23 +29,23 @@ pub struct InvertStats {
 
 /// Invert a single partition file
 ///
-/// Each partition file contains rows with (citing_doi, ref_index, ref_json, raw_match, arxiv_id).
-/// This function groups by arxiv_id and aggregates to produce the inverted index.
-fn invert_single_partition(partition_path: &Path) -> Result<DataFrame> {
+/// Each partition file contains rows with (citing_doi, ref_index, ref_json, raw_match, cited_id).
+/// This function groups by cited_id and aggregates to produce the inverted index.
+fn invert_single_partition(partition_path: &Path, output_mode: OutputMode) -> Result<DataFrame> {
     debug!("Inverting partition: {:?}", partition_path);
 
     let lf = LazyFrame::scan_parquet(partition_path, Default::default())
         .with_context(|| format!("Failed to scan partition: {:?}", partition_path))?;
 
-    // Group by arxiv_id, aggregating citations
-    // Note: rows are already exploded (one row per arxiv_id per reference)
+    // Group by cited_id, aggregating citations
+    // Note: rows are already exploded (one row per cited_id per reference)
     let inverted = lf
-        // Deduplicate (same citing_doi + arxiv_id should only count once)
+        // Deduplicate (same citing_doi + cited_id should only count once)
         .unique(
-            Some(vec!["citing_doi".into(), "arxiv_id".into()]),
+            Some(vec!["citing_doi".into(), "cited_id".into()]),
             UniqueKeepStrategy::First,
         )
-        .group_by([col("arxiv_id")])
+        .group_by([col("cited_id")])
         .agg([
             col("citing_doi").n_unique().alias("citation_count"),
             col("citing_doi").count().alias("reference_count"),
@@ -45,11 +55,16 @@ fn invert_single_partition(partition_path: &Path) -> Result<DataFrame> {
                 col("ref_json").alias("reference"),
             ])
             .alias("cited_by"),
-        ])
-        .with_columns([
-            concat_str([lit("10.48550/arXiv."), col("arxiv_id")], "", true)
-                .alias("arxiv_doi"),
         ]);
+
+    // Add arxiv_doi column only for Arxiv output mode
+    let inverted = match output_mode {
+        OutputMode::Arxiv => inverted.with_columns([
+            concat_str([lit("10.48550/arXiv."), col("cited_id")], "", true)
+                .alias("arxiv_doi"),
+        ]),
+        OutputMode::Generic => inverted,
+    };
 
     inverted.collect()
         .with_context(|| format!("Failed to collect inverted partition: {:?}", partition_path))
@@ -61,6 +76,7 @@ pub fn invert_partitions(
     output_parquet: &Path,
     output_jsonl: Option<&Path>,
     checkpoint: &mut Checkpoint,
+    output_mode: OutputMode,
 ) -> Result<InvertStats> {
     // Find all partition files
     let partition_files: Vec<_> = fs::read_dir(partition_dir)
@@ -83,7 +99,7 @@ pub fn invert_partitions(
     let results: Vec<Result<(String, DataFrame)>> = partition_files
         .par_iter()
         .map(|path| {
-            let df = invert_single_partition(path)?;
+            let df = invert_single_partition(path, output_mode)?;
             let name = path.file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
@@ -145,7 +161,10 @@ pub fn invert_partitions(
 
     // Write JSONL output if requested
     if let Some(jsonl_path) = output_jsonl {
-        write_jsonl_output(&combined, jsonl_path)?;
+        match output_mode {
+            OutputMode::Arxiv => write_arxiv_jsonl_output(&combined, jsonl_path)?,
+            OutputMode::Generic => write_generic_jsonl_output(&combined, jsonl_path)?,
+        }
     }
 
     let stats = InvertStats {
@@ -157,23 +176,23 @@ pub fn invert_partitions(
     Ok(stats)
 }
 
-/// Write DataFrame to JSONL format for validate step compatibility
-fn write_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
-    info!("Writing JSONL output: {:?}", path);
+/// Write DataFrame to JSONL format for arXiv-specific output
+fn write_arxiv_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
+    info!("Writing arXiv JSONL output: {:?}", path);
 
     let file = File::create(path)
         .with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
     let mut writer = BufWriter::new(file);
 
     let arxiv_doi = df.column("arxiv_doi")?.str()?;
-    let arxiv_id = df.column("arxiv_id")?.str()?;
+    let cited_id = df.column("cited_id")?.str()?;
     let reference_count = df.column("reference_count")?.u32()?;
     let citation_count = df.column("citation_count")?.u32()?;
     let cited_by = df.column("cited_by")?;
 
     for i in 0..df.height() {
         let doi = arxiv_doi.get(i).unwrap_or("");
-        let id = arxiv_id.get(i).unwrap_or("");
+        let id = cited_id.get(i).unwrap_or("");
         let ref_count = reference_count.get(i).unwrap_or(0);
         let cit_count = citation_count.get(i).unwrap_or(0);
 
@@ -182,6 +201,40 @@ fn write_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
         let json_line = serde_json::json!({
             "arxiv_doi": doi,
             "arxiv_id": id,
+            "reference_count": ref_count,
+            "citation_count": cit_count,
+            "cited_by": cited_by_json
+        });
+
+        writeln!(writer, "{}", json_line)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write DataFrame to JSONL format for generic DOI citations
+fn write_generic_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
+    info!("Writing generic JSONL output: {:?}", path);
+
+    let file = File::create(path)
+        .with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
+    let mut writer = BufWriter::new(file);
+
+    let cited_id = df.column("cited_id")?.str()?;
+    let reference_count = df.column("reference_count")?.u32()?;
+    let citation_count = df.column("citation_count")?.u32()?;
+    let cited_by = df.column("cited_by")?;
+
+    for i in 0..df.height() {
+        let doi = cited_id.get(i).unwrap_or("");
+        let ref_count = reference_count.get(i).unwrap_or(0);
+        let cit_count = citation_count.get(i).unwrap_or(0);
+
+        let cited_by_json = build_cited_by_json(cited_by, i)?;
+
+        let json_line = serde_json::json!({
+            "doi": doi,
             "reference_count": ref_count,
             "citation_count": cit_count,
             "cited_by": cited_by_json
@@ -254,14 +307,14 @@ mod tests {
         let ref_indices: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let ref_jsons: Vec<String> = rows.iter().map(|r| r.2.to_string()).collect();
         let raw_matches: Vec<String> = rows.iter().map(|r| r.3.to_string()).collect();
-        let arxiv_ids: Vec<String> = rows.iter().map(|r| r.4.to_string()).collect();
+        let cited_ids: Vec<String> = rows.iter().map(|r| r.4.to_string()).collect();
 
         let mut df = DataFrame::new(vec![
             Column::new("citing_doi".into(), &citing_dois),
             Column::new("ref_index".into(), &ref_indices),
             Column::new("ref_json".into(), &ref_jsons),
             Column::new("raw_match".into(), &raw_matches),
-            Column::new("arxiv_id".into(), &arxiv_ids),
+            Column::new("cited_id".into(), &cited_ids),
         ])?;
 
         let file = File::create(dir.join(format!("{}.parquet", name)))?;
@@ -270,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invert_single_partition() {
+    fn test_invert_single_partition_arxiv_mode() {
         let dir = tempdir().unwrap();
 
         create_test_partition(dir.path(), "2403", vec![
@@ -279,17 +332,47 @@ mod tests {
             ("10.1234/a", 2, "{}", "arXiv:2403.67890", "2403.67890"),
         ]).unwrap();
 
-        let df = invert_single_partition(&dir.path().join("2403.parquet")).unwrap();
+        let df = invert_single_partition(&dir.path().join("2403.parquet"), OutputMode::Arxiv).unwrap();
 
-        assert_eq!(df.height(), 2); // Two unique arxiv_ids
+        assert_eq!(df.height(), 2); // Two unique cited_ids
 
-        let arxiv_ids: Vec<_> = df.column("arxiv_id").unwrap()
+        let cited_ids: Vec<_> = df.column("cited_id").unwrap()
             .str().unwrap()
             .into_iter()
             .filter_map(|s| s.map(|s| s.to_string()))
             .collect();
 
-        assert!(arxiv_ids.contains(&"2403.12345".to_string()));
-        assert!(arxiv_ids.contains(&"2403.67890".to_string()));
+        assert!(cited_ids.contains(&"2403.12345".to_string()));
+        assert!(cited_ids.contains(&"2403.67890".to_string()));
+
+        // Arxiv mode should have arxiv_doi column
+        assert!(df.column("arxiv_doi").is_ok());
+    }
+
+    #[test]
+    fn test_invert_single_partition_generic_mode() {
+        let dir = tempdir().unwrap();
+
+        create_test_partition(dir.path(), "10.1234", vec![
+            ("10.5555/a", 0, "{}", "10.1234/test1", "10.1234/test1"),
+            ("10.5555/b", 1, "{}", "10.1234/test1", "10.1234/test1"),
+            ("10.5555/a", 2, "{}", "10.1234/test2", "10.1234/test2"),
+        ]).unwrap();
+
+        let df = invert_single_partition(&dir.path().join("10.1234.parquet"), OutputMode::Generic).unwrap();
+
+        assert_eq!(df.height(), 2); // Two unique cited_ids
+
+        let cited_ids: Vec<_> = df.column("cited_id").unwrap()
+            .str().unwrap()
+            .into_iter()
+            .filter_map(|s| s.map(|s| s.to_string()))
+            .collect();
+
+        assert!(cited_ids.contains(&"10.1234/test1".to_string()));
+        assert!(cited_ids.contains(&"10.1234/test2".to_string()));
+
+        // Generic mode should NOT have arxiv_doi column
+        assert!(df.column("arxiv_doi").is_err());
     }
 }
