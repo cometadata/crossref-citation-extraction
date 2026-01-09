@@ -1,14 +1,34 @@
-use anyhow::Result;
-use log::info;
-use std::path::Path;
+use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
+use log::{debug, info, warn};
+use serde_json::Value;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use tar::Archive;
+use uuid::Uuid;
 
 use crate::cli::{PipelineArgs, Source};
 use crate::common::setup_logging;
-use crate::index::{build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex};
+use crate::extract::{extract_arxiv_matches_from_text, extract_doi_matches_from_text};
+use crate::index::{
+    build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex,
+};
+use crate::streaming::PartitionWriter;
 
 struct PipelineIndexes {
     crossref: Option<DoiIndex>,
     datacite: Option<DoiIndex>,
+}
+
+/// Statistics from the extraction phase
+#[derive(Debug, Clone, Default)]
+pub struct ExtractionStats {
+    pub files_processed: usize,
+    pub items_processed: usize,
+    pub refs_with_matches: usize,
+    pub total_matches: usize,
+    pub crossref_dois_indexed: usize,
 }
 
 fn load_indexes(args: &PipelineArgs) -> Result<PipelineIndexes> {
@@ -35,6 +55,175 @@ fn load_indexes(args: &PipelineArgs) -> Result<PipelineIndexes> {
     Ok(indexes)
 }
 
+/// Determine if we should build the Crossref index during extraction
+fn should_build_crossref_index(args: &PipelineArgs) -> bool {
+    // Build the index if:
+    // 1. We're extracting DOIs (not arxiv mode) AND
+    // 2. We don't already have a loaded index AND
+    // 3. We need the index for validation (crossref or all mode)
+    args.load_crossref_index.is_none()
+        && matches!(args.source, Source::All | Source::Crossref)
+}
+
+/// Run the extraction phase: stream through tar.gz, extract references, build Crossref index
+fn run_extraction(
+    args: &PipelineArgs,
+    indexes: &mut PipelineIndexes,
+    partition_dir: &Path,
+) -> Result<ExtractionStats> {
+    let mut stats = ExtractionStats::default();
+    let build_crossref_index = should_build_crossref_index(args);
+
+    // Initialize Crossref index if we're building it
+    if build_crossref_index && indexes.crossref.is_none() {
+        info!("Will build Crossref index during extraction");
+        indexes.crossref = Some(DoiIndex::new());
+    }
+
+    // Create partition writer
+    let flush_threshold = args.batch_size / 100; // Flush per partition more frequently
+    let mut writer = PartitionWriter::new(partition_dir, flush_threshold.max(10000))?;
+
+    // Open and stream the tar.gz
+    let file = File::open(&args.input)
+        .with_context(|| format!("Failed to open input file: {}", args.input))?;
+    let gz = GzDecoder::new(file);
+    let mut archive = Archive::new(gz);
+
+    info!("Streaming through Crossref archive...");
+
+    for entry_result in archive.entries()? {
+        let entry = entry_result.context("Failed to read tar entry")?;
+        let path = entry.path()?.to_path_buf();
+
+        // Skip non-JSON files
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(".json") {
+            continue;
+        }
+
+        debug!("Processing: {}", path_str);
+
+        // Read and parse JSON
+        let reader = BufReader::new(entry);
+        let json: Value = match serde_json::from_reader(reader) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to parse JSON in {}: {}", path_str, e);
+                continue;
+            }
+        };
+
+        // Process items array
+        if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                stats.items_processed += 1;
+
+                // Extract the work's DOI
+                let work_doi = match item.get("DOI").and_then(|v| v.as_str()) {
+                    Some(doi) => doi.to_lowercase(),
+                    None => continue, // Skip items without DOI
+                };
+
+                // Add to Crossref index if building
+                if build_crossref_index {
+                    if let Some(ref mut index) = indexes.crossref {
+                        index.insert(&work_doi);
+                        stats.crossref_dois_indexed += 1;
+                    }
+                }
+
+                // Process references
+                if let Some(references) = item.get("reference").and_then(|v| v.as_array()) {
+                    for (ref_idx, reference) in references.iter().enumerate() {
+                        let ref_json = reference.to_string();
+
+                        // Collect text to search for matches
+                        let mut search_text = String::new();
+
+                        // Include the DOI field if present
+                        if let Some(doi) = reference.get("DOI").and_then(|v| v.as_str()) {
+                            search_text.push_str(doi);
+                            search_text.push(' ');
+                        }
+
+                        // Include unstructured text if present
+                        if let Some(unstructured) =
+                            reference.get("unstructured").and_then(|v| v.as_str())
+                        {
+                            search_text.push_str(unstructured);
+                        }
+
+                        if search_text.is_empty() {
+                            continue;
+                        }
+
+                        // Extract matches based on source mode
+                        let (raw_matches, cited_ids): (Vec<String>, Vec<String>) =
+                            match args.source {
+                                Source::Arxiv => {
+                                    // Extract arXiv IDs
+                                    let matches = extract_arxiv_matches_from_text(&search_text);
+                                    let raws: Vec<String> =
+                                        matches.iter().map(|m| m.raw.clone()).collect();
+                                    let ids: Vec<String> =
+                                        matches.iter().map(|m| m.arxiv_doi.clone()).collect();
+                                    (raws, ids)
+                                }
+                                Source::All | Source::Crossref | Source::Datacite => {
+                                    // Extract DOIs
+                                    let matches = extract_doi_matches_from_text(&search_text);
+                                    let raws: Vec<String> =
+                                        matches.iter().map(|m| m.raw.clone()).collect();
+                                    let ids: Vec<String> =
+                                        matches.iter().map(|m| m.doi.clone()).collect();
+                                    (raws, ids)
+                                }
+                            };
+
+                        if !cited_ids.is_empty() {
+                            stats.refs_with_matches += 1;
+                            stats.total_matches += cited_ids.len();
+
+                            writer.write_extracted_ref(
+                                &work_doi,
+                                ref_idx as u32,
+                                &ref_json,
+                                &raw_matches,
+                                &cited_ids,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
+        stats.files_processed += 1;
+
+        // Log progress periodically
+        if stats.files_processed % 100 == 0 {
+            info!(
+                "Progress: {} files, {} items, {} matches",
+                stats.files_processed, stats.items_processed, stats.total_matches
+            );
+        }
+    }
+
+    // Flush remaining data
+    writer.flush_all()?;
+
+    info!("Extraction complete:");
+    info!("  Files processed: {}", stats.files_processed);
+    info!("  Items processed: {}", stats.items_processed);
+    info!("  References with matches: {}", stats.refs_with_matches);
+    info!("  Total matches: {}", stats.total_matches);
+    if build_crossref_index {
+        info!("  Crossref DOIs indexed: {}", stats.crossref_dois_indexed);
+    }
+
+    Ok(stats)
+}
+
 pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     setup_logging(&args.log_level)?;
 
@@ -53,7 +242,31 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     info!("=== Loading Indexes ===");
     let mut indexes = load_indexes(&args)?;
 
-    // TODO: Phase 2: Extract and build Crossref index
+    // Set up partition directory
+    let partition_dir = if let Some(ref dir) = args.temp_dir {
+        let path = PathBuf::from(dir);
+        std::fs::create_dir_all(&path)?;
+        path
+    } else {
+        // Create a unique temp directory
+        let temp_base = std::env::temp_dir();
+        let unique_dir = temp_base.join(format!("crossref-extract-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&unique_dir)
+            .context("Failed to create temp directory")?;
+        unique_dir
+    };
+    let cleanup_temp = args.temp_dir.is_none() && !args.keep_intermediates;
+    info!("Partition directory: {}", partition_dir.display());
+
+    // Phase 2: Extract and build Crossref index
+    info!("");
+    info!("=== Extraction Phase ===");
+    let extraction_stats = run_extraction(&args, &mut indexes, &partition_dir)?;
+
+    if extraction_stats.total_matches == 0 {
+        warn!("No matches found during extraction");
+    }
+
     // TODO: Phase 3: Invert partitions
     // TODO: Phase 4: Validate
 
@@ -66,6 +279,14 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     if let Some(ref path) = args.save_datacite_index {
         if let Some(ref index) = indexes.datacite {
             save_index_to_parquet(index, path)?;
+        }
+    }
+
+    // Cleanup temp directory if needed
+    if cleanup_temp {
+        info!("Cleaning up temp directory: {}", partition_dir.display());
+        if let Err(e) = std::fs::remove_dir_all(&partition_dir) {
+            warn!("Failed to cleanup temp directory: {}", e);
         }
     }
 
