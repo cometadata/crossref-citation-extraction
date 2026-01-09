@@ -1,9 +1,11 @@
 pub mod logging;
+pub mod output;
 pub mod progress;
 pub mod types;
 pub mod utils;
 
 pub use logging::*;
+pub use output::SplitOutputPaths;
 pub use types::*;
 pub use utils::*;
 
