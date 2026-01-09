@@ -245,7 +245,10 @@ fn test_provenance_end_to_end() {
             record.get("citation_count").is_some(),
             "Should have citation_count field"
         );
-        assert!(record.get("cited_by").is_some(), "Should have cited_by field");
+        assert!(
+            record.get("cited_by").is_some(),
+            "Should have cited_by field"
+        );
 
         // Verify cited_by entries have provenance field
         let cited_by = record.get("cited_by").unwrap().as_array().unwrap();
@@ -263,10 +266,7 @@ fn test_provenance_end_to_end() {
         main_records.push(record);
     }
 
-    assert!(
-        !main_records.is_empty(),
-        "Main output should have records"
-    );
+    assert!(!main_records.is_empty(), "Main output should have records");
 
     // Read and verify asserted output file (should only have publisher/crossref provenance)
     let asserted_file = File::open(&asserted_path).unwrap();
@@ -289,10 +289,7 @@ fn test_provenance_end_to_end() {
         asserted_count += 1;
     }
 
-    assert!(
-        asserted_count > 0,
-        "Asserted output should have records"
-    );
+    assert!(asserted_count > 0, "Asserted output should have records");
 
     // Read and verify mined output file (should only have mined provenance)
     let mined_file = File::open(&mined_path).unwrap();

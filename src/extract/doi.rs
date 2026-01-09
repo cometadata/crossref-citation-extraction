@@ -15,14 +15,18 @@ lazy_static! {
 /// Represents a matched DOI with raw match text, normalized form, and provenance
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoiMatch {
-    pub doi: String,           // Normalized DOI (lowercase, cleaned)
-    pub raw: String,           // Original matched substring
+    pub doi: String,            // Normalized DOI (lowercase, cleaned)
+    pub raw: String,            // Original matched substring
     pub provenance: Provenance, // How this DOI was obtained
 }
 
 impl DoiMatch {
     pub fn new(doi: String, raw: String, provenance: Provenance) -> Self {
-        Self { doi, raw, provenance }
+        Self {
+            doi,
+            raw,
+            provenance,
+        }
     }
 
     /// Create a mined DoiMatch (extracted from text)
@@ -177,7 +181,11 @@ mod tests {
 
     #[test]
     fn test_doi_match_with_provenance() {
-        let m = DoiMatch::new("10.1234/test".to_string(), "10.1234/test".to_string(), Provenance::Publisher);
+        let m = DoiMatch::new(
+            "10.1234/test".to_string(),
+            "10.1234/test".to_string(),
+            Provenance::Publisher,
+        );
         assert_eq!(m.doi, "10.1234/test");
         assert_eq!(m.provenance, Provenance::Publisher);
     }

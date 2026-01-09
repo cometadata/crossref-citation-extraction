@@ -23,6 +23,7 @@ impl Provenance {
     }
 
     /// Check if this is an asserted provenance (publisher or crossref)
+    #[allow(dead_code)]
     pub fn is_asserted(&self) -> bool {
         matches!(self, Provenance::Publisher | Provenance::Crossref)
     }
@@ -40,16 +41,34 @@ mod tests {
 
     #[test]
     fn test_provenance_serialization() {
-        assert_eq!(serde_json::to_string(&Provenance::Publisher).unwrap(), "\"publisher\"");
-        assert_eq!(serde_json::to_string(&Provenance::Crossref).unwrap(), "\"crossref\"");
-        assert_eq!(serde_json::to_string(&Provenance::Mined).unwrap(), "\"mined\"");
+        assert_eq!(
+            serde_json::to_string(&Provenance::Publisher).unwrap(),
+            "\"publisher\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Provenance::Crossref).unwrap(),
+            "\"crossref\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Provenance::Mined).unwrap(),
+            "\"mined\""
+        );
     }
 
     #[test]
     fn test_provenance_deserialization() {
-        assert_eq!(serde_json::from_str::<Provenance>("\"publisher\"").unwrap(), Provenance::Publisher);
-        assert_eq!(serde_json::from_str::<Provenance>("\"crossref\"").unwrap(), Provenance::Crossref);
-        assert_eq!(serde_json::from_str::<Provenance>("\"mined\"").unwrap(), Provenance::Mined);
+        assert_eq!(
+            serde_json::from_str::<Provenance>("\"publisher\"").unwrap(),
+            Provenance::Publisher
+        );
+        assert_eq!(
+            serde_json::from_str::<Provenance>("\"crossref\"").unwrap(),
+            Provenance::Crossref
+        );
+        assert_eq!(
+            serde_json::from_str::<Provenance>("\"mined\"").unwrap(),
+            Provenance::Mined
+        );
     }
 
     #[test]

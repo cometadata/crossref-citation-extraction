@@ -149,6 +149,7 @@ pub async fn validate_citations(
 }
 
 /// Write validation results to output files
+#[allow(dead_code)]
 pub fn write_validation_results(
     results: &ValidationResults,
     output_valid: &str,
@@ -254,6 +255,7 @@ pub fn write_split_validation_results(
 }
 
 /// Write arXiv validation results (preserves arXiv format)
+#[allow(dead_code)]
 pub fn write_arxiv_validation_results(
     results: &ValidationResults,
     output_arxiv: &str,

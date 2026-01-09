@@ -52,7 +52,10 @@ mod tests {
     fn test_split_path_with_directory() {
         let paths = SplitOutputPaths::from_base("/path/to/output.jsonl");
         assert_eq!(paths.all, PathBuf::from("/path/to/output.jsonl"));
-        assert_eq!(paths.asserted, PathBuf::from("/path/to/output_asserted.jsonl"));
+        assert_eq!(
+            paths.asserted,
+            PathBuf::from("/path/to/output_asserted.jsonl")
+        );
         assert_eq!(paths.mined, PathBuf::from("/path/to/output_mined.jsonl"));
     }
 

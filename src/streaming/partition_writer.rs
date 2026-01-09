@@ -137,8 +137,10 @@ impl PartitionWriter {
         provenances: &[Provenance],
     ) -> Result<usize> {
         let mut written = 0;
-        for ((raw_match, cited_id), provenance) in
-            raw_matches.iter().zip(cited_ids.iter()).zip(provenances.iter())
+        for ((raw_match, cited_id), provenance) in raw_matches
+            .iter()
+            .zip(cited_ids.iter())
+            .zip(provenances.iter())
         {
             self.write(ExplodedRow {
                 citing_doi: citing_doi.to_string(),
