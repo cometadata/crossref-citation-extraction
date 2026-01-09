@@ -24,3 +24,14 @@ pub fn create_doi_client() -> reqwest::Result<Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_doi_client() {
+        let client = create_doi_client();
+        assert!(client.is_ok());
+    }
+}
