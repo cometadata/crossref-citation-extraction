@@ -2,6 +2,8 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::collections::HashSet;
 
+use super::Provenance;
+
 lazy_static! {
     /// DOI pattern - captures DOI from various formats
     /// Matches: bare DOI, doi:prefix, URL forms
@@ -10,16 +12,22 @@ lazy_static! {
     ).unwrap();
 }
 
-/// Represents a matched DOI with raw match text and normalized form
+/// Represents a matched DOI with raw match text, normalized form, and provenance
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoiMatch {
-    pub doi: String, // Normalized DOI (lowercase, cleaned)
-    pub raw: String, // Original matched substring
+    pub doi: String,           // Normalized DOI (lowercase, cleaned)
+    pub raw: String,           // Original matched substring
+    pub provenance: Provenance, // How this DOI was obtained
 }
 
 impl DoiMatch {
-    pub fn new(doi: String, raw: String) -> Self {
-        Self { doi, raw }
+    pub fn new(doi: String, raw: String, provenance: Provenance) -> Self {
+        Self { doi, raw, provenance }
+    }
+
+    /// Create a mined DoiMatch (extracted from text)
+    pub fn mined(doi: String, raw: String) -> Self {
+        Self::new(doi, raw, Provenance::Mined)
     }
 }
 
@@ -71,7 +79,7 @@ pub fn extract_doi_matches_from_text(text: &str) -> Vec<DoiMatch> {
 
             // Skip if we've already seen this normalized DOI
             if seen.insert(normalized.clone()) {
-                matches.push(DoiMatch::new(normalized, raw));
+                matches.push(DoiMatch::mined(normalized, raw));
             }
         }
     }
@@ -165,5 +173,18 @@ mod tests {
         let text = "See 10.1234/first and 10.5678/second";
         let matches = extract_doi_matches_from_text(text);
         assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn test_doi_match_with_provenance() {
+        let m = DoiMatch::new("10.1234/test".to_string(), "10.1234/test".to_string(), Provenance::Publisher);
+        assert_eq!(m.doi, "10.1234/test");
+        assert_eq!(m.provenance, Provenance::Publisher);
+    }
+
+    #[test]
+    fn test_doi_match_mined_default() {
+        let m = DoiMatch::mined("10.1234/test".to_string(), "10.1234/test".to_string());
+        assert_eq!(m.provenance, Provenance::Mined);
     }
 }
