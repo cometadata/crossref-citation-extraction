@@ -104,6 +104,15 @@ fn run_extraction(
     let gz = GzDecoder::new(file);
     let mut archive = Archive::new(gz);
 
+    // Log extraction behavior based on source mode
+    match args.source {
+        Source::Arxiv => {
+            info!("Extracting arXiv IDs from references...");
+        }
+        _ => {
+            info!("Extracting all DOIs from references (source filtering happens during validation)...");
+        }
+    }
     info!("Streaming through Crossref archive...");
 
     for entry_result in archive.entries()? {
@@ -176,12 +185,12 @@ fn run_extraction(
                         let (raw_matches, cited_ids): (Vec<String>, Vec<String>) = match args.source
                         {
                             Source::Arxiv => {
-                                // Extract arXiv IDs
+                                // Extract arXiv IDs (just the ID, not the DOI - DOI is constructed in invert step)
                                 let matches = extract_arxiv_matches_from_text(&search_text);
                                 let raws: Vec<String> =
                                     matches.iter().map(|m| m.raw.clone()).collect();
                                 let ids: Vec<String> =
-                                    matches.iter().map(|m| m.arxiv_doi.clone()).collect();
+                                    matches.iter().map(|m| m.id.clone()).collect();
                                 (raws, ids)
                             }
                             Source::All | Source::Crossref | Source::Datacite => {
@@ -326,12 +335,23 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
         "  Partitions processed: {}",
         invert_stats.partitions_processed
     );
-    info!("  Unique cited works: {}", invert_stats.unique_cited_works);
-    info!("  Total citations: {}", invert_stats.total_citations);
+    info!(
+        "  Unique cited works (all extracted): {}",
+        invert_stats.unique_cited_works
+    );
+    info!(
+        "  Total citations (all extracted): {}",
+        invert_stats.total_citations
+    );
 
     // Phase 4: Validate
     info!("");
     info!("=== Validating Citations ===");
+    info!(
+        "Filtering {} extracted works to {} source DOIs...",
+        invert_stats.unique_cited_works,
+        args.source
+    );
 
     let http_fallback_enabled = args
         .http_fallback
@@ -356,15 +376,15 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
 
             info!("Validation results:");
             info!(
-                "  Total records: {}",
+                "  Total records checked: {}",
                 validation_results.stats.total_records
             );
             info!(
-                "  Crossref matched: {}",
+                "  Crossref index matched: {}",
                 validation_results.stats.crossref_matched
             );
             info!(
-                "  DataCite matched: {}",
+                "  DataCite index matched: {}",
                 validation_results.stats.datacite_matched
             );
             if http_fallback_enabled {
@@ -374,8 +394,16 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
                     validation_results.stats.datacite_http_resolved
                 );
             }
-            info!("  Total valid: {}", validation_results.valid.len());
-            info!("  Total failed: {}", validation_results.failed.len());
+            info!(
+                "  Valid {} citations: {}",
+                args.source,
+                validation_results.valid.len()
+            );
+            info!(
+                "  Failed (not in {} index): {}",
+                args.source,
+                validation_results.failed.len()
+            );
 
             // Write outputs based on source mode
             match args.source {

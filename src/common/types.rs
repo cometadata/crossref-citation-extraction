@@ -47,9 +47,13 @@ pub struct ValidateStats {
 }
 
 /// Generic citation record for Crossref/DataCite output
+/// Also handles arXiv format which uses arxiv_doi instead of doi
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CitationRecord {
+    #[serde(alias = "arxiv_doi")]
     pub doi: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arxiv_id: Option<String>,
     pub reference_count: usize,
     pub citation_count: usize,
     pub cited_by: Vec<Value>,

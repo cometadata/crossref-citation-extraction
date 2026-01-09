@@ -253,7 +253,7 @@ pub fn write_split_validation_results(
     Ok((crossref_count, datacite_count))
 }
 
-/// Write arXiv validation results (converts generic to arXiv format)
+/// Write arXiv validation results (preserves arXiv format)
 pub fn write_arxiv_validation_results(
     results: &ValidationResults,
     output_arxiv: &str,
@@ -270,12 +270,14 @@ pub fn write_arxiv_validation_results(
     let mut writer = BufWriter::new(file);
 
     for (record, _) in &results.valid {
-        // Convert generic CitationRecord to arXiv format
-        let arxiv_id = record
-            .doi
-            .strip_prefix("10.48550/arXiv.")
-            .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
-            .unwrap_or(&record.doi);
+        // Use arxiv_id from record if present, otherwise extract from DOI
+        let arxiv_id = record.arxiv_id.as_deref().unwrap_or_else(|| {
+            record
+                .doi
+                .strip_prefix("10.48550/arXiv.")
+                .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
+                .unwrap_or(&record.doi)
+        });
 
         let arxiv_record = serde_json::json!({
             "arxiv_doi": record.doi,
@@ -300,11 +302,13 @@ pub fn write_arxiv_validation_results(
         let mut writer = BufWriter::new(file);
 
         for record in &results.failed {
-            let arxiv_id = record
-                .doi
-                .strip_prefix("10.48550/arXiv.")
-                .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
-                .unwrap_or(&record.doi);
+            let arxiv_id = record.arxiv_id.as_deref().unwrap_or_else(|| {
+                record
+                    .doi
+                    .strip_prefix("10.48550/arXiv.")
+                    .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
+                    .unwrap_or(&record.doi)
+            });
 
             let arxiv_record = serde_json::json!({
                 "arxiv_doi": record.doi,
@@ -332,6 +336,7 @@ mod tests {
     fn create_test_record(doi: &str) -> CitationRecord {
         CitationRecord {
             doi: doi.to_string(),
+            arxiv_id: None,
             reference_count: 0,
             citation_count: 1,
             cited_by: vec![json!({"doi": "10.1234/citing"})],
@@ -487,5 +492,24 @@ mod tests {
         assert_eq!(results.stats.total_records, 0);
         assert_eq!(results.valid.len(), 0);
         assert_eq!(results.failed.len(), 0);
+    }
+
+    #[test]
+    fn test_citation_record_parses_arxiv_format() {
+        // arXiv format uses arxiv_doi instead of doi
+        let arxiv_json = r#"{"arxiv_doi":"10.48550/arXiv.2301.00001","arxiv_id":"2301.00001","reference_count":1,"citation_count":5,"cited_by":[]}"#;
+        let record: CitationRecord = serde_json::from_str(arxiv_json).unwrap();
+        assert_eq!(record.doi, "10.48550/arXiv.2301.00001");
+        assert_eq!(record.arxiv_id, Some("2301.00001".to_string()));
+    }
+
+    #[test]
+    fn test_citation_record_parses_generic_format() {
+        // Generic format uses doi
+        let generic_json =
+            r#"{"doi":"10.1234/test","reference_count":1,"citation_count":5,"cited_by":[]}"#;
+        let record: CitationRecord = serde_json::from_str(generic_json).unwrap();
+        assert_eq!(record.doi, "10.1234/test");
+        assert_eq!(record.arxiv_id, None);
     }
 }
