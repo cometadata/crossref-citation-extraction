@@ -23,7 +23,7 @@ pub enum OutputMode {
 #[derive(Debug, Clone, Default)]
 pub struct InvertStats {
     pub partitions_processed: usize,
-    pub unique_arxiv_works: usize,
+    pub unique_cited_works: usize,
     pub total_citations: usize,
 }
 
@@ -97,30 +97,42 @@ pub fn invert_partitions(
 
     info!("Inverting {} partitions in parallel", partition_files.len());
 
-    // Process partitions in parallel
-    let results: Vec<Result<(String, DataFrame)>> = partition_files
-        .par_iter()
-        .map(|path| {
-            let df = invert_single_partition(path, output_mode)?;
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            Ok((name, df))
-        })
-        .collect();
-
-    // Collect successful results and track which partitions completed
+    // Process partitions in batches to avoid stack overflow from nested parallelism
+    // (Polars uses rayon internally, so processing too many partitions at once causes issues)
+    const BATCH_SIZE: usize = 500;
     let mut dfs = Vec::new();
-    for result in results {
-        match result {
-            Ok((name, df)) => {
-                checkpoint.mark_partition_inverted(&name);
-                dfs.push(df);
-            }
-            Err(e) => {
-                return Err(e.context("Failed to invert partition"));
+
+    for (batch_idx, batch) in partition_files.chunks(BATCH_SIZE).enumerate() {
+        debug!(
+            "Processing partition batch {}/{} ({} partitions)",
+            batch_idx + 1,
+            (partition_files.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+            batch.len()
+        );
+
+        let results: Vec<Result<(String, DataFrame)>> = batch
+            .par_iter()
+            .map(|path| {
+                let df = invert_single_partition(path, output_mode)?;
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                Ok((name, df))
+            })
+            .collect();
+
+        // Collect successful results and track which partitions completed
+        for result in results {
+            match result {
+                Ok((name, df)) => {
+                    checkpoint.mark_partition_inverted(&name);
+                    dfs.push(df);
+                }
+                Err(e) => {
+                    return Err(e.context("Failed to invert partition"));
+                }
             }
         }
     }
@@ -132,23 +144,51 @@ pub fn invert_partitions(
 
     info!("Concatenating {} inverted partitions", dfs.len());
 
-    // Concatenate all dataframes
-    let lazy_dfs: Vec<LazyFrame> = dfs.into_iter().map(|df| df.lazy()).collect();
-    let mut combined = concat(&lazy_dfs, UnionArgs::default())
-        .context("Failed to concatenate inverted partitions")?
+    // Concatenate in batches to avoid stack overflow from deep recursive plans
+    // Polars concat builds a tree of Union nodes; too deep causes stack overflow
+    const CONCAT_BATCH_SIZE: usize = 500;
+    let mut combined = if dfs.len() <= CONCAT_BATCH_SIZE {
+        // Small enough to concat directly
+        let lazy_dfs: Vec<LazyFrame> = dfs.into_iter().map(|df| df.lazy()).collect();
+        concat(&lazy_dfs, UnionArgs::default())
+            .context("Failed to concatenate inverted partitions")?
+            .collect()
+            .context("Failed to collect combined dataframe")?
+    } else {
+        // Batch concatenation to limit tree depth
+        let mut batched_dfs: Vec<DataFrame> = Vec::new();
+        for chunk in dfs.chunks(CONCAT_BATCH_SIZE) {
+            let lazy_chunk: Vec<LazyFrame> = chunk.iter().map(|df| df.clone().lazy()).collect();
+            let batch_df = concat(&lazy_chunk, UnionArgs::default())
+                .context("Failed to concatenate batch")?
+                .collect()
+                .context("Failed to collect batch")?;
+            batched_dfs.push(batch_df);
+        }
+        // Final concat of batched results
+        let lazy_batched: Vec<LazyFrame> = batched_dfs.into_iter().map(|df| df.lazy()).collect();
+        concat(&lazy_batched, UnionArgs::default())
+            .context("Failed to concatenate batched results")?
+            .collect()
+            .context("Failed to collect final result")?
+    };
+
+    // Sort by citation count descending
+    combined = combined
+        .lazy()
         .sort(
             ["citation_count"],
             SortMultipleOptions::default().with_order_descending(true),
         )
         .collect()
-        .context("Failed to collect combined dataframe")?;
+        .context("Failed to sort combined dataframe")?;
 
-    let unique_arxiv_works = combined.height();
+    let unique_cited_works = combined.height();
     let total_citations: u32 = combined.column("citation_count")?.u32()?.sum().unwrap_or(0);
 
     info!(
-        "Writing inverted output: {} unique arXiv works",
-        unique_arxiv_works
+        "Writing inverted output: {} unique cited works",
+        unique_cited_works
     );
 
     // Write Parquet output
@@ -171,7 +211,7 @@ pub fn invert_partitions(
 
     let stats = InvertStats {
         partitions_processed: partition_files.len(),
-        unique_arxiv_works,
+        unique_cited_works,
         total_citations: total_citations as usize,
     };
 

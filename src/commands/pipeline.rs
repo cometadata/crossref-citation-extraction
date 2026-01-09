@@ -326,7 +326,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
         "  Partitions processed: {}",
         invert_stats.partitions_processed
     );
-    info!("  Unique cited works: {}", invert_stats.unique_arxiv_works);
+    info!("  Unique cited works: {}", invert_stats.unique_cited_works);
     info!("  Total citations: {}", invert_stats.total_citations);
 
     // Phase 4: Validate
