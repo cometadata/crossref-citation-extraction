@@ -108,6 +108,7 @@ crossref-citation-extraction validate \
   "cited_by": [
     {
       "doi": "10.5678/citing-paper",
+      "provenance": "publisher",
       "raw_match": "10.1234/example",
       "reference": {"unstructured": "..."}
     }
@@ -126,6 +127,29 @@ crossref-citation-extraction validate \
   "cited_by": [...]
 }
 ```
+
+### Provenance Tracking
+
+Each citation includes a `provenance` field indicating how the DOI was obtained:
+
+- `publisher` - DOI was explicitly provided by the publisher in the reference metadata
+- `crossref` - DOI was matched/validated by Crossref
+- `mined` - DOI was extracted from unstructured text or other fields
+
+### Automatic Split Output Files
+
+When you specify an output file, the tool automatically generates three files:
+
+```bash
+--output-crossref results.jsonl
+```
+
+Produces:
+- `results.jsonl` - All citations
+- `results_asserted.jsonl` - Only citations with `publisher` or `crossref` provenance
+- `results_mined.jsonl` - Only citations with `mined` provenance
+
+This applies to all output flags (`--output-crossref`, `--output-datacite`, `--output-arxiv`) and their corresponding failed outputs.
 
 ## DOI Patterns
 
