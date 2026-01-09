@@ -14,7 +14,7 @@ use crate::extract::{extract_arxiv_matches_from_text, extract_doi_matches_from_t
 use crate::index::{
     build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex,
 };
-use crate::streaming::PartitionWriter;
+use crate::streaming::{invert_partitions, Checkpoint, OutputMode, PartitionWriter};
 
 struct PipelineIndexes {
     crossref: Option<DoiIndex>,
@@ -267,7 +267,39 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
         warn!("No matches found during extraction");
     }
 
-    // TODO: Phase 3: Invert partitions
+    // Phase 3: Invert partitions
+    info!("");
+    info!("=== Aggregating Citations ===");
+
+    let output_mode = match args.source {
+        Source::Arxiv => OutputMode::Arxiv,
+        _ => OutputMode::Generic,
+    };
+
+    // Determine output paths
+    let output_parquet = partition_dir.join("inverted.parquet");
+    let output_jsonl = match args.source {
+        Source::Arxiv => args.output_arxiv.as_ref().map(PathBuf::from),
+        Source::Crossref => args.output_crossref.as_ref().map(PathBuf::from),
+        Source::Datacite => args.output_datacite.as_ref().map(PathBuf::from),
+        Source::All => None, // Will handle separately in validation phase
+    };
+
+    let mut checkpoint = Checkpoint::new(&format!("pipeline-{}", Uuid::new_v4()));
+
+    let invert_stats = invert_partitions(
+        &partition_dir,
+        &output_parquet,
+        output_jsonl.as_ref().map(|p| p.as_path()),
+        &mut checkpoint,
+        output_mode,
+    )?;
+
+    info!("Aggregation complete:");
+    info!("  Partitions processed: {}", invert_stats.partitions_processed);
+    info!("  Unique cited works: {}", invert_stats.unique_arxiv_works);
+    info!("  Total citations: {}", invert_stats.total_citations);
+
     // TODO: Phase 4: Validate
 
     // Save indexes if requested
