@@ -148,47 +148,6 @@ pub async fn validate_citations(
     })
 }
 
-/// Write validation results to output files
-#[allow(dead_code)]
-pub fn write_validation_results(
-    results: &ValidationResults,
-    output_valid: &str,
-    output_failed: Option<&str>,
-) -> Result<()> {
-    info!(
-        "Writing {} valid records to: {}",
-        results.valid.len(),
-        output_valid
-    );
-
-    let file = File::create(output_valid)
-        .with_context(|| format!("Failed to create output file: {}", output_valid))?;
-    let mut writer = BufWriter::new(file);
-
-    for (record, _source) in &results.valid {
-        writeln!(writer, "{}", serde_json::to_string(record)?)?;
-    }
-    writer.flush()?;
-
-    if let Some(failed_path) = output_failed {
-        info!(
-            "Writing {} failed records to: {}",
-            results.failed.len(),
-            failed_path
-        );
-        let file = File::create(failed_path)
-            .with_context(|| format!("Failed to create output file: {}", failed_path))?;
-        let mut writer = BufWriter::new(file);
-
-        for record in &results.failed {
-            writeln!(writer, "{}", serde_json::to_string(record)?)?;
-        }
-        writer.flush()?;
-    }
-
-    Ok(())
-}
-
 /// Write validation results split by source
 pub fn write_split_validation_results(
     results: &ValidationResults,
@@ -252,80 +211,6 @@ pub fn write_split_validation_results(
     }
 
     Ok((crossref_count, datacite_count))
-}
-
-/// Write arXiv validation results (preserves arXiv format)
-#[allow(dead_code)]
-pub fn write_arxiv_validation_results(
-    results: &ValidationResults,
-    output_arxiv: &str,
-    output_arxiv_failed: Option<&str>,
-) -> Result<()> {
-    info!(
-        "Writing {} arXiv citations to: {}",
-        results.valid.len(),
-        output_arxiv
-    );
-
-    let file = File::create(output_arxiv)
-        .with_context(|| format!("Failed to create output file: {}", output_arxiv))?;
-    let mut writer = BufWriter::new(file);
-
-    for (record, _) in &results.valid {
-        // Use arxiv_id from record if present, otherwise extract from DOI
-        let arxiv_id = record.arxiv_id.as_deref().unwrap_or_else(|| {
-            record
-                .doi
-                .strip_prefix("10.48550/arXiv.")
-                .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
-                .unwrap_or(&record.doi)
-        });
-
-        let arxiv_record = serde_json::json!({
-            "arxiv_doi": record.doi,
-            "arxiv_id": arxiv_id,
-            "reference_count": record.reference_count,
-            "citation_count": record.citation_count,
-            "cited_by": record.cited_by
-        });
-
-        writeln!(writer, "{}", arxiv_record)?;
-    }
-    writer.flush()?;
-
-    if let Some(failed_path) = output_arxiv_failed {
-        info!(
-            "Writing {} failed arXiv citations to: {}",
-            results.failed.len(),
-            failed_path
-        );
-        let file = File::create(failed_path)
-            .with_context(|| format!("Failed to create output file: {}", failed_path))?;
-        let mut writer = BufWriter::new(file);
-
-        for record in &results.failed {
-            let arxiv_id = record.arxiv_id.as_deref().unwrap_or_else(|| {
-                record
-                    .doi
-                    .strip_prefix("10.48550/arXiv.")
-                    .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
-                    .unwrap_or(&record.doi)
-            });
-
-            let arxiv_record = serde_json::json!({
-                "arxiv_doi": record.doi,
-                "arxiv_id": arxiv_id,
-                "reference_count": record.reference_count,
-                "citation_count": record.citation_count,
-                "cited_by": record.cited_by
-            });
-
-            writeln!(writer, "{}", arxiv_record)?;
-        }
-        writer.flush()?;
-    }
-
-    Ok(())
 }
 
 /// Write arXiv validation results with automatic split by provenance
@@ -739,33 +624,6 @@ mod tests {
         assert_eq!(results.stats.datacite_matched, 1);
         assert_eq!(results.valid.len(), 2);
         assert_eq!(results.failed.len(), 1);
-    }
-
-    #[test]
-    fn test_write_validation_results() {
-        let results = ValidationResults {
-            valid: vec![(create_test_record("10.1234/valid"), Source::Crossref)],
-            failed: vec![create_test_record("10.1234/failed")],
-            stats: MultiValidateStats::default(),
-        };
-
-        let valid_file = NamedTempFile::new().unwrap();
-        let failed_file = NamedTempFile::new().unwrap();
-
-        write_validation_results(
-            &results,
-            valid_file.path().to_str().unwrap(),
-            Some(failed_file.path().to_str().unwrap()),
-        )
-        .unwrap();
-
-        // Verify valid file
-        let valid_content = std::fs::read_to_string(valid_file.path()).unwrap();
-        assert!(valid_content.contains("10.1234/valid"));
-
-        // Verify failed file
-        let failed_content = std::fs::read_to_string(failed_file.path()).unwrap();
-        assert!(failed_content.contains("10.1234/failed"));
     }
 
     #[tokio::test]

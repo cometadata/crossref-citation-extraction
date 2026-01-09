@@ -21,12 +21,6 @@ impl Provenance {
             Provenance::Mined => "mined",
         }
     }
-
-    /// Check if this is an asserted provenance (publisher or crossref)
-    #[allow(dead_code)]
-    pub fn is_asserted(&self) -> bool {
-        matches!(self, Provenance::Publisher | Provenance::Crossref)
-    }
 }
 
 impl std::fmt::Display for Provenance {
@@ -83,12 +77,5 @@ mod tests {
         assert_eq!(Provenance::Publisher.as_str(), "publisher");
         assert_eq!(Provenance::Crossref.as_str(), "crossref");
         assert_eq!(Provenance::Mined.as_str(), "mined");
-    }
-
-    #[test]
-    fn test_provenance_is_asserted() {
-        assert!(Provenance::Publisher.is_asserted());
-        assert!(Provenance::Crossref.is_asserted());
-        assert!(!Provenance::Mined.is_asserted());
     }
 }

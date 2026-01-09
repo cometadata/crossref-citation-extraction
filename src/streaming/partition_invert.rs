@@ -107,7 +107,7 @@ pub fn invert_partitions(
         debug!(
             "Processing partition batch {}/{} ({} partitions)",
             batch_idx + 1,
-            (partition_files.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+            partition_files.len().div_ceil(BATCH_SIZE),
             batch.len()
         );
 
