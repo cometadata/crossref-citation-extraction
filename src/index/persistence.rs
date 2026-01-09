@@ -16,17 +16,12 @@ pub fn save_index_to_parquet(index: &DoiIndex, path: &str) -> Result<()> {
     let prefixes: Vec<&str> = index.prefixes.iter().map(|s| s.as_str()).collect();
 
     // Create two dataframes and save to same file using row groups
-    let mut dois_df = DataFrame::new(vec![
-        Column::new("doi".into(), &dois),
-    ])?;
+    let mut dois_df = DataFrame::new(vec![Column::new("doi".into(), &dois)])?;
 
-    let mut prefixes_df = DataFrame::new(vec![
-        Column::new("prefix".into(), &prefixes),
-    ])?;
+    let mut prefixes_df = DataFrame::new(vec![Column::new("prefix".into(), &prefixes)])?;
 
     // Save DOIs
-    let file = File::create(path)
-        .with_context(|| format!("Failed to create file: {}", path))?;
+    let file = File::create(path).with_context(|| format!("Failed to create file: {}", path))?;
 
     ParquetWriter::new(file)
         .with_compression(ParquetCompression::Zstd(None))

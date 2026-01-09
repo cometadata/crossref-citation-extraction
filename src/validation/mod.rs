@@ -1,10 +1,12 @@
 pub mod http;
 pub mod lookup;
 pub mod prefix_filter;
+pub mod runner;
 
 pub use http::*;
 pub use lookup::*;
 pub use prefix_filter::*;
+pub use runner::*;
 
 use crate::cli::Source;
 use crate::index::DoiIndex;

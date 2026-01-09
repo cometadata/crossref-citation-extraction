@@ -15,6 +15,12 @@ use crate::index::{
     build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex,
 };
 use crate::streaming::{invert_partitions, Checkpoint, OutputMode, PartitionWriter};
+use crate::validation::{validate_citations, write_validation_results};
+
+/// Progress logging interval (every N files)
+const PROGRESS_LOG_INTERVAL: usize = 100;
+/// Divisor for computing flush threshold from batch size
+const FLUSH_THRESHOLD_DIVISOR: usize = 100;
 
 struct PipelineIndexes {
     crossref: Option<DoiIndex>,
@@ -61,8 +67,7 @@ fn should_build_crossref_index(args: &PipelineArgs) -> bool {
     // 1. We're extracting DOIs (not arxiv mode) AND
     // 2. We don't already have a loaded index AND
     // 3. We need the index for validation (crossref or all mode)
-    args.load_crossref_index.is_none()
-        && matches!(args.source, Source::All | Source::Crossref)
+    args.load_crossref_index.is_none() && matches!(args.source, Source::All | Source::Crossref)
 }
 
 /// Run the extraction phase: stream through tar.gz, extract references, build Crossref index
@@ -81,7 +86,7 @@ fn run_extraction(
     }
 
     // Create partition writer
-    let flush_threshold = args.batch_size / 100; // Flush per partition more frequently
+    let flush_threshold = args.batch_size / FLUSH_THRESHOLD_DIVISOR;
     let mut writer = PartitionWriter::new(partition_dir, flush_threshold.max(10000))?;
 
     // Open and stream the tar.gz
@@ -159,27 +164,27 @@ fn run_extraction(
                         }
 
                         // Extract matches based on source mode
-                        let (raw_matches, cited_ids): (Vec<String>, Vec<String>) =
-                            match args.source {
-                                Source::Arxiv => {
-                                    // Extract arXiv IDs
-                                    let matches = extract_arxiv_matches_from_text(&search_text);
-                                    let raws: Vec<String> =
-                                        matches.iter().map(|m| m.raw.clone()).collect();
-                                    let ids: Vec<String> =
-                                        matches.iter().map(|m| m.arxiv_doi.clone()).collect();
-                                    (raws, ids)
-                                }
-                                Source::All | Source::Crossref | Source::Datacite => {
-                                    // Extract DOIs
-                                    let matches = extract_doi_matches_from_text(&search_text);
-                                    let raws: Vec<String> =
-                                        matches.iter().map(|m| m.raw.clone()).collect();
-                                    let ids: Vec<String> =
-                                        matches.iter().map(|m| m.doi.clone()).collect();
-                                    (raws, ids)
-                                }
-                            };
+                        let (raw_matches, cited_ids): (Vec<String>, Vec<String>) = match args.source
+                        {
+                            Source::Arxiv => {
+                                // Extract arXiv IDs
+                                let matches = extract_arxiv_matches_from_text(&search_text);
+                                let raws: Vec<String> =
+                                    matches.iter().map(|m| m.raw.clone()).collect();
+                                let ids: Vec<String> =
+                                    matches.iter().map(|m| m.arxiv_doi.clone()).collect();
+                                (raws, ids)
+                            }
+                            Source::All | Source::Crossref | Source::Datacite => {
+                                // Extract DOIs
+                                let matches = extract_doi_matches_from_text(&search_text);
+                                let raws: Vec<String> =
+                                    matches.iter().map(|m| m.raw.clone()).collect();
+                                let ids: Vec<String> =
+                                    matches.iter().map(|m| m.doi.clone()).collect();
+                                (raws, ids)
+                            }
+                        };
 
                         if !cited_ids.is_empty() {
                             stats.refs_with_matches += 1;
@@ -201,7 +206,7 @@ fn run_extraction(
         stats.files_processed += 1;
 
         // Log progress periodically
-        if stats.files_processed % 100 == 0 {
+        if stats.files_processed % PROGRESS_LOG_INTERVAL == 0 {
             info!(
                 "Progress: {} files, {} items, {} matches",
                 stats.files_processed, stats.items_processed, stats.total_matches
@@ -251,8 +256,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
         // Create a unique temp directory
         let temp_base = std::env::temp_dir();
         let unique_dir = temp_base.join(format!("crossref-extract-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&unique_dir)
-            .context("Failed to create temp directory")?;
+        std::fs::create_dir_all(&unique_dir).context("Failed to create temp directory")?;
         unique_dir
     };
     let cleanup_temp = args.temp_dir.is_none() && !args.keep_intermediates;
@@ -290,17 +294,83 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     let invert_stats = invert_partitions(
         &partition_dir,
         &output_parquet,
-        output_jsonl.as_ref().map(|p| p.as_path()),
+        output_jsonl.as_deref(),
         &mut checkpoint,
         output_mode,
     )?;
 
     info!("Aggregation complete:");
-    info!("  Partitions processed: {}", invert_stats.partitions_processed);
+    info!(
+        "  Partitions processed: {}",
+        invert_stats.partitions_processed
+    );
     info!("  Unique cited works: {}", invert_stats.unique_arxiv_works);
     info!("  Total citations: {}", invert_stats.total_citations);
 
-    // TODO: Phase 4: Validate
+    // Phase 4: Validate
+    info!("");
+    info!("=== Validating Citations ===");
+
+    let http_fallback_enabled = args
+        .http_fallback
+        .iter()
+        .any(|s| s == "crossref" || s == "datacite" || s == "all");
+
+    // Only run validation if we have an index to validate against and JSONL output
+    if indexes.crossref.is_some() || indexes.datacite.is_some() {
+        if let Some(ref jsonl_path) = output_jsonl {
+            let validation_input = jsonl_path.to_string_lossy().to_string();
+
+            // Determine the failed output path based on source
+            let failed_output = match args.source {
+                Source::Arxiv => args.output_arxiv_failed.as_deref(),
+                Source::Crossref => args.output_crossref_failed.as_deref(),
+                Source::Datacite => args.output_datacite_failed.as_deref(),
+                Source::All => None, // Handle separately for multi-source
+            };
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let validation_results = rt.block_on(validate_citations(
+                &validation_input,
+                indexes.crossref.as_ref(),
+                indexes.datacite.as_ref(),
+                args.source,
+                http_fallback_enabled,
+                args.concurrency,
+                args.timeout,
+            ))?;
+
+            info!("Validation results:");
+            info!(
+                "  Total records: {}",
+                validation_results.stats.total_records
+            );
+            info!(
+                "  Crossref matched: {}",
+                validation_results.stats.crossref_matched
+            );
+            info!(
+                "  DataCite matched: {}",
+                validation_results.stats.datacite_matched
+            );
+            if http_fallback_enabled {
+                info!(
+                    "  HTTP resolved: {} crossref, {} datacite",
+                    validation_results.stats.crossref_http_resolved,
+                    validation_results.stats.datacite_http_resolved
+                );
+            }
+            info!("  Total valid: {}", validation_results.valid.len());
+            info!("  Total failed: {}", validation_results.failed.len());
+
+            // Write validated results back to the output file
+            write_validation_results(&validation_results, &validation_input, failed_output)?;
+        } else {
+            info!("No JSONL output specified, skipping validation...");
+        }
+    } else {
+        info!("No indexes available for validation, skipping...");
+    }
 
     // Save indexes if requested
     if let Some(ref path) = args.save_crossref_index {
@@ -355,9 +425,7 @@ fn validate_args(args: &PipelineArgs) -> Result<()> {
         }
         Source::Arxiv => {
             if args.output_arxiv.is_none() {
-                return Err(anyhow::anyhow!(
-                    "Source 'arxiv' requires --output-arxiv"
-                ));
+                return Err(anyhow::anyhow!("Source 'arxiv' requires --output-arxiv"));
             }
             if args.datacite_records.is_none() && args.load_datacite_index.is_none() {
                 return Err(anyhow::anyhow!(
@@ -404,7 +472,10 @@ mod tests {
         let args = default_args();
         let result = validate_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--output-crossref"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--output-crossref"));
     }
 
     #[test]
@@ -422,7 +493,10 @@ mod tests {
         args.source = Source::Crossref;
         let result = validate_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--output-crossref"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--output-crossref"));
     }
 
     #[test]
@@ -441,7 +515,10 @@ mod tests {
         args.datacite_records = Some("records.jsonl.gz".to_string());
         let result = validate_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--output-datacite"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--output-datacite"));
     }
 
     #[test]
@@ -451,7 +528,10 @@ mod tests {
         args.output_datacite = Some("datacite.jsonl".to_string());
         let result = validate_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--datacite-records"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--datacite-records"));
     }
 
     #[test]
@@ -491,7 +571,10 @@ mod tests {
         args.output_arxiv = Some("arxiv.jsonl".to_string());
         let result = validate_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--datacite-records"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--datacite-records"));
     }
 
     #[test]

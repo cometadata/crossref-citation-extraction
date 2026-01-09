@@ -89,8 +89,9 @@ impl PartitionWriter {
     /// * `partition_dir` - Directory to store partition files
     /// * `flush_threshold` - Number of rows per partition before flushing to disk
     pub fn new(partition_dir: &Path, flush_threshold: usize) -> Result<Self> {
-        fs::create_dir_all(partition_dir)
-            .with_context(|| format!("Failed to create partition directory: {:?}", partition_dir))?;
+        fs::create_dir_all(partition_dir).with_context(|| {
+            format!("Failed to create partition directory: {:?}", partition_dir)
+        })?;
 
         Ok(Self {
             partition_dir: partition_dir.to_path_buf(),
@@ -104,7 +105,8 @@ impl PartitionWriter {
     pub fn write(&mut self, row: ExplodedRow) -> Result<()> {
         let partition = partition_key(&row.cited_id);
 
-        let buffer = self.buffers
+        let buffer = self
+            .buffers
             .entry(partition.clone())
             .or_insert_with(|| PartitionBuffer::new(&self.partition_dir, &partition));
 
@@ -142,7 +144,9 @@ impl PartitionWriter {
 
     /// Flush a specific partition to disk
     fn flush_partition(&mut self, partition: &str) -> Result<()> {
-        let buffer = self.buffers.get_mut(partition)
+        let buffer = self
+            .buffers
+            .get_mut(partition)
             .ok_or_else(|| anyhow::anyhow!("Partition {} not found", partition))?;
 
         if buffer.len() == 0 {
@@ -194,7 +198,10 @@ impl PartitionWriter {
         for partition in partitions {
             self.flush_partition(&partition)?;
         }
-        info!("Flushed all partitions ({} total rows)", self.total_rows_written);
+        info!(
+            "Flushed all partitions ({} total rows)",
+            self.total_rows_written
+        );
         Ok(())
     }
 
@@ -214,13 +221,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut writer = PartitionWriter::new(dir.path(), 10).unwrap();
 
-        writer.write(ExplodedRow {
-            citing_doi: "10.1234/test".to_string(),
-            ref_index: 0,
-            ref_json: "{}".to_string(),
-            raw_match: "arXiv:2403.12345".to_string(),
-            cited_id: "2403.12345".to_string(),
-        }).unwrap();
+        writer
+            .write(ExplodedRow {
+                citing_doi: "10.1234/test".to_string(),
+                ref_index: 0,
+                ref_json: "{}".to_string(),
+                raw_match: "arXiv:2403.12345".to_string(),
+                cited_id: "2403.12345".to_string(),
+            })
+            .unwrap();
 
         writer.flush_all().unwrap();
 
@@ -233,22 +242,26 @@ mod tests {
         let mut writer = PartitionWriter::new(dir.path(), 100).unwrap();
 
         // Modern format
-        writer.write(ExplodedRow {
-            citing_doi: "10.1234/a".to_string(),
-            ref_index: 0,
-            ref_json: "{}".to_string(),
-            raw_match: "arXiv:2403.12345".to_string(),
-            cited_id: "2403.12345".to_string(),
-        }).unwrap();
+        writer
+            .write(ExplodedRow {
+                citing_doi: "10.1234/a".to_string(),
+                ref_index: 0,
+                ref_json: "{}".to_string(),
+                raw_match: "arXiv:2403.12345".to_string(),
+                cited_id: "2403.12345".to_string(),
+            })
+            .unwrap();
 
         // Old format
-        writer.write(ExplodedRow {
-            citing_doi: "10.1234/b".to_string(),
-            ref_index: 1,
-            ref_json: "{}".to_string(),
-            raw_match: "arXiv:hep-ph/9901234".to_string(),
-            cited_id: "hep-ph/9901234".to_string(),
-        }).unwrap();
+        writer
+            .write(ExplodedRow {
+                citing_doi: "10.1234/b".to_string(),
+                ref_index: 1,
+                ref_json: "{}".to_string(),
+                raw_match: "arXiv:hep-ph/9901234".to_string(),
+                cited_id: "hep-ph/9901234".to_string(),
+            })
+            .unwrap();
 
         writer.flush_all().unwrap();
 
@@ -262,13 +275,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut writer = PartitionWriter::new(dir.path(), 100).unwrap();
 
-        let written = writer.write_extracted_ref(
-            "10.1234/test",
-            0,
-            "{}",
-            &["arXiv:2403.12345".to_string(), "arXiv:2403.67890".to_string()],
-            &["2403.12345".to_string(), "2403.67890".to_string()],
-        ).unwrap();
+        let written = writer
+            .write_extracted_ref(
+                "10.1234/test",
+                0,
+                "{}",
+                &[
+                    "arXiv:2403.12345".to_string(),
+                    "arXiv:2403.67890".to_string(),
+                ],
+                &["2403.12345".to_string(), "2403.67890".to_string()],
+            )
+            .unwrap();
 
         assert_eq!(written, 2);
         writer.flush_all().unwrap();

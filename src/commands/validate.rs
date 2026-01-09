@@ -13,7 +13,7 @@ use tokio::sync::Semaphore;
 
 use crate::cli::ValidateArgs;
 use crate::common::{
-    format_elapsed, create_bytes_progress_bar, create_count_progress_bar, setup_logging,
+    create_bytes_progress_bar, create_count_progress_bar, format_elapsed, setup_logging,
     ArxivCitationsSimple, DataCiteRecord, ValidateStats,
 };
 
@@ -21,8 +21,8 @@ fn load_datacite_dois(path: &str) -> Result<HashSet<String>> {
     info!("Loading DataCite DOIs from: {}", path);
     let start = Instant::now();
 
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open records file: {}", path))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open records file: {}", path))?;
 
     let decoder = GzDecoder::new(file);
     let reader = BufReader::new(decoder);
@@ -56,8 +56,12 @@ fn load_datacite_dois(path: &str) -> Result<HashSet<String>> {
         }
     }
 
-    info!("Loaded {} unique DOIs from {} records in {}",
-          dois.len(), lines_processed, format_elapsed(start.elapsed()));
+    info!(
+        "Loaded {} unique DOIs from {} records in {}",
+        dois.len(),
+        lines_processed,
+        format_elapsed(start.elapsed())
+    );
 
     if lines_failed > 0 {
         warn!("Failed to parse {} records", lines_failed);
@@ -69,11 +73,7 @@ fn load_datacite_dois(path: &str) -> Result<HashSet<String>> {
 async fn check_doi_resolves(client: &Client, doi: &str, timeout: Duration) -> bool {
     let url = format!("https://doi.org/{}", doi);
 
-    match client.head(&url)
-        .timeout(timeout)
-        .send()
-        .await
-    {
+    match client.head(&url).timeout(timeout).send().await {
         Ok(resp) => {
             let status = resp.status();
             status.is_redirection() || status.is_success()
@@ -98,7 +98,9 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
     info!("Concurrency: {}", args.concurrency);
     info!("Timeout: {}s", args.timeout);
 
-    let datacite_records = args.datacite_records.as_ref()
+    let datacite_records = args
+        .datacite_records
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("DataCite records file required for validation"))?;
     let datacite_dois = load_datacite_dois(datacite_records)?;
 
@@ -142,7 +144,9 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
         if lines_processed % 100000 == 0 {
             progress.set_message(format!(
                 "{} records | {} matched | {} unmatched",
-                lines_processed, matched.len(), unmatched.len()
+                lines_processed,
+                matched.len(),
+                unmatched.len()
             ));
         }
     }
@@ -154,7 +158,10 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
     info!("  Matched in DataCite: {}", matched.len());
     info!("  Unmatched (need resolution check): {}", unmatched.len());
 
-    info!("Writing {} matched records to valid output...", matched.len());
+    info!(
+        "Writing {} matched records to valid output...",
+        matched.len()
+    );
     let valid_file = File::create(&args.output_valid)
         .with_context(|| format!("Failed to create output file: {}", args.output_valid))?;
     let mut valid_writer = BufWriter::new(valid_file);
@@ -176,7 +183,10 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
         File::create(&args.output_failed)
             .with_context(|| format!("Failed to create output file: {}", args.output_failed))?;
     } else {
-        info!("Checking resolution for {} unmatched DOIs...", unmatched.len());
+        info!(
+            "Checking resolution for {} unmatched DOIs...",
+            unmatched.len()
+        );
 
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -272,7 +282,10 @@ pub async fn run_validate_async(args: ValidateArgs) -> Result<ValidateStats> {
     info!("Total execution time: {}", format_elapsed(total_time));
     info!("Input records: {}", stats.total_records);
     info!("Matched in DataCite: {}", stats.matched_in_datacite);
-    info!("Resolution checks: {} resolved, {} failed", stats.resolution_resolved, stats.resolution_failed);
+    info!(
+        "Resolution checks: {} resolved, {} failed",
+        stats.resolution_resolved, stats.resolution_failed
+    );
     info!("Total valid: {}", stats.total_valid);
     info!("Total failed: {}", stats.total_failed);
     info!("Output valid: {}", args.output_valid);

@@ -59,14 +59,16 @@ fn invert_single_partition(partition_path: &Path, output_mode: OutputMode) -> Re
 
     // Add arxiv_doi column only for Arxiv output mode
     let inverted = match output_mode {
-        OutputMode::Arxiv => inverted.with_columns([
-            concat_str([lit("10.48550/arXiv."), col("cited_id")], "", true)
-                .alias("arxiv_doi"),
-        ]),
+        OutputMode::Arxiv => {
+            inverted.with_columns([
+                concat_str([lit("10.48550/arXiv."), col("cited_id")], "", true).alias("arxiv_doi"),
+            ])
+        }
         OutputMode::Generic => inverted,
     };
 
-    inverted.collect()
+    inverted
+        .collect()
         .with_context(|| format!("Failed to collect inverted partition: {:?}", partition_path))
 }
 
@@ -86,9 +88,7 @@ pub fn invert_partitions(
         .filter(|path| path.extension().map_or(false, |ext| ext == "parquet"))
         .filter(|path| {
             // Skip already-inverted partitions (from checkpoint)
-            let name = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             !checkpoint.is_partition_inverted(name)
         })
         .collect();
@@ -100,7 +100,8 @@ pub fn invert_partitions(
         .par_iter()
         .map(|path| {
             let df = invert_single_partition(path, output_mode)?;
-            let name = path.file_stem()
+            let name = path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string();
@@ -141,13 +142,12 @@ pub fn invert_partitions(
         .context("Failed to collect combined dataframe")?;
 
     let unique_arxiv_works = combined.height();
-    let total_citations: u32 = combined
-        .column("citation_count")?
-        .u32()?
-        .sum()
-        .unwrap_or(0);
+    let total_citations: u32 = combined.column("citation_count")?.u32()?.sum().unwrap_or(0);
 
-    info!("Writing inverted output: {} unique arXiv works", unique_arxiv_works);
+    info!(
+        "Writing inverted output: {} unique arXiv works",
+        unique_arxiv_works
+    );
 
     // Write Parquet output
     let file = File::create(output_parquet)
@@ -180,8 +180,8 @@ pub fn invert_partitions(
 fn write_arxiv_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
     info!("Writing arXiv JSONL output: {:?}", path);
 
-    let file = File::create(path)
-        .with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
+    let file =
+        File::create(path).with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
     let mut writer = BufWriter::new(file);
 
     let arxiv_doi = df.column("arxiv_doi")?.str()?;
@@ -217,8 +217,8 @@ fn write_arxiv_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
 fn write_generic_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
     info!("Writing generic JSONL output: {:?}", path);
 
-    let file = File::create(path)
-        .with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
+    let file =
+        File::create(path).with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
     let mut writer = BufWriter::new(file);
 
     let cited_id = df.column("cited_id")?.str()?;
@@ -302,7 +302,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn create_test_partition(dir: &Path, name: &str, rows: Vec<(&str, u32, &str, &str, &str)>) -> Result<()> {
+    fn create_test_partition(
+        dir: &Path,
+        name: &str,
+        rows: Vec<(&str, u32, &str, &str, &str)>,
+    ) -> Result<()> {
         let citing_dois: Vec<String> = rows.iter().map(|r| r.0.to_string()).collect();
         let ref_indices: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let ref_jsons: Vec<String> = rows.iter().map(|r| r.2.to_string()).collect();
@@ -326,18 +330,27 @@ mod tests {
     fn test_invert_single_partition_arxiv_mode() {
         let dir = tempdir().unwrap();
 
-        create_test_partition(dir.path(), "2403", vec![
-            ("10.1234/a", 0, "{}", "arXiv:2403.12345", "2403.12345"),
-            ("10.1234/b", 1, "{}", "arXiv:2403.12345", "2403.12345"),
-            ("10.1234/a", 2, "{}", "arXiv:2403.67890", "2403.67890"),
-        ]).unwrap();
+        create_test_partition(
+            dir.path(),
+            "2403",
+            vec![
+                ("10.1234/a", 0, "{}", "arXiv:2403.12345", "2403.12345"),
+                ("10.1234/b", 1, "{}", "arXiv:2403.12345", "2403.12345"),
+                ("10.1234/a", 2, "{}", "arXiv:2403.67890", "2403.67890"),
+            ],
+        )
+        .unwrap();
 
-        let df = invert_single_partition(&dir.path().join("2403.parquet"), OutputMode::Arxiv).unwrap();
+        let df =
+            invert_single_partition(&dir.path().join("2403.parquet"), OutputMode::Arxiv).unwrap();
 
         assert_eq!(df.height(), 2); // Two unique cited_ids
 
-        let cited_ids: Vec<_> = df.column("cited_id").unwrap()
-            .str().unwrap()
+        let cited_ids: Vec<_> = df
+            .column("cited_id")
+            .unwrap()
+            .str()
+            .unwrap()
             .into_iter()
             .filter_map(|s| s.map(|s| s.to_string()))
             .collect();
@@ -353,18 +366,27 @@ mod tests {
     fn test_invert_single_partition_generic_mode() {
         let dir = tempdir().unwrap();
 
-        create_test_partition(dir.path(), "10.1234", vec![
-            ("10.5555/a", 0, "{}", "10.1234/test1", "10.1234/test1"),
-            ("10.5555/b", 1, "{}", "10.1234/test1", "10.1234/test1"),
-            ("10.5555/a", 2, "{}", "10.1234/test2", "10.1234/test2"),
-        ]).unwrap();
+        create_test_partition(
+            dir.path(),
+            "10.1234",
+            vec![
+                ("10.5555/a", 0, "{}", "10.1234/test1", "10.1234/test1"),
+                ("10.5555/b", 1, "{}", "10.1234/test1", "10.1234/test1"),
+                ("10.5555/a", 2, "{}", "10.1234/test2", "10.1234/test2"),
+            ],
+        )
+        .unwrap();
 
-        let df = invert_single_partition(&dir.path().join("10.1234.parquet"), OutputMode::Generic).unwrap();
+        let df = invert_single_partition(&dir.path().join("10.1234.parquet"), OutputMode::Generic)
+            .unwrap();
 
         assert_eq!(df.height(), 2); // Two unique cited_ids
 
-        let cited_ids: Vec<_> = df.column("cited_id").unwrap()
-            .str().unwrap()
+        let cited_ids: Vec<_> = df
+            .column("cited_id")
+            .unwrap()
+            .str()
+            .unwrap()
             .into_iter()
             .filter_map(|s| s.map(|s| s.to_string()))
             .collect();

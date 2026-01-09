@@ -57,8 +57,7 @@ impl Checkpoint {
 
     /// Save checkpoint to file
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize checkpoint")?;
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize checkpoint")?;
         fs::write(path, json)
             .with_context(|| format!("Failed to write checkpoint to {:?}", path))?;
         Ok(())
@@ -71,8 +70,8 @@ impl Checkpoint {
         }
         let json = fs::read_to_string(path)
             .with_context(|| format!("Failed to read checkpoint from {:?}", path))?;
-        let checkpoint: Self = serde_json::from_str(&json)
-            .context("Failed to deserialize checkpoint")?;
+        let checkpoint: Self =
+            serde_json::from_str(&json).context("Failed to deserialize checkpoint")?;
         Ok(Some(checkpoint))
     }
 
