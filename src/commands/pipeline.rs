@@ -31,6 +31,32 @@ fn should_include_citation(citing_doi: &str, cited_id: &str) -> bool {
     citing_doi.to_lowercase() != cited_id.to_lowercase()
 }
 
+/// Determine the provenance of a DOI based on how it was found in the reference
+fn determine_provenance(reference: &Value, extracted_doi: &str) -> Provenance {
+    // Check if there's an explicit DOI field
+    if let Some(doi_field) = reference.get("DOI").and_then(|v| v.as_str()) {
+        // Check if the extracted DOI matches the DOI field (normalized comparison)
+        let doi_field_normalized = doi_field.to_lowercase();
+        let extracted_normalized = extracted_doi.to_lowercase();
+
+        if doi_field_normalized == extracted_normalized {
+            // DOI came from the explicit DOI field - check doi-asserted-by
+            if let Some(asserted_by) = reference.get("doi-asserted-by").and_then(|v| v.as_str()) {
+                return match asserted_by {
+                    "publisher" => Provenance::Publisher,
+                    "crossref" => Provenance::Crossref,
+                    _ => Provenance::Mined, // Unknown assertion type
+                };
+            }
+            // DOI field present but no doi-asserted-by
+            return Provenance::Mined;
+        }
+    }
+
+    // DOI was mined from other fields (unstructured, URL, etc.)
+    Provenance::Mined
+}
+
 struct PipelineIndexes {
     crossref: Option<DoiIndex>,
     datacite: Option<DoiIndex>,
@@ -208,14 +234,19 @@ fn run_extraction(
                         {
                             Source::Arxiv => {
                                 // Extract arXiv IDs (just the ID, not the DOI - DOI is constructed in invert step)
-                                // ArxivMatch doesn't have provenance yet, so default to Mined
                                 let matches = extract_arxiv_matches_from_text(&search_text);
                                 let raws: Vec<String> =
                                     matches.iter().map(|m| m.raw.clone()).collect();
                                 let ids: Vec<String> =
                                     matches.iter().map(|m| m.id.clone()).collect();
-                                let provs: Vec<Provenance> =
-                                    matches.iter().map(|_| Provenance::Mined).collect();
+                                // For arXiv, determine provenance based on whether DOI field exists
+                                let provs: Vec<Provenance> = ids
+                                    .iter()
+                                    .map(|id| {
+                                        let arxiv_doi = format!("10.48550/arXiv.{}", id);
+                                        determine_provenance(reference, &arxiv_doi)
+                                    })
+                                    .collect();
                                 (raws, ids, provs)
                             }
                             Source::All | Source::Crossref | Source::Datacite => {
@@ -225,8 +256,10 @@ fn run_extraction(
                                     matches.iter().map(|m| m.raw.clone()).collect();
                                 let ids: Vec<String> =
                                     matches.iter().map(|m| m.doi.clone()).collect();
-                                let provs: Vec<Provenance> =
-                                    matches.iter().map(|m| m.provenance).collect();
+                                let provs: Vec<Provenance> = ids
+                                    .iter()
+                                    .map(|doi| determine_provenance(reference, doi))
+                                    .collect();
                                 (raws, ids, provs)
                             }
                         };
@@ -703,5 +736,27 @@ mod tests {
         assert!(should_include_citation("10.1234/a", "10.5678/b"));
         assert!(!should_include_citation("10.1234/a", "10.1234/a"));
         assert!(!should_include_citation("10.1234/A", "10.1234/a")); // Case insensitive
+    }
+
+    #[test]
+    fn test_determine_provenance() {
+        use serde_json::json;
+        use crate::extract::Provenance;
+
+        // Publisher asserted
+        let ref_publisher = json!({"DOI": "10.1234/test", "doi-asserted-by": "publisher"});
+        assert_eq!(determine_provenance(&ref_publisher, "10.1234/test"), Provenance::Publisher);
+
+        // Crossref asserted
+        let ref_crossref = json!({"DOI": "10.1234/test", "doi-asserted-by": "crossref"});
+        assert_eq!(determine_provenance(&ref_crossref, "10.1234/test"), Provenance::Crossref);
+
+        // DOI present but no doi-asserted-by
+        let ref_no_assertion = json!({"DOI": "10.1234/test"});
+        assert_eq!(determine_provenance(&ref_no_assertion, "10.1234/test"), Provenance::Mined);
+
+        // Mined from unstructured (DOI not in DOI field)
+        let ref_unstructured = json!({"unstructured": "See doi:10.1234/test"});
+        assert_eq!(determine_provenance(&ref_unstructured, "10.1234/test"), Provenance::Mined);
     }
 }
