@@ -25,6 +25,12 @@ const PROGRESS_LOG_INTERVAL: usize = 100;
 /// Divisor for computing flush threshold from batch size
 const FLUSH_THRESHOLD_DIVISOR: usize = 100;
 
+/// Check if a citation should be included (filters out self-citations)
+fn should_include_citation(citing_doi: &str, cited_id: &str) -> bool {
+    // Remove self-citations
+    citing_doi.to_lowercase() != cited_id.to_lowercase()
+}
+
 struct PipelineIndexes {
     crossref: Option<DoiIndex>,
     datacite: Option<DoiIndex>,
@@ -190,16 +196,29 @@ fn run_extraction(
                         };
 
                         if !cited_ids.is_empty() {
-                            stats.refs_with_matches += 1;
-                            stats.total_matches += cited_ids.len();
+                            // Filter out self-citations
+                            let (filtered_raw_matches, filtered_cited_ids): (Vec<_>, Vec<_>) =
+                                raw_matches
+                                    .iter()
+                                    .zip(cited_ids.iter())
+                                    .filter(|(_, cited_id)| {
+                                        should_include_citation(&work_doi, cited_id)
+                                    })
+                                    .map(|(raw, cited)| (raw.clone(), cited.clone()))
+                                    .unzip();
 
-                            writer.write_extracted_ref(
-                                &work_doi,
-                                ref_idx as u32,
-                                &ref_json,
-                                &raw_matches,
-                                &cited_ids,
-                            )?;
+                            if !filtered_cited_ids.is_empty() {
+                                stats.refs_with_matches += 1;
+                                stats.total_matches += filtered_cited_ids.len();
+
+                                writer.write_extracted_ref(
+                                    &work_doi,
+                                    ref_idx as u32,
+                                    &ref_json,
+                                    &filtered_raw_matches,
+                                    &filtered_cited_ids,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -615,5 +634,12 @@ mod tests {
         args.datacite_records = Some("records.jsonl.gz".to_string());
         let result = validate_args(&args);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_should_include_citation() {
+        assert!(should_include_citation("10.1234/a", "10.5678/b"));
+        assert!(!should_include_citation("10.1234/a", "10.1234/a"));
+        assert!(!should_include_citation("10.1234/A", "10.1234/a")); // Case insensitive
     }
 }

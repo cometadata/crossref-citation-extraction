@@ -14,6 +14,8 @@ fn create_test_crossref_tar_gz(dir: &std::path::Path) -> std::path::PathBuf {
     let mut builder = Builder::new(encoder);
 
     // Create a JSON file with test data
+    // Note: 10.1234/citing-paper cites 10.1234/other-paper (cross-citation, valid)
+    // and 10.1234/other-paper cites itself (self-citation, should be filtered)
     let json_content = r#"{
         "items": [
             {
@@ -21,13 +23,14 @@ fn create_test_crossref_tar_gz(dir: &std::path::Path) -> std::path::PathBuf {
                 "reference": [
                     {"unstructured": "See arXiv:2403.12345 for details"},
                     {"DOI": "10.5678/another-paper"},
-                    {"unstructured": "Also 10.9999/datacite-doi"}
+                    {"unstructured": "Also 10.9999/datacite-doi"},
+                    {"DOI": "10.1234/other-paper"}
                 ]
             },
             {
-                "DOI": "10.1234/self-cite",
+                "DOI": "10.1234/other-paper",
                 "reference": [
-                    {"DOI": "10.1234/self-cite"}
+                    {"DOI": "10.1234/other-paper"}
                 ]
             }
         ]

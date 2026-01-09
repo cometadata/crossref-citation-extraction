@@ -45,6 +45,8 @@ fn invert_single_partition(partition_path: &Path, output_mode: OutputMode) -> Re
             Some(vec!["citing_doi".into(), "cited_id".into()]),
             UniqueKeepStrategy::First,
         )
+        // Filter out any self-citations that slipped through
+        .filter(col("citing_doi").neq(col("cited_id")))
         .group_by([col("cited_id")])
         .agg([
             col("citing_doi").n_unique().alias("citation_count"),
