@@ -326,6 +326,156 @@ pub fn write_arxiv_validation_results(
     Ok(())
 }
 
+/// Write arXiv validation results with automatic split by provenance
+pub fn write_arxiv_validation_results_with_split(
+    results: &ValidationResults,
+    output_arxiv: &str,
+    output_arxiv_failed: Option<&str>,
+) -> Result<()> {
+    let paths = SplitOutputPaths::from_base(output_arxiv);
+
+    // Open all three output files
+    let file_all =
+        File::create(&paths.all).with_context(|| format!("Failed to create: {:?}", paths.all))?;
+    let file_asserted = File::create(&paths.asserted)
+        .with_context(|| format!("Failed to create: {:?}", paths.asserted))?;
+    let file_mined = File::create(&paths.mined)
+        .with_context(|| format!("Failed to create: {:?}", paths.mined))?;
+
+    let mut writer_all = BufWriter::new(file_all);
+    let mut writer_asserted = BufWriter::new(file_asserted);
+    let mut writer_mined = BufWriter::new(file_mined);
+
+    for (record, _) in &results.valid {
+        // Use arxiv_id from record if present, otherwise extract from DOI
+        let arxiv_id = record.arxiv_id.as_deref().unwrap_or_else(|| {
+            record
+                .doi
+                .strip_prefix("10.48550/arXiv.")
+                .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
+                .unwrap_or(&record.doi)
+        });
+
+        // Write to main file
+        let arxiv_record = serde_json::json!({
+            "arxiv_doi": record.doi,
+            "arxiv_id": arxiv_id,
+            "reference_count": record.reference_count,
+            "citation_count": record.citation_count,
+            "cited_by": record.cited_by
+        });
+        writeln!(writer_all, "{}", arxiv_record)?;
+
+        // Filter and write to asserted file
+        let asserted_cited_by = filter_cited_by_by_provenance(&record.cited_by, true);
+        if !asserted_cited_by.is_empty() {
+            let asserted_record = serde_json::json!({
+                "arxiv_doi": record.doi,
+                "arxiv_id": arxiv_id,
+                "reference_count": record.reference_count,
+                "citation_count": asserted_cited_by.len(),
+                "cited_by": asserted_cited_by,
+            });
+            writeln!(writer_asserted, "{}", asserted_record)?;
+        }
+
+        // Filter and write to mined file
+        let mined_cited_by = filter_cited_by_by_provenance(&record.cited_by, false);
+        if !mined_cited_by.is_empty() {
+            let mined_record = serde_json::json!({
+                "arxiv_doi": record.doi,
+                "arxiv_id": arxiv_id,
+                "reference_count": record.reference_count,
+                "citation_count": mined_cited_by.len(),
+                "cited_by": mined_cited_by,
+            });
+            writeln!(writer_mined, "{}", mined_record)?;
+        }
+    }
+
+    writer_all.flush()?;
+    writer_asserted.flush()?;
+    writer_mined.flush()?;
+
+    info!("Wrote split arXiv output files:");
+    info!("  All: {:?}", paths.all);
+    info!("  Asserted: {:?}", paths.asserted);
+    info!("  Mined: {:?}", paths.mined);
+
+    // Handle failed outputs with split
+    if let Some(failed_base) = output_arxiv_failed {
+        let failed_paths = SplitOutputPaths::from_base(failed_base);
+
+        let file_all = File::create(&failed_paths.all)
+            .with_context(|| format!("Failed to create: {:?}", failed_paths.all))?;
+        let file_asserted = File::create(&failed_paths.asserted)
+            .with_context(|| format!("Failed to create: {:?}", failed_paths.asserted))?;
+        let file_mined = File::create(&failed_paths.mined)
+            .with_context(|| format!("Failed to create: {:?}", failed_paths.mined))?;
+
+        let mut writer_all = BufWriter::new(file_all);
+        let mut writer_asserted = BufWriter::new(file_asserted);
+        let mut writer_mined = BufWriter::new(file_mined);
+
+        for record in &results.failed {
+            let arxiv_id = record.arxiv_id.as_deref().unwrap_or_else(|| {
+                record
+                    .doi
+                    .strip_prefix("10.48550/arXiv.")
+                    .or_else(|| record.doi.strip_prefix("10.48550/arxiv."))
+                    .unwrap_or(&record.doi)
+            });
+
+            // Write to main file
+            let arxiv_record = serde_json::json!({
+                "arxiv_doi": record.doi,
+                "arxiv_id": arxiv_id,
+                "reference_count": record.reference_count,
+                "citation_count": record.citation_count,
+                "cited_by": record.cited_by
+            });
+            writeln!(writer_all, "{}", arxiv_record)?;
+
+            // Filter and write to asserted file
+            let asserted_cited_by = filter_cited_by_by_provenance(&record.cited_by, true);
+            if !asserted_cited_by.is_empty() {
+                let asserted_record = serde_json::json!({
+                    "arxiv_doi": record.doi,
+                    "arxiv_id": arxiv_id,
+                    "reference_count": record.reference_count,
+                    "citation_count": asserted_cited_by.len(),
+                    "cited_by": asserted_cited_by,
+                });
+                writeln!(writer_asserted, "{}", asserted_record)?;
+            }
+
+            // Filter and write to mined file
+            let mined_cited_by = filter_cited_by_by_provenance(&record.cited_by, false);
+            if !mined_cited_by.is_empty() {
+                let mined_record = serde_json::json!({
+                    "arxiv_doi": record.doi,
+                    "arxiv_id": arxiv_id,
+                    "reference_count": record.reference_count,
+                    "citation_count": mined_cited_by.len(),
+                    "cited_by": mined_cited_by,
+                });
+                writeln!(writer_mined, "{}", mined_record)?;
+            }
+        }
+
+        writer_all.flush()?;
+        writer_asserted.flush()?;
+        writer_mined.flush()?;
+
+        info!("Wrote split failed arXiv output files:");
+        info!("  All: {:?}", failed_paths.all);
+        info!("  Asserted: {:?}", failed_paths.asserted);
+        info!("  Mined: {:?}", failed_paths.mined);
+    }
+
+    Ok(())
+}
+
 /// Filter cited_by entries by provenance
 fn filter_cited_by_by_provenance(
     cited_by: &[serde_json::Value],

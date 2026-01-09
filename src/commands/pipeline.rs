@@ -16,8 +16,8 @@ use crate::index::{
 };
 use crate::streaming::{invert_partitions, Checkpoint, OutputMode, PartitionWriter};
 use crate::validation::{
-    validate_citations, write_arxiv_validation_results, write_split_validation_results,
-    write_validation_results,
+    validate_citations, write_arxiv_validation_results_with_split, write_split_validation_results,
+    write_validation_results_with_split,
 };
 
 /// Progress logging interval (every N files)
@@ -230,8 +230,11 @@ fn run_extraction(
                         }
 
                         // Extract matches based on source mode
-                        let (raw_matches, cited_ids, provenances): (Vec<String>, Vec<String>, Vec<Provenance>) = match args.source
-                        {
+                        let (raw_matches, cited_ids, provenances): (
+                            Vec<String>,
+                            Vec<String>,
+                            Vec<Provenance>,
+                        ) = match args.source {
                             Source::Arxiv => {
                                 // Extract arXiv IDs (just the ID, not the DOI - DOI is constructed in invert step)
                                 let matches = extract_arxiv_matches_from_text(&search_text);
@@ -266,21 +269,27 @@ fn run_extraction(
 
                         if !cited_ids.is_empty() {
                             // Filter out self-citations
-                            let (filtered_raw_matches, filtered_cited_ids, filtered_provenances): (Vec<_>, Vec<_>, Vec<_>) =
-                                raw_matches
-                                    .iter()
-                                    .zip(cited_ids.iter())
-                                    .zip(provenances.iter())
-                                    .filter(|((_, cited_id), _)| {
-                                        should_include_citation(&work_doi, cited_id)
-                                    })
-                                    .map(|((raw, cited), prov)| (raw.clone(), cited.clone(), *prov))
-                                    .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, (raw, cited, prov)| {
+                            let (filtered_raw_matches, filtered_cited_ids, filtered_provenances): (
+                                Vec<_>,
+                                Vec<_>,
+                                Vec<_>,
+                            ) = raw_matches
+                                .iter()
+                                .zip(cited_ids.iter())
+                                .zip(provenances.iter())
+                                .filter(|((_, cited_id), _)| {
+                                    should_include_citation(&work_doi, cited_id)
+                                })
+                                .map(|((raw, cited), prov)| (raw.clone(), cited.clone(), *prov))
+                                .fold(
+                                    (Vec::new(), Vec::new(), Vec::new()),
+                                    |mut acc, (raw, cited, prov)| {
                                         acc.0.push(raw);
                                         acc.1.push(cited);
                                         acc.2.push(prov);
                                         acc
-                                    });
+                                    },
+                                );
 
                             if !filtered_cited_ids.is_empty() {
                                 stats.refs_with_matches += 1;
@@ -416,8 +425,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     info!("=== Validating Citations ===");
     info!(
         "Filtering {} extracted works to {} source DOIs...",
-        invert_stats.unique_cited_works,
-        args.source
+        invert_stats.unique_cited_works, args.source
     );
 
     let http_fallback_enabled = args
@@ -472,7 +480,7 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
                 validation_results.failed.len()
             );
 
-            // Write outputs based on source mode
+            // Write outputs based on source mode (all modes use split output by provenance)
             match args.source {
                 Source::All => {
                     let (crossref_written, datacite_written) = write_split_validation_results(
@@ -488,21 +496,23 @@ pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
                     );
                 }
                 Source::Crossref => {
-                    write_validation_results(
-                        &validation_results,
+                    write_validation_results_with_split(
+                        &validation_results.valid,
+                        &validation_results.failed,
                         args.output_crossref.as_ref().unwrap(),
                         args.output_crossref_failed.as_deref(),
                     )?;
                 }
                 Source::Datacite => {
-                    write_validation_results(
-                        &validation_results,
+                    write_validation_results_with_split(
+                        &validation_results.valid,
+                        &validation_results.failed,
                         args.output_datacite.as_ref().unwrap(),
                         args.output_datacite_failed.as_deref(),
                     )?;
                 }
                 Source::Arxiv => {
-                    write_arxiv_validation_results(
+                    write_arxiv_validation_results_with_split(
                         &validation_results,
                         args.output_arxiv.as_ref().unwrap(),
                         args.output_arxiv_failed.as_deref(),
@@ -740,23 +750,35 @@ mod tests {
 
     #[test]
     fn test_determine_provenance() {
-        use serde_json::json;
         use crate::extract::Provenance;
+        use serde_json::json;
 
         // Publisher asserted
         let ref_publisher = json!({"DOI": "10.1234/test", "doi-asserted-by": "publisher"});
-        assert_eq!(determine_provenance(&ref_publisher, "10.1234/test"), Provenance::Publisher);
+        assert_eq!(
+            determine_provenance(&ref_publisher, "10.1234/test"),
+            Provenance::Publisher
+        );
 
         // Crossref asserted
         let ref_crossref = json!({"DOI": "10.1234/test", "doi-asserted-by": "crossref"});
-        assert_eq!(determine_provenance(&ref_crossref, "10.1234/test"), Provenance::Crossref);
+        assert_eq!(
+            determine_provenance(&ref_crossref, "10.1234/test"),
+            Provenance::Crossref
+        );
 
         // DOI present but no doi-asserted-by
         let ref_no_assertion = json!({"DOI": "10.1234/test"});
-        assert_eq!(determine_provenance(&ref_no_assertion, "10.1234/test"), Provenance::Mined);
+        assert_eq!(
+            determine_provenance(&ref_no_assertion, "10.1234/test"),
+            Provenance::Mined
+        );
 
         // Mined from unstructured (DOI not in DOI field)
         let ref_unstructured = json!({"unstructured": "See doi:10.1234/test"});
-        assert_eq!(determine_provenance(&ref_unstructured, "10.1234/test"), Provenance::Mined);
+        assert_eq!(
+            determine_provenance(&ref_unstructured, "10.1234/test"),
+            Provenance::Mined
+        );
     }
 }
