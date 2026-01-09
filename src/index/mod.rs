@@ -1,6 +1,9 @@
 pub mod builder;
 pub mod persistence;
 
+pub use builder::*;
+pub use persistence::*;
+
 use std::collections::HashSet;
 
 /// DOI index containing DOIs and their prefixes for fast lookup
