@@ -2,7 +2,9 @@ mod cli;
 mod commands;
 mod common;
 mod extract;
+mod index;
 mod streaming;
+mod validation;
 
 use anyhow::Result;
 use clap::Parser;
@@ -15,7 +17,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Pipeline(args) => {
-            run_pipeline(args)?;
+            run_pipeline(*args)?;
         }
         Commands::Validate(args) => {
             run_validate(args)?;

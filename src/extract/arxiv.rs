@@ -37,7 +37,7 @@ pub fn normalize_arxiv_id(id: &str) -> String {
 
     // Strip version suffix (e.g., "2403.03542v1" -> "2403.03542")
     if let Some(pos) = id.find('v') {
-        if pos + 1 < id.len() && id[pos+1..].chars().all(|c| c.is_ascii_digit()) {
+        if pos + 1 < id.len() && id[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
             return id[..pos].to_string();
         }
     }
@@ -51,36 +51,36 @@ pub fn extract_arxiv_matches_from_text(text: &str) -> Vec<ArxivMatch> {
     for cap in ARXIV_MODERN_PATTERN.captures_iter(text) {
         if let (Some(raw), Some(id)) = (cap.get(1), cap.get(2)) {
             let normalized = normalize_arxiv_id(id.as_str());
-            matches.entry(normalized.clone()).or_insert_with(|| {
-                ArxivMatch::new(normalized, raw.as_str().to_string())
-            });
+            matches
+                .entry(normalized.clone())
+                .or_insert_with(|| ArxivMatch::new(normalized, raw.as_str().to_string()));
         }
     }
 
     for cap in ARXIV_OLD_FORMAT_PATTERN.captures_iter(text) {
         if let (Some(raw), Some(id)) = (cap.get(1), cap.get(2)) {
             let normalized = normalize_arxiv_id(id.as_str());
-            matches.entry(normalized.clone()).or_insert_with(|| {
-                ArxivMatch::new(normalized, raw.as_str().to_string())
-            });
+            matches
+                .entry(normalized.clone())
+                .or_insert_with(|| ArxivMatch::new(normalized, raw.as_str().to_string()));
         }
     }
 
     for cap in ARXIV_DOI_PATTERN.captures_iter(text) {
         if let (Some(raw), Some(id)) = (cap.get(1), cap.get(2)) {
             let normalized = normalize_arxiv_id(id.as_str());
-            matches.entry(normalized.clone()).or_insert_with(|| {
-                ArxivMatch::new(normalized, raw.as_str().to_string())
-            });
+            matches
+                .entry(normalized.clone())
+                .or_insert_with(|| ArxivMatch::new(normalized, raw.as_str().to_string()));
         }
     }
 
     for cap in ARXIV_URL_PATTERN.captures_iter(text) {
         if let (Some(raw), Some(id)) = (cap.get(1), cap.get(2)) {
             let normalized = normalize_arxiv_id(id.as_str());
-            matches.entry(normalized.clone()).or_insert_with(|| {
-                ArxivMatch::new(normalized, raw.as_str().to_string())
-            });
+            matches
+                .entry(normalized.clone())
+                .or_insert_with(|| ArxivMatch::new(normalized, raw.as_str().to_string()));
         }
     }
 

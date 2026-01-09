@@ -9,33 +9,45 @@ use std::path::Path;
 
 use super::Checkpoint;
 
+/// Output mode for inverted data
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMode {
+    /// arXiv-specific output with arxiv_doi and arxiv_id fields
+    #[default]
+    Arxiv,
+    /// Generic DOI output with just doi field
+    Generic,
+}
+
 /// Statistics from inverting partitions
 #[derive(Debug, Clone, Default)]
 pub struct InvertStats {
     pub partitions_processed: usize,
-    pub unique_arxiv_works: usize,
+    pub unique_cited_works: usize,
     pub total_citations: usize,
 }
 
 /// Invert a single partition file
 ///
-/// Each partition file contains rows with (citing_doi, ref_index, ref_json, raw_match, arxiv_id).
-/// This function groups by arxiv_id and aggregates to produce the inverted index.
-fn invert_single_partition(partition_path: &Path) -> Result<DataFrame> {
+/// Each partition file contains rows with (citing_doi, ref_index, ref_json, raw_match, cited_id).
+/// This function groups by cited_id and aggregates to produce the inverted index.
+fn invert_single_partition(partition_path: &Path, output_mode: OutputMode) -> Result<DataFrame> {
     debug!("Inverting partition: {:?}", partition_path);
 
     let lf = LazyFrame::scan_parquet(partition_path, Default::default())
         .with_context(|| format!("Failed to scan partition: {:?}", partition_path))?;
 
-    // Group by arxiv_id, aggregating citations
-    // Note: rows are already exploded (one row per arxiv_id per reference)
+    // Group by cited_id, aggregating citations
+    // Note: rows are already exploded (one row per cited_id per reference)
     let inverted = lf
-        // Deduplicate (same citing_doi + arxiv_id should only count once)
+        // Deduplicate (same citing_doi + cited_id should only count once)
         .unique(
-            Some(vec!["citing_doi".into(), "arxiv_id".into()]),
+            Some(vec!["citing_doi".into(), "cited_id".into()]),
             UniqueKeepStrategy::First,
         )
-        .group_by([col("arxiv_id")])
+        // Filter out any self-citations that slipped through
+        .filter(col("citing_doi").neq(col("cited_id")))
+        .group_by([col("cited_id")])
         .agg([
             col("citing_doi").n_unique().alias("citation_count"),
             col("citing_doi").count().alias("reference_count"),
@@ -43,15 +55,23 @@ fn invert_single_partition(partition_path: &Path) -> Result<DataFrame> {
                 col("citing_doi").alias("doi"),
                 col("raw_match"),
                 col("ref_json").alias("reference"),
+                col("provenance"),
             ])
             .alias("cited_by"),
-        ])
-        .with_columns([
-            concat_str([lit("10.48550/arXiv."), col("arxiv_id")], "", true)
-                .alias("arxiv_doi"),
         ]);
 
-    inverted.collect()
+    // Add arxiv_doi column only for Arxiv output mode
+    let inverted = match output_mode {
+        OutputMode::Arxiv => {
+            inverted.with_columns([
+                concat_str([lit("10.48550/arXiv."), col("cited_id")], "", true).alias("arxiv_doi"),
+            ])
+        }
+        OutputMode::Generic => inverted,
+    };
+
+    inverted
+        .collect()
         .with_context(|| format!("Failed to collect inverted partition: {:?}", partition_path))
 }
 
@@ -61,47 +81,59 @@ pub fn invert_partitions(
     output_parquet: &Path,
     output_jsonl: Option<&Path>,
     checkpoint: &mut Checkpoint,
+    output_mode: OutputMode,
 ) -> Result<InvertStats> {
     // Find all partition files
     let partition_files: Vec<_> = fs::read_dir(partition_dir)
         .with_context(|| format!("Failed to read partition directory: {:?}", partition_dir))?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().map_or(false, |ext| ext == "parquet"))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
         .filter(|path| {
             // Skip already-inverted partitions (from checkpoint)
-            let name = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             !checkpoint.is_partition_inverted(name)
         })
         .collect();
 
     info!("Inverting {} partitions in parallel", partition_files.len());
 
-    // Process partitions in parallel
-    let results: Vec<Result<(String, DataFrame)>> = partition_files
-        .par_iter()
-        .map(|path| {
-            let df = invert_single_partition(path)?;
-            let name = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-            Ok((name, df))
-        })
-        .collect();
-
-    // Collect successful results and track which partitions completed
+    // Process partitions in batches to avoid stack overflow from nested parallelism
+    // (Polars uses rayon internally, so processing too many partitions at once causes issues)
+    const BATCH_SIZE: usize = 500;
     let mut dfs = Vec::new();
-    for result in results {
-        match result {
-            Ok((name, df)) => {
-                checkpoint.mark_partition_inverted(&name);
-                dfs.push(df);
-            }
-            Err(e) => {
-                return Err(e.context("Failed to invert partition"));
+
+    for (batch_idx, batch) in partition_files.chunks(BATCH_SIZE).enumerate() {
+        debug!(
+            "Processing partition batch {}/{} ({} partitions)",
+            batch_idx + 1,
+            partition_files.len().div_ceil(BATCH_SIZE),
+            batch.len()
+        );
+
+        let results: Vec<Result<(String, DataFrame)>> = batch
+            .par_iter()
+            .map(|path| {
+                let df = invert_single_partition(path, output_mode)?;
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                Ok((name, df))
+            })
+            .collect();
+
+        // Collect successful results and track which partitions completed
+        for result in results {
+            match result {
+                Ok((name, df)) => {
+                    checkpoint.mark_partition_inverted(&name);
+                    dfs.push(df);
+                }
+                Err(e) => {
+                    return Err(e.context("Failed to invert partition"));
+                }
             }
         }
     }
@@ -113,25 +145,52 @@ pub fn invert_partitions(
 
     info!("Concatenating {} inverted partitions", dfs.len());
 
-    // Concatenate all dataframes
-    let lazy_dfs: Vec<LazyFrame> = dfs.into_iter().map(|df| df.lazy()).collect();
-    let mut combined = concat(&lazy_dfs, UnionArgs::default())
-        .context("Failed to concatenate inverted partitions")?
+    // Concatenate in batches to avoid stack overflow from deep recursive plans
+    // Polars concat builds a tree of Union nodes; too deep causes stack overflow
+    const CONCAT_BATCH_SIZE: usize = 500;
+    let mut combined = if dfs.len() <= CONCAT_BATCH_SIZE {
+        // Small enough to concat directly
+        let lazy_dfs: Vec<LazyFrame> = dfs.into_iter().map(|df| df.lazy()).collect();
+        concat(&lazy_dfs, UnionArgs::default())
+            .context("Failed to concatenate inverted partitions")?
+            .collect()
+            .context("Failed to collect combined dataframe")?
+    } else {
+        // Batch concatenation to limit tree depth
+        let mut batched_dfs: Vec<DataFrame> = Vec::new();
+        for chunk in dfs.chunks(CONCAT_BATCH_SIZE) {
+            let lazy_chunk: Vec<LazyFrame> = chunk.iter().map(|df| df.clone().lazy()).collect();
+            let batch_df = concat(&lazy_chunk, UnionArgs::default())
+                .context("Failed to concatenate batch")?
+                .collect()
+                .context("Failed to collect batch")?;
+            batched_dfs.push(batch_df);
+        }
+        // Final concat of batched results
+        let lazy_batched: Vec<LazyFrame> = batched_dfs.into_iter().map(|df| df.lazy()).collect();
+        concat(&lazy_batched, UnionArgs::default())
+            .context("Failed to concatenate batched results")?
+            .collect()
+            .context("Failed to collect final result")?
+    };
+
+    // Sort by citation count descending
+    combined = combined
+        .lazy()
         .sort(
             ["citation_count"],
             SortMultipleOptions::default().with_order_descending(true),
         )
         .collect()
-        .context("Failed to collect combined dataframe")?;
+        .context("Failed to sort combined dataframe")?;
 
-    let unique_arxiv_works = combined.height();
-    let total_citations: u32 = combined
-        .column("citation_count")?
-        .u32()?
-        .sum()
-        .unwrap_or(0);
+    let unique_cited_works = combined.height();
+    let total_citations: u32 = combined.column("citation_count")?.u32()?.sum().unwrap_or(0);
 
-    info!("Writing inverted output: {} unique arXiv works", unique_arxiv_works);
+    info!(
+        "Writing inverted output: {} unique cited works",
+        unique_cited_works
+    );
 
     // Write Parquet output
     let file = File::create(output_parquet)
@@ -145,35 +204,38 @@ pub fn invert_partitions(
 
     // Write JSONL output if requested
     if let Some(jsonl_path) = output_jsonl {
-        write_jsonl_output(&combined, jsonl_path)?;
+        match output_mode {
+            OutputMode::Arxiv => write_arxiv_jsonl_output(&combined, jsonl_path)?,
+            OutputMode::Generic => write_generic_jsonl_output(&combined, jsonl_path)?,
+        }
     }
 
     let stats = InvertStats {
         partitions_processed: partition_files.len(),
-        unique_arxiv_works,
+        unique_cited_works,
         total_citations: total_citations as usize,
     };
 
     Ok(stats)
 }
 
-/// Write DataFrame to JSONL format for validate step compatibility
-fn write_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
-    info!("Writing JSONL output: {:?}", path);
+/// Write DataFrame to JSONL format for arXiv-specific output
+fn write_arxiv_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
+    info!("Writing arXiv JSONL output: {:?}", path);
 
-    let file = File::create(path)
-        .with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
+    let file =
+        File::create(path).with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
     let mut writer = BufWriter::new(file);
 
     let arxiv_doi = df.column("arxiv_doi")?.str()?;
-    let arxiv_id = df.column("arxiv_id")?.str()?;
+    let cited_id = df.column("cited_id")?.str()?;
     let reference_count = df.column("reference_count")?.u32()?;
     let citation_count = df.column("citation_count")?.u32()?;
     let cited_by = df.column("cited_by")?;
 
     for i in 0..df.height() {
         let doi = arxiv_doi.get(i).unwrap_or("");
-        let id = arxiv_id.get(i).unwrap_or("");
+        let id = cited_id.get(i).unwrap_or("");
         let ref_count = reference_count.get(i).unwrap_or(0);
         let cit_count = citation_count.get(i).unwrap_or(0);
 
@@ -182,6 +244,40 @@ fn write_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
         let json_line = serde_json::json!({
             "arxiv_doi": doi,
             "arxiv_id": id,
+            "reference_count": ref_count,
+            "citation_count": cit_count,
+            "cited_by": cited_by_json
+        });
+
+        writeln!(writer, "{}", json_line)?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write DataFrame to JSONL format for generic DOI citations
+fn write_generic_jsonl_output(df: &DataFrame, path: &Path) -> Result<()> {
+    info!("Writing generic JSONL output: {:?}", path);
+
+    let file =
+        File::create(path).with_context(|| format!("Failed to create JSONL file: {:?}", path))?;
+    let mut writer = BufWriter::new(file);
+
+    let cited_id = df.column("cited_id")?.str()?;
+    let reference_count = df.column("reference_count")?.u32()?;
+    let citation_count = df.column("citation_count")?.u32()?;
+    let cited_by = df.column("cited_by")?;
+
+    for i in 0..df.height() {
+        let doi = cited_id.get(i).unwrap_or("");
+        let ref_count = reference_count.get(i).unwrap_or(0);
+        let cit_count = citation_count.get(i).unwrap_or(0);
+
+        let cited_by_json = build_cited_by_json(cited_by, i)?;
+
+        let json_line = serde_json::json!({
+            "doi": doi,
             "reference_count": ref_count,
             "citation_count": cit_count,
             "cited_by": cited_by_json
@@ -205,10 +301,12 @@ fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_js
             let doi_field = structs.field_by_name("doi")?;
             let raw_match_field = structs.field_by_name("raw_match")?;
             let ref_field = structs.field_by_name("reference")?;
+            let provenance_field = structs.field_by_name("provenance")?;
 
             let dois = doi_field.str()?;
             let raw_matches = raw_match_field.str()?;
             let refs = ref_field.str()?;
+            let provenances = provenance_field.str()?;
 
             let mut doi_matches: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
@@ -216,13 +314,15 @@ fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_js
                 let doi = dois.get(j).unwrap_or("").to_string();
                 let raw_match = raw_matches.get(j).unwrap_or("");
                 let ref_json_str = refs.get(j).unwrap_or("null");
+                let provenance = provenances.get(j).unwrap_or("mined");
 
                 let reference: serde_json::Value =
                     serde_json::from_str(ref_json_str).unwrap_or(serde_json::Value::Null);
 
                 let match_obj = serde_json::json!({
                     "raw_match": raw_match,
-                    "reference": reference
+                    "reference": reference,
+                    "provenance": provenance
                 });
 
                 doi_matches.entry(doi).or_default().push(match_obj);
@@ -231,8 +331,20 @@ fn build_cited_by_json(cited_by_col: &Column, row_idx: usize) -> Result<serde_js
             let cited_by_arr: Vec<serde_json::Value> = doi_matches
                 .into_iter()
                 .map(|(doi, matches)| {
+                    // Determine overall provenance for this citing DOI (best available)
+                    let best_provenance = matches
+                        .iter()
+                        .filter_map(|m| m.get("provenance").and_then(|p| p.as_str()))
+                        .max_by_key(|p| match *p {
+                            "publisher" => 2,
+                            "crossref" => 1,
+                            _ => 0,
+                        })
+                        .unwrap_or("mined");
+
                     serde_json::json!({
                         "doi": doi,
+                        "provenance": best_provenance,
                         "matches": matches
                     })
                 })
@@ -249,19 +361,38 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn create_test_partition(dir: &Path, name: &str, rows: Vec<(&str, u32, &str, &str, &str)>) -> Result<()> {
+    fn create_test_partition(
+        dir: &Path,
+        name: &str,
+        rows: Vec<(&str, u32, &str, &str, &str)>,
+    ) -> Result<()> {
+        // Default to "mined" provenance for backward compatibility
+        let rows_with_provenance: Vec<_> = rows
+            .into_iter()
+            .map(|(a, b, c, d, e)| (a, b, c, d, e, "mined"))
+            .collect();
+        create_test_partition_with_provenance(dir, name, rows_with_provenance)
+    }
+
+    fn create_test_partition_with_provenance(
+        dir: &Path,
+        name: &str,
+        rows: Vec<(&str, u32, &str, &str, &str, &str)>,
+    ) -> Result<()> {
         let citing_dois: Vec<String> = rows.iter().map(|r| r.0.to_string()).collect();
         let ref_indices: Vec<u32> = rows.iter().map(|r| r.1).collect();
         let ref_jsons: Vec<String> = rows.iter().map(|r| r.2.to_string()).collect();
         let raw_matches: Vec<String> = rows.iter().map(|r| r.3.to_string()).collect();
-        let arxiv_ids: Vec<String> = rows.iter().map(|r| r.4.to_string()).collect();
+        let cited_ids: Vec<String> = rows.iter().map(|r| r.4.to_string()).collect();
+        let provenances: Vec<String> = rows.iter().map(|r| r.5.to_string()).collect();
 
         let mut df = DataFrame::new(vec![
             Column::new("citing_doi".into(), &citing_dois),
             Column::new("ref_index".into(), &ref_indices),
             Column::new("ref_json".into(), &ref_jsons),
             Column::new("raw_match".into(), &raw_matches),
-            Column::new("arxiv_id".into(), &arxiv_ids),
+            Column::new("cited_id".into(), &cited_ids),
+            Column::new("provenance".into(), &provenances),
         ])?;
 
         let file = File::create(dir.join(format!("{}.parquet", name)))?;
@@ -270,26 +401,211 @@ mod tests {
     }
 
     #[test]
-    fn test_invert_single_partition() {
+    fn test_invert_single_partition_arxiv_mode() {
         let dir = tempdir().unwrap();
 
-        create_test_partition(dir.path(), "2403", vec![
-            ("10.1234/a", 0, "{}", "arXiv:2403.12345", "2403.12345"),
-            ("10.1234/b", 1, "{}", "arXiv:2403.12345", "2403.12345"),
-            ("10.1234/a", 2, "{}", "arXiv:2403.67890", "2403.67890"),
-        ]).unwrap();
+        create_test_partition(
+            dir.path(),
+            "2403",
+            vec![
+                ("10.1234/a", 0, "{}", "arXiv:2403.12345", "2403.12345"),
+                ("10.1234/b", 1, "{}", "arXiv:2403.12345", "2403.12345"),
+                ("10.1234/a", 2, "{}", "arXiv:2403.67890", "2403.67890"),
+            ],
+        )
+        .unwrap();
 
-        let df = invert_single_partition(&dir.path().join("2403.parquet")).unwrap();
+        let df =
+            invert_single_partition(&dir.path().join("2403.parquet"), OutputMode::Arxiv).unwrap();
 
-        assert_eq!(df.height(), 2); // Two unique arxiv_ids
+        assert_eq!(df.height(), 2); // Two unique cited_ids
 
-        let arxiv_ids: Vec<_> = df.column("arxiv_id").unwrap()
-            .str().unwrap()
+        let cited_ids: Vec<_> = df
+            .column("cited_id")
+            .unwrap()
+            .str()
+            .unwrap()
             .into_iter()
             .filter_map(|s| s.map(|s| s.to_string()))
             .collect();
 
-        assert!(arxiv_ids.contains(&"2403.12345".to_string()));
-        assert!(arxiv_ids.contains(&"2403.67890".to_string()));
+        assert!(cited_ids.contains(&"2403.12345".to_string()));
+        assert!(cited_ids.contains(&"2403.67890".to_string()));
+
+        // Arxiv mode should have arxiv_doi column
+        assert!(df.column("arxiv_doi").is_ok());
+    }
+
+    #[test]
+    fn test_invert_single_partition_generic_mode() {
+        let dir = tempdir().unwrap();
+
+        create_test_partition(
+            dir.path(),
+            "10.1234",
+            vec![
+                ("10.5555/a", 0, "{}", "10.1234/test1", "10.1234/test1"),
+                ("10.5555/b", 1, "{}", "10.1234/test1", "10.1234/test1"),
+                ("10.5555/a", 2, "{}", "10.1234/test2", "10.1234/test2"),
+            ],
+        )
+        .unwrap();
+
+        let df = invert_single_partition(&dir.path().join("10.1234.parquet"), OutputMode::Generic)
+            .unwrap();
+
+        assert_eq!(df.height(), 2); // Two unique cited_ids
+
+        let cited_ids: Vec<_> = df
+            .column("cited_id")
+            .unwrap()
+            .str()
+            .unwrap()
+            .into_iter()
+            .filter_map(|s| s.map(|s| s.to_string()))
+            .collect();
+
+        assert!(cited_ids.contains(&"10.1234/test1".to_string()));
+        assert!(cited_ids.contains(&"10.1234/test2".to_string()));
+
+        // Generic mode should NOT have arxiv_doi column
+        assert!(df.column("arxiv_doi").is_err());
+    }
+
+    #[test]
+    fn test_invert_partition_includes_provenance() {
+        let dir = tempdir().unwrap();
+
+        // Create partition with different provenances for same cited work
+        create_test_partition_with_provenance(
+            dir.path(),
+            "10.5678",
+            vec![
+                (
+                    "10.1234/a",
+                    0,
+                    r#"{"key": "ref1"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "publisher",
+                ),
+                (
+                    "10.1234/b",
+                    1,
+                    r#"{"key": "ref2"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "mined",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result =
+            invert_single_partition(&dir.path().join("10.5678.parquet"), OutputMode::Generic)
+                .unwrap();
+
+        // Verify we have one cited work with two citations
+        assert_eq!(result.height(), 1);
+
+        // Verify cited_by struct includes provenance field
+        let cited_by = result.column("cited_by").unwrap();
+        let list = cited_by.list().unwrap();
+        let row_list = list.get_as_series(0).unwrap();
+        let structs = row_list.struct_().unwrap();
+
+        // The struct should have provenance field
+        let provenance_field = structs.field_by_name("provenance");
+        assert!(
+            provenance_field.is_ok(),
+            "cited_by struct should have provenance field"
+        );
+
+        // Verify provenance values are preserved
+        let provenances = provenance_field.unwrap();
+        let prov_strs = provenances.str().unwrap();
+        let prov_values: Vec<_> = (0..prov_strs.len())
+            .filter_map(|i| prov_strs.get(i).map(|s| s.to_string()))
+            .collect();
+        assert!(prov_values.contains(&"publisher".to_string()));
+        assert!(prov_values.contains(&"mined".to_string()));
+    }
+
+    #[test]
+    fn test_build_cited_by_json_with_provenance() {
+        let dir = tempdir().unwrap();
+
+        // Create partition with provenance
+        // Note: The inversion deduplicates by (citing_doi, cited_id) pair,
+        // so multiple references from the same citing DOI to the same cited work
+        // are collapsed to one entry (keeping the first).
+        create_test_partition_with_provenance(
+            dir.path(),
+            "10.5678",
+            vec![
+                (
+                    "10.1234/a",
+                    0,
+                    r#"{"key": "ref1"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "publisher",
+                ),
+                (
+                    "10.1234/b",
+                    0,
+                    r#"{"key": "ref2"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "crossref",
+                ),
+                (
+                    "10.1234/c",
+                    0,
+                    r#"{"key": "ref3"}"#,
+                    "10.5678/cited",
+                    "10.5678/cited",
+                    "mined",
+                ),
+            ],
+        )
+        .unwrap();
+
+        let result =
+            invert_single_partition(&dir.path().join("10.5678.parquet"), OutputMode::Generic)
+                .unwrap();
+
+        let cited_by_col = result.column("cited_by").unwrap();
+        let json = build_cited_by_json(cited_by_col, 0).unwrap();
+
+        // JSON should be an array of citing DOIs
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 3); // Three citing DOIs: 10.1234/a, 10.1234/b, 10.1234/c
+
+        // Find the entry for 10.1234/a (should have "publisher" provenance)
+        let entry_a = arr
+            .iter()
+            .find(|e| e["doi"] == "10.1234/a")
+            .expect("Should have entry for 10.1234/a");
+        assert_eq!(entry_a["provenance"], "publisher");
+
+        // Entry should have one match with provenance
+        let matches_a = entry_a["matches"].as_array().unwrap();
+        assert_eq!(matches_a.len(), 1);
+        assert_eq!(matches_a[0]["provenance"], "publisher");
+
+        // Find the entry for 10.1234/b (should have "crossref" as provenance)
+        let entry_b = arr
+            .iter()
+            .find(|e| e["doi"] == "10.1234/b")
+            .expect("Should have entry for 10.1234/b");
+        assert_eq!(entry_b["provenance"], "crossref");
+
+        // Find the entry for 10.1234/c (should have "mined" as provenance)
+        let entry_c = arr
+            .iter()
+            .find(|e| e["doi"] == "10.1234/c")
+            .expect("Should have entry for 10.1234/c");
+        assert_eq!(entry_c["provenance"], "mined");
     }
 }

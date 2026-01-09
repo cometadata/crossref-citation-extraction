@@ -2,514 +2,783 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use log::{debug, info, warn};
 use serde_json::Value;
-use std::env;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use tar::Archive;
 use uuid::Uuid;
 
-use crate::cli::{PipelineArgs, ValidateArgs};
-use crate::commands::validate;
-use crate::common::{format_elapsed, setup_logging, ValidateStats};
-use crate::common::ArxivMatch;
-use crate::extract::extract_arxiv_matches_from_text;
-use crate::streaming::{invert_partitions, Checkpoint, InvertStats, PartitionWriter, PipelinePhase};
+use crate::cli::{PipelineArgs, Source};
+use crate::common::setup_logging;
+use crate::extract::{extract_arxiv_matches_from_text, extract_doi_matches_from_text, Provenance};
+use crate::index::{
+    build_index_from_jsonl_gz, load_index_from_parquet, save_index_to_parquet, DoiIndex,
+};
+use crate::streaming::{invert_partitions, Checkpoint, OutputMode, PartitionWriter};
+use crate::validation::{
+    validate_citations, write_arxiv_validation_results_with_split, write_split_validation_results,
+    write_validation_results_with_split,
+};
 
-/// Statistics from the fused convert+extract step
+/// Progress logging interval (every N files)
+const PROGRESS_LOG_INTERVAL: usize = 100;
+/// Divisor for computing flush threshold from batch size
+const FLUSH_THRESHOLD_DIVISOR: usize = 100;
+
+/// Check if a citation should be included (filters out self-citations)
+fn should_include_citation(citing_doi: &str, cited_id: &str) -> bool {
+    // Remove self-citations
+    citing_doi.to_lowercase() != cited_id.to_lowercase()
+}
+
+/// Determine the provenance of a DOI based on how it was found in the reference
+fn determine_provenance(reference: &Value, extracted_doi: &str) -> Provenance {
+    // Check if there's an explicit DOI field
+    if let Some(doi_field) = reference.get("DOI").and_then(|v| v.as_str()) {
+        // Check if the extracted DOI matches the DOI field (normalized comparison)
+        let doi_field_normalized = doi_field.to_lowercase();
+        let extracted_normalized = extracted_doi.to_lowercase();
+
+        if doi_field_normalized == extracted_normalized {
+            // DOI came from the explicit DOI field - check doi-asserted-by
+            if let Some(asserted_by) = reference.get("doi-asserted-by").and_then(|v| v.as_str()) {
+                return match asserted_by {
+                    "publisher" => Provenance::Publisher,
+                    "crossref" => Provenance::Crossref,
+                    _ => Provenance::Mined, // Unknown assertion type
+                };
+            }
+            // DOI field present but no doi-asserted-by
+            return Provenance::Mined;
+        }
+    }
+
+    // DOI was mined from other fields (unstructured, URL, etc.)
+    Provenance::Mined
+}
+
+struct PipelineIndexes {
+    crossref: Option<DoiIndex>,
+    datacite: Option<DoiIndex>,
+}
+
+/// Statistics from the extraction phase
 #[derive(Debug, Clone, Default)]
-pub struct FusedStats {
-    pub json_files_processed: usize,
-    pub total_records: usize,
-    pub total_references: usize,
-    pub references_with_hint: usize,
-    pub references_with_matches: usize,
-    pub total_arxiv_ids_extracted: usize,
+pub struct ExtractionStats {
+    pub files_processed: usize,
+    pub items_processed: usize,
+    pub refs_with_matches: usize,
+    pub total_matches: usize,
+    pub crossref_dois_indexed: usize,
 }
 
-/// Combined pipeline statistics
-#[derive(Debug, Clone, Default)]
-pub struct PipelineStats {
-    pub fused: FusedStats,
-    pub invert: InvertStats,
-    pub validate: Option<ValidateStats>,
-}
+fn load_indexes(args: &PipelineArgs) -> Result<PipelineIndexes> {
+    let mut indexes = PipelineIndexes {
+        crossref: None,
+        datacite: None,
+    };
 
-/// Pipeline context for managing directories and cleanup
-struct PipelineContext {
-    partition_dir: PathBuf,
-    output_parquet: PathBuf,
-    output_jsonl: PathBuf,
-    checkpoint_path: PathBuf,
-    keep_intermediates: bool,
-}
-
-impl PipelineContext {
-    fn new(args: &PipelineArgs) -> Result<Self> {
-        let run_id = &Uuid::new_v4().to_string()[..8];
-
-        let temp_dir = args.temp_dir
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| env::temp_dir());
-
-        let partition_dir = temp_dir.join(format!("partitions_{}", run_id));
-        fs::create_dir_all(&partition_dir)
-            .with_context(|| format!("Failed to create partition directory: {}", partition_dir.display()))?;
-
-        let output_parquet = temp_dir.join(format!("inverted_{}.parquet", run_id));
-        let output_jsonl = temp_dir.join(format!("inverted_{}.jsonl", run_id));
-        let checkpoint_path = partition_dir.join("checkpoint.json");
-
-        Ok(Self {
-            partition_dir,
-            output_parquet,
-            output_jsonl,
-            checkpoint_path,
-            keep_intermediates: args.keep_intermediates,
-        })
+    // Load or defer Crossref index (built during streaming)
+    if let Some(ref path) = args.load_crossref_index {
+        info!("Loading Crossref index from: {}", path);
+        indexes.crossref = Some(load_index_from_parquet(path)?);
     }
 
-    fn cleanup(&self) -> Result<()> {
-        if self.keep_intermediates {
-            info!("Keeping intermediate files:");
-            info!("  Partition directory: {}", self.partition_dir.display());
-            info!("  Inverted parquet: {}", self.output_parquet.display());
-            info!("  Inverted JSONL: {}", self.output_jsonl.display());
-            return Ok(());
-        }
-
-        info!("Cleaning up intermediate files...");
-
-        // Remove partition directory and all contents
-        if self.partition_dir.exists() {
-            fs::remove_dir_all(&self.partition_dir)
-                .with_context(|| format!("Failed to remove partition directory: {}", self.partition_dir.display()))?;
-        }
-
-        // Remove intermediate parquet (keep JSONL if it's the final output)
-        if self.output_parquet.exists() {
-            fs::remove_file(&self.output_parquet)
-                .with_context(|| format!("Failed to remove: {}", self.output_parquet.display()))?;
-        }
-
-        Ok(())
+    // Load or build DataCite index
+    if let Some(ref path) = args.load_datacite_index {
+        info!("Loading DataCite index from: {}", path);
+        indexes.datacite = Some(load_index_from_parquet(path)?);
+    } else if let Some(ref path) = args.datacite_records {
+        info!("Building DataCite index from: {}", path);
+        indexes.datacite = Some(build_index_from_jsonl_gz(path, "id")?);
     }
+
+    Ok(indexes)
 }
 
-impl Drop for PipelineContext {
-    fn drop(&mut self) {
-        if !self.keep_intermediates {
-            let _ = fs::remove_dir_all(&self.partition_dir);
-            let _ = fs::remove_file(&self.output_parquet);
+/// Determine if we should build the Crossref index during extraction
+fn should_build_crossref_index(args: &PipelineArgs) -> bool {
+    // Build the index if:
+    // 1. We're extracting DOIs (not arxiv mode) AND
+    // 2. We don't already have a loaded index AND
+    // 3. We need the index for validation (crossref or all mode)
+    args.load_crossref_index.is_none() && matches!(args.source, Source::All | Source::Crossref)
+}
+
+/// Run the extraction phase: stream through tar.gz, extract references, build Crossref index
+fn run_extraction(
+    args: &PipelineArgs,
+    indexes: &mut PipelineIndexes,
+    partition_dir: &Path,
+) -> Result<ExtractionStats> {
+    let mut stats = ExtractionStats::default();
+    let build_crossref_index = should_build_crossref_index(args);
+
+    // Initialize Crossref index if we're building it
+    if build_crossref_index && indexes.crossref.is_none() {
+        info!("Will build Crossref index during extraction");
+        indexes.crossref = Some(DoiIndex::new());
+    }
+
+    // Create partition writer
+    let flush_threshold = args.batch_size / FLUSH_THRESHOLD_DIVISOR;
+    let mut writer = PartitionWriter::new(partition_dir, flush_threshold.max(10000))?;
+
+    // Open and stream the tar.gz
+    let file = File::open(&args.input)
+        .with_context(|| format!("Failed to open input file: {}", args.input))?;
+    let gz = GzDecoder::new(file);
+    let mut archive = Archive::new(gz);
+
+    // Log extraction behavior based on source mode
+    match args.source {
+        Source::Arxiv => {
+            info!("Extracting arXiv IDs from references...");
+        }
+        _ => {
+            info!("Extracting all DOIs from references (source filtering happens during validation)...");
         }
     }
-}
-
-/// Check if a reference might contain an arXiv ID (fast pre-filter)
-fn check_arxiv_hint(
-    doi: Option<&str>,
-    unstructured: Option<&str>,
-    article_title: Option<&str>,
-    journal_title: Option<&str>,
-    url: Option<&str>,
-) -> bool {
-    let check = |s: Option<&str>| s.map(|t| t.to_lowercase().contains("arxiv")).unwrap_or(false);
-    let doi_check = doi.map(|d| d.to_lowercase().contains("10.48550")).unwrap_or(false);
-
-    check(unstructured) || check(article_title) || check(journal_title) || check(url) || doi_check
-}
-
-/// Extract arXiv matches from a reference, returning (raw_matches, normalized_ids)
-fn extract_from_reference(reference: &Value) -> Option<(Vec<String>, Vec<String>)> {
-    let fields = [
-        reference.get("unstructured").and_then(|v| v.as_str()),
-        reference.get("DOI").and_then(|v| v.as_str()),
-        reference.get("URL").and_then(|v| v.as_str()),
-        reference.get("article-title").and_then(|v| v.as_str()),
-        reference.get("journal-title").and_then(|v| v.as_str()),
-    ];
-
-    let mut all_matches: Vec<ArxivMatch> = Vec::new();
-    for field in fields.iter().filter_map(|f| *f) {
-        all_matches.extend(extract_arxiv_matches_from_text(field));
-    }
-
-    if all_matches.is_empty() {
-        return None;
-    }
-
-    // Deduplicate by normalized ID
-    let mut seen = std::collections::HashSet::new();
-    let mut raw_matches = Vec::new();
-    let mut normalized_ids = Vec::new();
-
-    for m in all_matches {
-        if seen.insert(m.id.clone()) {
-            raw_matches.push(m.raw);
-            normalized_ids.push(m.id);
-        }
-    }
-
-    Some((raw_matches, normalized_ids))
-}
-
-/// Phase 1: Stream through tar.gz, extract arXiv references, and write to partitions
-fn run_fused_convert_extract(
-    input_path: &str,
-    writer: &mut PartitionWriter,
-    checkpoint: &mut Checkpoint,
-    progress_callback: impl Fn(usize, usize),
-) -> Result<FusedStats> {
-    let start = Instant::now();
-    info!("Streaming Crossref snapshot and extracting arXiv references: {}", input_path);
-
-    let tar_file = File::open(input_path)
-        .with_context(|| format!("Failed to open input file: {}", input_path))?;
-    let gz_decoder = GzDecoder::new(tar_file);
-    let mut archive = Archive::new(gz_decoder);
-
-    let mut stats = FusedStats::default();
-    let mut entry_count = 0;
+    info!("Streaming through Crossref archive...");
 
     for entry_result in archive.entries()? {
-        let mut entry = entry_result.context("Failed to read tar entry")?;
+        let entry = entry_result.context("Failed to read tar entry")?;
         let path = entry.path()?.to_path_buf();
 
-        if !path.extension().map_or(false, |ext| ext == "json") {
+        // Skip non-JSON files
+        let path_str = path.to_string_lossy();
+        if !path_str.ends_with(".json") {
             continue;
         }
 
-        entry_count += 1;
+        debug!("Processing: {}", path_str);
 
-        // Skip already-processed entries (resume support)
-        if entry_count <= checkpoint.tar_entries_processed {
-            continue;
-        }
-
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let mut content = String::new();
-        entry
-            .read_to_string(&mut content)
-            .with_context(|| format!("Failed to read content from: {}", path.display()))?;
-
-        let json_data: Value = match serde_json::from_str(&content) {
-            Ok(data) => data,
+        // Read and parse JSON
+        let reader = BufReader::new(entry);
+        let json: Value = match serde_json::from_reader(reader) {
+            Ok(v) => v,
             Err(e) => {
-                warn!("Failed to parse JSON in {}: {}", path.display(), e);
+                warn!("Failed to parse JSON in {}: {}", path_str, e);
                 continue;
             }
         };
 
-        drop(content); // Free memory
+        // Process items array
+        if let Some(items) = json.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                stats.items_processed += 1;
 
-        let items = match json_data.get("items") {
-            Some(Value::Array(items)) => items,
-            _ => {
-                warn!("No 'items' array found in {}", path.display());
-                continue;
-            }
-        };
+                // Extract the work's DOI
+                let work_doi = match item.get("DOI").and_then(|v| v.as_str()) {
+                    Some(doi) => doi.to_lowercase(),
+                    None => continue, // Skip items without DOI
+                };
 
-        stats.json_files_processed += 1;
-
-        for record in items {
-            stats.total_records += 1;
-
-            let doi = match record.get("DOI").and_then(|v| v.as_str()) {
-                Some(d) => d,
-                None => continue,
-            };
-
-            let references = match record.get("reference") {
-                Some(Value::Array(refs)) => refs,
-                _ => continue,
-            };
-
-            for (idx, reference) in references.iter().enumerate() {
-                stats.total_references += 1;
-
-                // Quick hint check
-                let ref_doi = reference.get("DOI").and_then(|v| v.as_str());
-                let unstructured = reference.get("unstructured").and_then(|v| v.as_str());
-                let article_title = reference.get("article-title").and_then(|v| v.as_str());
-                let journal_title = reference.get("journal-title").and_then(|v| v.as_str());
-                let url = reference.get("URL").and_then(|v| v.as_str());
-
-                let has_hint = check_arxiv_hint(ref_doi, unstructured, article_title, journal_title, url);
-                if !has_hint {
-                    continue;
+                // Add to Crossref index if building
+                if build_crossref_index {
+                    if let Some(ref mut index) = indexes.crossref {
+                        index.insert(&work_doi);
+                        stats.crossref_dois_indexed += 1;
+                    }
                 }
 
-                stats.references_with_hint += 1;
+                // Process references
+                if let Some(references) = item.get("reference").and_then(|v| v.as_array()) {
+                    for (ref_idx, reference) in references.iter().enumerate() {
+                        let ref_json = reference.to_string();
 
-                // Extract arXiv IDs
-                if let Some((raw_matches, normalized_ids)) = extract_from_reference(reference) {
-                    let ref_json = serde_json::to_string(reference).unwrap_or_default();
+                        // Collect text to search for matches
+                        // Search all fields that might contain arXiv IDs or DOIs
+                        let mut search_text = String::new();
 
-                    let written = writer.write_extracted_ref(
-                        doi,
-                        idx as u32,
-                        &ref_json,
-                        &raw_matches,
-                        &normalized_ids,
-                    )?;
+                        // Include the DOI field if present
+                        if let Some(doi) = reference.get("DOI").and_then(|v| v.as_str()) {
+                            search_text.push_str(doi);
+                            search_text.push(' ');
+                        }
 
-                    stats.references_with_matches += 1;
-                    stats.total_arxiv_ids_extracted += written;
+                        // Include URL field if present
+                        if let Some(url) = reference.get("URL").and_then(|v| v.as_str()) {
+                            search_text.push_str(url);
+                            search_text.push(' ');
+                        }
+
+                        // Include article-title field if present
+                        if let Some(title) = reference.get("article-title").and_then(|v| v.as_str())
+                        {
+                            search_text.push_str(title);
+                            search_text.push(' ');
+                        }
+
+                        // Include journal-title field if present
+                        if let Some(journal) =
+                            reference.get("journal-title").and_then(|v| v.as_str())
+                        {
+                            search_text.push_str(journal);
+                            search_text.push(' ');
+                        }
+
+                        // Include unstructured text if present
+                        if let Some(unstructured) =
+                            reference.get("unstructured").and_then(|v| v.as_str())
+                        {
+                            search_text.push_str(unstructured);
+                        }
+
+                        if search_text.is_empty() {
+                            continue;
+                        }
+
+                        // Extract matches based on source mode
+                        let (raw_matches, cited_ids, provenances): (
+                            Vec<String>,
+                            Vec<String>,
+                            Vec<Provenance>,
+                        ) = match args.source {
+                            Source::Arxiv => {
+                                // Extract arXiv IDs (just the ID, not the DOI - DOI is constructed in invert step)
+                                let matches = extract_arxiv_matches_from_text(&search_text);
+                                let raws: Vec<String> =
+                                    matches.iter().map(|m| m.raw.clone()).collect();
+                                let ids: Vec<String> =
+                                    matches.iter().map(|m| m.id.clone()).collect();
+                                // For arXiv, determine provenance based on whether DOI field exists
+                                let provs: Vec<Provenance> = ids
+                                    .iter()
+                                    .map(|id| {
+                                        let arxiv_doi = format!("10.48550/arXiv.{}", id);
+                                        determine_provenance(reference, &arxiv_doi)
+                                    })
+                                    .collect();
+                                (raws, ids, provs)
+                            }
+                            Source::All | Source::Crossref | Source::Datacite => {
+                                // Extract DOIs
+                                let matches = extract_doi_matches_from_text(&search_text);
+                                let raws: Vec<String> =
+                                    matches.iter().map(|m| m.raw.clone()).collect();
+                                let ids: Vec<String> =
+                                    matches.iter().map(|m| m.doi.clone()).collect();
+                                let provs: Vec<Provenance> = ids
+                                    .iter()
+                                    .map(|doi| determine_provenance(reference, doi))
+                                    .collect();
+                                (raws, ids, provs)
+                            }
+                        };
+
+                        if !cited_ids.is_empty() {
+                            // Filter out self-citations
+                            let (filtered_raw_matches, filtered_cited_ids, filtered_provenances): (
+                                Vec<_>,
+                                Vec<_>,
+                                Vec<_>,
+                            ) = raw_matches
+                                .iter()
+                                .zip(cited_ids.iter())
+                                .zip(provenances.iter())
+                                .filter(|((_, cited_id), _)| {
+                                    should_include_citation(&work_doi, cited_id)
+                                })
+                                .map(|((raw, cited), prov)| (raw.clone(), cited.clone(), *prov))
+                                .fold(
+                                    (Vec::new(), Vec::new(), Vec::new()),
+                                    |mut acc, (raw, cited, prov)| {
+                                        acc.0.push(raw);
+                                        acc.1.push(cited);
+                                        acc.2.push(prov);
+                                        acc
+                                    },
+                                );
+
+                            if !filtered_cited_ids.is_empty() {
+                                stats.refs_with_matches += 1;
+                                stats.total_matches += filtered_cited_ids.len();
+
+                                writer.write_extracted_ref(
+                                    &work_doi,
+                                    ref_idx as u32,
+                                    &ref_json,
+                                    &filtered_raw_matches,
+                                    &filtered_cited_ids,
+                                    &filtered_provenances,
+                                )?;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // Update checkpoint periodically
-        if stats.json_files_processed % 100 == 0 {
-            checkpoint.tar_entries_processed = entry_count;
-            checkpoint.stats.json_files_processed = stats.json_files_processed;
-            checkpoint.stats.total_records = stats.total_records;
-            checkpoint.stats.total_references = stats.total_references;
-            checkpoint.stats.references_with_matches = stats.references_with_matches;
-            checkpoint.stats.total_arxiv_ids_extracted = stats.total_arxiv_ids_extracted;
+        stats.files_processed += 1;
 
-            progress_callback(stats.json_files_processed, stats.total_references);
+        // Log progress periodically
+        if stats.files_processed % PROGRESS_LOG_INTERVAL == 0 {
+            info!(
+                "Progress: {} files, {} items, {} matches",
+                stats.files_processed, stats.items_processed, stats.total_matches
+            );
         }
-
-        debug!(
-            "Processed {}: {} items",
-            file_name,
-            items.len()
-        );
     }
 
-    // Final flush
+    // Flush remaining data
     writer.flush_all()?;
 
-    info!(
-        "Fused convert+extract complete in {}: {} refs -> {} matches ({} arxiv IDs)",
-        format_elapsed(start.elapsed()),
-        stats.total_references,
-        stats.references_with_matches,
-        stats.total_arxiv_ids_extracted
-    );
+    info!("Extraction complete:");
+    info!("  Files processed: {}", stats.files_processed);
+    info!("  Items processed: {}", stats.items_processed);
+    info!("  References with matches: {}", stats.refs_with_matches);
+    info!("  Total matches: {}", stats.total_matches);
+    if build_crossref_index {
+        info!("  Crossref DOIs indexed: {}", stats.crossref_dois_indexed);
+    }
 
     Ok(stats)
 }
 
-pub fn run_pipeline(args: PipelineArgs) -> Result<PipelineStats> {
-    let start_time = Instant::now();
-
+pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     setup_logging(&args.log_level)?;
 
-    info!("Starting arXiv citation pipeline (Fused Streaming)");
+    info!("Starting citation extraction pipeline");
     info!("Input: {}", args.input);
-    info!("DataCite records: {}", args.records);
-    info!("Output: {}", args.output);
+    info!("Source mode: {}", args.source);
+
+    validate_args(&args)?;
 
     if !Path::new(&args.input).exists() {
         return Err(anyhow::anyhow!("Input file does not exist: {}", args.input));
     }
 
-    let ctx = PipelineContext::new(&args)?;
-    info!("Partition directory: {}", ctx.partition_dir.display());
+    // Phase 1: Load indexes
+    info!("");
+    info!("=== Loading Indexes ===");
+    let mut indexes = load_indexes(&args)?;
 
-    // Load or create checkpoint
-    let mut checkpoint = Checkpoint::load(&ctx.checkpoint_path)?
-        .unwrap_or_else(|| {
-            let run_id = ctx.partition_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("run");
-            Checkpoint::new(run_id)
-        });
-
-    let mut stats = PipelineStats::default();
-
-    // Phase 1: Fused Convert + Extract (if not already complete)
-    if checkpoint.phase == PipelinePhase::ConvertExtract {
-        info!("");
-        info!("=== Extracting arXiv references ===");
-        info!("");
-
-        let flush_threshold = args.batch_size / 50; // ~100K rows per partition flush
-        let mut writer = PartitionWriter::new(&ctx.partition_dir, flush_threshold.max(10_000))?;
-
-        let fused_stats = run_fused_convert_extract(
-            &args.input,
-            &mut writer,
-            &mut checkpoint,
-            |files, refs| {
-                debug!("Progress: {} files, {} references", files, refs);
-            },
-        )?;
-
-        stats.fused = fused_stats;
-
-        info!("Extraction complete:");
-        info!("  JSON files processed: {}", stats.fused.json_files_processed);
-        info!("  Total records: {}", stats.fused.total_records);
-        info!("  Total references: {}", stats.fused.total_references);
-        info!("  References with matches: {}", stats.fused.references_with_matches);
-        info!("  Total arXiv IDs: {}", stats.fused.total_arxiv_ids_extracted);
-        info!("  Partitions created: {}", writer.partition_count());
-
-        checkpoint.start_invert_phase();
-        checkpoint.save(&ctx.checkpoint_path)?;
+    // Set up partition directory
+    let partition_dir = if let Some(ref dir) = args.temp_dir {
+        let path = PathBuf::from(dir);
+        std::fs::create_dir_all(&path)?;
+        path
     } else {
-        let phase_name = match checkpoint.phase {
-            PipelinePhase::ConvertExtract => "extraction",
-            PipelinePhase::Invert => "aggregation",
-            PipelinePhase::Complete => "complete",
-        };
-        info!("Resuming from checkpoint ({})", phase_name);
-        // Restore stats from checkpoint
-        stats.fused = FusedStats {
-            json_files_processed: checkpoint.stats.json_files_processed,
-            total_records: checkpoint.stats.total_records,
-            total_references: checkpoint.stats.total_references,
-            references_with_hint: 0, // Not tracked in checkpoint
-            references_with_matches: checkpoint.stats.references_with_matches,
-            total_arxiv_ids_extracted: checkpoint.stats.total_arxiv_ids_extracted,
-        };
+        // Create a unique temp directory
+        let temp_base = std::env::temp_dir();
+        let unique_dir = temp_base.join(format!("crossref-extract-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&unique_dir).context("Failed to create temp directory")?;
+        unique_dir
+    };
+    let cleanup_temp = args.temp_dir.is_none() && !args.keep_intermediates;
+    info!("Partition directory: {}", partition_dir.display());
+
+    // Phase 2: Extract and build Crossref index
+    info!("");
+    info!("=== Extraction Phase ===");
+    let extraction_stats = run_extraction(&args, &mut indexes, &partition_dir)?;
+
+    if extraction_stats.total_matches == 0 {
+        warn!("No matches found during extraction");
     }
 
-    // Phase 2: Parallel Partition Invert
-    if checkpoint.phase == PipelinePhase::Invert {
-        info!("");
-        info!("=== Aggregating citations by arXiv work ===");
-        info!("");
-
-        let invert_stats = invert_partitions(
-            &ctx.partition_dir,
-            &ctx.output_parquet,
-            Some(&ctx.output_jsonl),
-            &mut checkpoint,
-        )?;
-
-        stats.invert = invert_stats;
-
-        info!("Aggregation complete:");
-        info!("  Partitions processed: {}", stats.invert.partitions_processed);
-        info!("  Unique arXiv works: {}", stats.invert.unique_arxiv_works);
-        info!("  Total citations: {}", stats.invert.total_citations);
-
-        checkpoint.mark_complete();
-        checkpoint.save(&ctx.checkpoint_path)?;
-    }
-
-    // Phase 3: Validate (optional, but part of original pipeline)
+    // Phase 3: Invert partitions
     info!("");
-    info!("=== Validating arXiv DOIs ===");
-    info!("");
+    info!("=== Aggregating Citations ===");
 
-    let validate_args = ValidateArgs {
-        input: ctx.output_jsonl.to_string_lossy().to_string(),
-        records: args.records.clone(),
-        output_valid: args.output.clone(),
-        output_failed: args.output_failed.clone().unwrap_or_else(|| {
-            ctx.partition_dir.join("failed_temp.jsonl").to_string_lossy().to_string()
-        }),
-        concurrency: args.concurrency,
-        timeout: args.timeout,
-        log_level: "OFF".to_string(),
+    let output_mode = match args.source {
+        Source::Arxiv => OutputMode::Arxiv,
+        _ => OutputMode::Generic,
     };
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let validate_stats = rt.block_on(validate::run_validate_async(validate_args))
-        .context("Validate step failed")?;
+    // Determine output paths
+    let output_parquet = partition_dir.join("inverted.parquet");
+    let output_jsonl = match args.source {
+        Source::Arxiv => args.output_arxiv.as_ref().map(PathBuf::from),
+        Source::Crossref => args.output_crossref.as_ref().map(PathBuf::from),
+        Source::Datacite => args.output_datacite.as_ref().map(PathBuf::from),
+        Source::All => None, // Will handle separately in validation phase
+    };
 
-    setup_logging(&args.log_level)?;
+    let mut checkpoint = Checkpoint::new(&format!("pipeline-{}", Uuid::new_v4()));
 
-    info!("Validation complete:");
-    info!("  Matched in DataCite: {}", validate_stats.matched_in_datacite);
-    info!("  Resolution resolved: {}", validate_stats.resolution_resolved);
-    info!("  Resolution failed: {}", validate_stats.resolution_failed);
-    info!("  Total valid: {}", validate_stats.total_valid);
-    info!("  Total failed: {}", validate_stats.total_failed);
+    let invert_stats = invert_partitions(
+        &partition_dir,
+        &output_parquet,
+        output_jsonl.as_deref(),
+        &mut checkpoint,
+        output_mode,
+    )?;
 
-    stats.validate = Some(validate_stats.clone());
+    info!("Aggregation complete:");
+    info!(
+        "  Partitions processed: {}",
+        invert_stats.partitions_processed
+    );
+    info!(
+        "  Unique cited works (all extracted): {}",
+        invert_stats.unique_cited_works
+    );
+    info!(
+        "  Total citations (all extracted): {}",
+        invert_stats.total_citations
+    );
 
-    // Cleanup temp failed file if not requested
-    if args.output_failed.is_none() {
-        let temp_failed = ctx.partition_dir.join("failed_temp.jsonl");
-        if temp_failed.exists() {
-            let _ = fs::remove_file(temp_failed);
+    // Phase 4: Validate
+    info!("");
+    info!("=== Validating Citations ===");
+    info!(
+        "Filtering {} extracted works to {} source DOIs...",
+        invert_stats.unique_cited_works, args.source
+    );
+
+    let http_fallback_enabled = args
+        .http_fallback
+        .iter()
+        .any(|s| s == "crossref" || s == "datacite" || s == "all");
+
+    // Only run validation if we have an index to validate against and JSONL output
+    if indexes.crossref.is_some() || indexes.datacite.is_some() {
+        if let Some(ref jsonl_path) = output_jsonl {
+            let validation_input = jsonl_path.to_string_lossy().to_string();
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let validation_results = rt.block_on(validate_citations(
+                &validation_input,
+                indexes.crossref.as_ref(),
+                indexes.datacite.as_ref(),
+                args.source,
+                http_fallback_enabled,
+                args.concurrency,
+                args.timeout,
+            ))?;
+
+            info!("Validation results:");
+            info!(
+                "  Total records checked: {}",
+                validation_results.stats.total_records
+            );
+            info!(
+                "  Crossref index matched: {}",
+                validation_results.stats.crossref_matched
+            );
+            info!(
+                "  DataCite index matched: {}",
+                validation_results.stats.datacite_matched
+            );
+            if http_fallback_enabled {
+                info!(
+                    "  HTTP resolved: {} crossref, {} datacite",
+                    validation_results.stats.crossref_http_resolved,
+                    validation_results.stats.datacite_http_resolved
+                );
+            }
+            info!(
+                "  Valid {} citations: {}",
+                args.source,
+                validation_results.valid.len()
+            );
+            info!(
+                "  Failed (not in {} index): {}",
+                args.source,
+                validation_results.failed.len()
+            );
+
+            // Write outputs based on source mode (all modes use split output by provenance)
+            match args.source {
+                Source::All => {
+                    let (crossref_written, datacite_written) = write_split_validation_results(
+                        &validation_results,
+                        args.output_crossref.as_deref(),
+                        args.output_datacite.as_deref(),
+                        args.output_crossref_failed.as_deref(),
+                        args.output_datacite_failed.as_deref(),
+                    )?;
+                    info!(
+                        "Output written: {} Crossref, {} DataCite",
+                        crossref_written, datacite_written
+                    );
+                }
+                Source::Crossref => {
+                    write_validation_results_with_split(
+                        &validation_results.valid,
+                        &validation_results.failed,
+                        args.output_crossref.as_ref().unwrap(),
+                        args.output_crossref_failed.as_deref(),
+                    )?;
+                }
+                Source::Datacite => {
+                    write_validation_results_with_split(
+                        &validation_results.valid,
+                        &validation_results.failed,
+                        args.output_datacite.as_ref().unwrap(),
+                        args.output_datacite_failed.as_deref(),
+                    )?;
+                }
+                Source::Arxiv => {
+                    write_arxiv_validation_results_with_split(
+                        &validation_results,
+                        args.output_arxiv.as_ref().unwrap(),
+                        args.output_arxiv_failed.as_deref(),
+                    )?;
+                }
+            }
+        } else {
+            info!("No JSONL output specified, skipping validation...");
+        }
+    } else {
+        info!("No indexes available for validation, skipping...");
+    }
+
+    // Save indexes if requested
+    if let Some(ref path) = args.save_crossref_index {
+        if let Some(ref index) = indexes.crossref {
+            save_index_to_parquet(index, path)?;
+        }
+    }
+    if let Some(ref path) = args.save_datacite_index {
+        if let Some(ref index) = indexes.datacite {
+            save_index_to_parquet(index, path)?;
         }
     }
 
-    ctx.cleanup()?;
-
-    let total_time = start_time.elapsed();
-
-    info!("");
-    info!("==================== PIPELINE COMPLETE ====================");
-    info!("Total execution time: {}", format_elapsed(total_time));
-    info!("");
-    info!("Extraction:");
-    info!("  JSON files processed: {}", stats.fused.json_files_processed);
-    info!("  Total records scanned: {}", stats.fused.total_records);
-    info!("  Total references: {}", stats.fused.total_references);
-    info!("  References with matches: {}", stats.fused.references_with_matches);
-    info!("  Total arXiv IDs extracted: {}", stats.fused.total_arxiv_ids_extracted);
-    info!("");
-    info!("Aggregation:");
-    info!("  Partitions processed: {}", stats.invert.partitions_processed);
-    info!("  Unique arXiv works: {}", stats.invert.unique_arxiv_works);
-    info!("  Total citations: {}", stats.invert.total_citations);
-    info!("");
-    if let Some(ref vs) = stats.validate {
-        info!("Validation:");
-        info!("  Matched in DataCite: {}", vs.matched_in_datacite);
-        info!("  Total valid: {}", vs.total_valid);
-        info!("  Total failed: {}", vs.total_failed);
-        info!("");
+    // Cleanup temp directory if needed
+    if cleanup_temp {
+        info!("Cleaning up temp directory: {}", partition_dir.display());
+        if let Err(e) = std::fs::remove_dir_all(&partition_dir) {
+            warn!("Failed to cleanup temp directory: {}", e);
+        }
     }
-    info!("Output: {}", args.output);
-    if let Some(ref failed) = args.output_failed {
-        info!("Output failed: {}", failed);
-    }
-    info!("===========================================================");
 
-    Ok(stats)
+    Ok(())
+}
+
+fn validate_args(args: &PipelineArgs) -> Result<()> {
+    match args.source {
+        Source::All => {
+            if args.output_crossref.is_none() || args.output_datacite.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Source 'all' requires both --output-crossref and --output-datacite"
+                ));
+            }
+        }
+        Source::Crossref => {
+            if args.output_crossref.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Source 'crossref' requires --output-crossref"
+                ));
+            }
+        }
+        Source::Datacite => {
+            if args.output_datacite.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Source 'datacite' requires --output-datacite"
+                ));
+            }
+            if args.datacite_records.is_none() && args.load_datacite_index.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Source 'datacite' requires --datacite-records or --load-datacite-index"
+                ));
+            }
+        }
+        Source::Arxiv => {
+            if args.output_arxiv.is_none() {
+                return Err(anyhow::anyhow!("Source 'arxiv' requires --output-arxiv"));
+            }
+            if args.datacite_records.is_none() && args.load_datacite_index.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Source 'arxiv' requires --datacite-records or --load-datacite-index"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::PipelineArgs;
 
-    #[test]
-    fn test_check_arxiv_hint() {
-        assert!(check_arxiv_hint(None, Some("arXiv:2403.12345"), None, None, None));
-        assert!(check_arxiv_hint(Some("10.48550/arXiv.2403.12345"), None, None, None, None));
-        assert!(check_arxiv_hint(None, None, None, None, Some("https://arxiv.org/abs/2403.12345")));
-        assert!(!check_arxiv_hint(Some("10.1234/test"), Some("Regular ref"), None, None, None));
+    fn default_args() -> PipelineArgs {
+        PipelineArgs {
+            input: "test.tar.gz".to_string(),
+            datacite_records: None,
+            source: Source::All,
+            output_crossref: None,
+            output_datacite: None,
+            output_arxiv: None,
+            output_crossref_failed: None,
+            output_datacite_failed: None,
+            output_arxiv_failed: None,
+            http_fallback: vec![],
+            load_crossref_index: None,
+            save_crossref_index: None,
+            load_datacite_index: None,
+            save_datacite_index: None,
+            log_level: "INFO".to_string(),
+            concurrency: 50,
+            timeout: 5,
+            keep_intermediates: false,
+            temp_dir: None,
+            batch_size: 5000000,
+        }
     }
 
     #[test]
-    fn test_extract_from_reference() {
-        let ref_json = serde_json::json!({
-            "unstructured": "See arXiv:2403.12345 for details"
-        });
-
-        let result = extract_from_reference(&ref_json);
-        assert!(result.is_some());
-
-        let (raw, norm) = result.unwrap();
-        assert_eq!(norm.len(), 1);
-        assert_eq!(norm[0], "2403.12345");
-        assert!(raw[0].contains("2403.12345"));
+    fn test_validate_args_all_requires_both_outputs() {
+        let args = default_args();
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--output-crossref"));
     }
 
     #[test]
-    fn test_extract_from_reference_no_match() {
-        let ref_json = serde_json::json!({
-            "unstructured": "A regular citation"
-        });
+    fn test_validate_args_all_with_both_outputs() {
+        let mut args = default_args();
+        args.output_crossref = Some("crossref.jsonl".to_string());
+        args.output_datacite = Some("datacite.jsonl".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+    }
 
-        let result = extract_from_reference(&ref_json);
-        assert!(result.is_none());
+    #[test]
+    fn test_validate_args_crossref_requires_output() {
+        let mut args = default_args();
+        args.source = Source::Crossref;
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--output-crossref"));
+    }
+
+    #[test]
+    fn test_validate_args_crossref_with_output() {
+        let mut args = default_args();
+        args.source = Source::Crossref;
+        args.output_crossref = Some("crossref.jsonl".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_args_datacite_requires_output() {
+        let mut args = default_args();
+        args.source = Source::Datacite;
+        args.datacite_records = Some("records.jsonl.gz".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--output-datacite"));
+    }
+
+    #[test]
+    fn test_validate_args_datacite_requires_records() {
+        let mut args = default_args();
+        args.source = Source::Datacite;
+        args.output_datacite = Some("datacite.jsonl".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--datacite-records"));
+    }
+
+    #[test]
+    fn test_validate_args_datacite_with_records_file() {
+        let mut args = default_args();
+        args.source = Source::Datacite;
+        args.output_datacite = Some("datacite.jsonl".to_string());
+        args.datacite_records = Some("records.jsonl.gz".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_args_datacite_with_index() {
+        let mut args = default_args();
+        args.source = Source::Datacite;
+        args.output_datacite = Some("datacite.jsonl".to_string());
+        args.load_datacite_index = Some("index.parquet".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_args_arxiv_requires_output() {
+        let mut args = default_args();
+        args.source = Source::Arxiv;
+        args.datacite_records = Some("records.jsonl.gz".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("--output-arxiv"));
+    }
+
+    #[test]
+    fn test_validate_args_arxiv_requires_records() {
+        let mut args = default_args();
+        args.source = Source::Arxiv;
+        args.output_arxiv = Some("arxiv.jsonl".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--datacite-records"));
+    }
+
+    #[test]
+    fn test_validate_args_arxiv_with_all_required() {
+        let mut args = default_args();
+        args.source = Source::Arxiv;
+        args.output_arxiv = Some("arxiv.jsonl".to_string());
+        args.datacite_records = Some("records.jsonl.gz".to_string());
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_should_include_citation() {
+        assert!(should_include_citation("10.1234/a", "10.5678/b"));
+        assert!(!should_include_citation("10.1234/a", "10.1234/a"));
+        assert!(!should_include_citation("10.1234/A", "10.1234/a")); // Case insensitive
+    }
+
+    #[test]
+    fn test_determine_provenance() {
+        use crate::extract::Provenance;
+        use serde_json::json;
+
+        // Publisher asserted
+        let ref_publisher = json!({"DOI": "10.1234/test", "doi-asserted-by": "publisher"});
+        assert_eq!(
+            determine_provenance(&ref_publisher, "10.1234/test"),
+            Provenance::Publisher
+        );
+
+        // Crossref asserted
+        let ref_crossref = json!({"DOI": "10.1234/test", "doi-asserted-by": "crossref"});
+        assert_eq!(
+            determine_provenance(&ref_crossref, "10.1234/test"),
+            Provenance::Crossref
+        );
+
+        // DOI present but no doi-asserted-by
+        let ref_no_assertion = json!({"DOI": "10.1234/test"});
+        assert_eq!(
+            determine_provenance(&ref_no_assertion, "10.1234/test"),
+            Provenance::Mined
+        );
+
+        // Mined from unstructured (DOI not in DOI field)
+        let ref_unstructured = json!({"unstructured": "See doi:10.1234/test"});
+        assert_eq!(
+            determine_provenance(&ref_unstructured, "10.1234/test"),
+            Provenance::Mined
+        );
     }
 }

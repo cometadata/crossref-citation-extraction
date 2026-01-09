@@ -56,23 +56,24 @@ impl Checkpoint {
     }
 
     /// Save checkpoint to file
+    #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .context("Failed to serialize checkpoint")?;
+        let json = serde_json::to_string_pretty(self).context("Failed to serialize checkpoint")?;
         fs::write(path, json)
             .with_context(|| format!("Failed to write checkpoint to {:?}", path))?;
         Ok(())
     }
 
     /// Load checkpoint from file, returning None if file doesn't exist
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
         let json = fs::read_to_string(path)
             .with_context(|| format!("Failed to read checkpoint from {:?}", path))?;
-        let checkpoint: Self = serde_json::from_str(&json)
-            .context("Failed to deserialize checkpoint")?;
+        let checkpoint: Self =
+            serde_json::from_str(&json).context("Failed to deserialize checkpoint")?;
         Ok(Some(checkpoint))
     }
 
@@ -87,11 +88,13 @@ impl Checkpoint {
     }
 
     /// Transition to invert phase
+    #[allow(dead_code)]
     pub fn start_invert_phase(&mut self) {
         self.phase = PipelinePhase::Invert;
     }
 
     /// Mark pipeline as complete
+    #[allow(dead_code)]
     pub fn mark_complete(&mut self) {
         self.phase = PipelinePhase::Complete;
     }

@@ -1,5 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 
+#[allow(dead_code)]
 pub fn create_bytes_progress_bar(total_bytes: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_bytes);
     pb.set_style(
@@ -11,6 +12,7 @@ pub fn create_bytes_progress_bar(total_bytes: u64) -> ProgressBar {
     pb
 }
 
+#[allow(dead_code)]
 pub fn create_count_progress_bar(total_items: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_items);
     pb.set_style(

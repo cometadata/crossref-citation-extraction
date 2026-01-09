@@ -21,7 +21,9 @@ pub fn setup_logging(log_level: &str) -> Result<()> {
     let level = parse_log_level(log_level);
     let _ = SimpleLogger::new()
         .with_level(level)
-        .with_timestamp_format(format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"))
+        .with_timestamp_format(format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second]"
+        ))
         .init();
     Ok(())
 }

@@ -1,8 +1,8 @@
 [package]
-name = "crossref-arxiv-citation-extraction"
-version = "1.0.0"
+name = "crossref-citation-extraction"
+version = "2.0.0"
 edition = "2021"
-description = "Unified CLI for extracting, inverting, and validating arXiv references from Crossref data"
+description = "CLI for extracting, inverting, and validating DOI references from Crossref data"
 
 [dependencies]
 # CLI
@@ -60,6 +60,11 @@ uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "extraction_bench"
+harness = false
 
 [profile.release]
 opt-level = 3

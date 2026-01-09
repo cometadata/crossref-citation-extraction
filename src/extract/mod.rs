@@ -1,3 +1,7 @@
-pub mod patterns;
+pub mod arxiv;
+pub mod doi;
+mod provenance;
 
-pub use patterns::*;
+pub use arxiv::*;
+pub use doi::*;
+pub use provenance::Provenance;
