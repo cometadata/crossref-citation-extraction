@@ -60,6 +60,11 @@ uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "extraction_bench"
+harness = false
 
 [profile.release]
 opt-level = 3
