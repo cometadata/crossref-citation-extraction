@@ -14,7 +14,7 @@ pub struct ExplodedRow {
     pub ref_index: u32,
     pub ref_json: String,
     pub raw_match: String,
-    pub arxiv_id: String,
+    pub cited_id: String,
 }
 
 /// Buffer for a single partition
@@ -23,7 +23,7 @@ struct PartitionBuffer {
     ref_indices: Vec<u32>,
     ref_jsons: Vec<String>,
     raw_matches: Vec<String>,
-    arxiv_ids: Vec<String>,
+    cited_ids: Vec<String>,
     file_path: PathBuf,
     rows_written: usize,
 }
@@ -36,7 +36,7 @@ impl PartitionBuffer {
             ref_indices: Vec::new(),
             ref_jsons: Vec::new(),
             raw_matches: Vec::new(),
-            arxiv_ids: Vec::new(),
+            cited_ids: Vec::new(),
             file_path,
             rows_written: 0,
         }
@@ -51,7 +51,7 @@ impl PartitionBuffer {
         self.ref_indices.push(row.ref_index);
         self.ref_jsons.push(row.ref_json);
         self.raw_matches.push(row.raw_match);
-        self.arxiv_ids.push(row.arxiv_id);
+        self.cited_ids.push(row.cited_id);
     }
 
     fn to_dataframe(&self) -> Result<DataFrame> {
@@ -60,7 +60,7 @@ impl PartitionBuffer {
             Column::new("ref_index".into(), &self.ref_indices),
             Column::new("ref_json".into(), &self.ref_jsons),
             Column::new("raw_match".into(), &self.raw_matches),
-            Column::new("arxiv_id".into(), &self.arxiv_ids),
+            Column::new("cited_id".into(), &self.cited_ids),
         ])
         .map_err(|e| anyhow::anyhow!("Failed to create DataFrame: {}", e))
     }
@@ -70,7 +70,7 @@ impl PartitionBuffer {
         self.ref_indices.clear();
         self.ref_jsons.clear();
         self.raw_matches.clear();
-        self.arxiv_ids.clear();
+        self.cited_ids.clear();
     }
 }
 
@@ -102,7 +102,7 @@ impl PartitionWriter {
 
     /// Write an exploded row to the appropriate partition
     pub fn write(&mut self, row: ExplodedRow) -> Result<()> {
-        let partition = partition_key(&row.arxiv_id);
+        let partition = partition_key(&row.cited_id);
 
         let buffer = self.buffers
             .entry(partition.clone())
@@ -124,16 +124,16 @@ impl PartitionWriter {
         ref_index: u32,
         ref_json: &str,
         raw_matches: &[String],
-        arxiv_ids: &[String],
+        cited_ids: &[String],
     ) -> Result<usize> {
         let mut written = 0;
-        for (raw_match, arxiv_id) in raw_matches.iter().zip(arxiv_ids.iter()) {
+        for (raw_match, cited_id) in raw_matches.iter().zip(cited_ids.iter()) {
             self.write(ExplodedRow {
                 citing_doi: citing_doi.to_string(),
                 ref_index,
                 ref_json: ref_json.to_string(),
                 raw_match: raw_match.clone(),
-                arxiv_id: arxiv_id.clone(),
+                cited_id: cited_id.clone(),
             })?;
             written += 1;
         }
@@ -219,7 +219,7 @@ mod tests {
             ref_index: 0,
             ref_json: "{}".to_string(),
             raw_match: "arXiv:2403.12345".to_string(),
-            arxiv_id: "2403.12345".to_string(),
+            cited_id: "2403.12345".to_string(),
         }).unwrap();
 
         writer.flush_all().unwrap();
@@ -238,7 +238,7 @@ mod tests {
             ref_index: 0,
             ref_json: "{}".to_string(),
             raw_match: "arXiv:2403.12345".to_string(),
-            arxiv_id: "2403.12345".to_string(),
+            cited_id: "2403.12345".to_string(),
         }).unwrap();
 
         // Old format
@@ -247,7 +247,7 @@ mod tests {
             ref_index: 1,
             ref_json: "{}".to_string(),
             raw_match: "arXiv:hep-ph/9901234".to_string(),
-            arxiv_id: "hep-ph/9901234".to_string(),
+            cited_id: "hep-ph/9901234".to_string(),
         }).unwrap();
 
         writer.flush_all().unwrap();
