@@ -162,11 +162,33 @@ fn run_extraction(
                         let ref_json = reference.to_string();
 
                         // Collect text to search for matches
+                        // Search all fields that might contain arXiv IDs or DOIs
                         let mut search_text = String::new();
 
                         // Include the DOI field if present
                         if let Some(doi) = reference.get("DOI").and_then(|v| v.as_str()) {
                             search_text.push_str(doi);
+                            search_text.push(' ');
+                        }
+
+                        // Include URL field if present
+                        if let Some(url) = reference.get("URL").and_then(|v| v.as_str()) {
+                            search_text.push_str(url);
+                            search_text.push(' ');
+                        }
+
+                        // Include article-title field if present
+                        if let Some(title) = reference.get("article-title").and_then(|v| v.as_str())
+                        {
+                            search_text.push_str(title);
+                            search_text.push(' ');
+                        }
+
+                        // Include journal-title field if present
+                        if let Some(journal) =
+                            reference.get("journal-title").and_then(|v| v.as_str())
+                        {
+                            search_text.push_str(journal);
                             search_text.push(' ');
                         }
 
