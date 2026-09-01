@@ -162,3 +162,96 @@ cargo test           # Run tests
 cargo fmt            # Format code
 cargo clippy         # Lint
 ```
+
+## Hugging Face Job
+
+A production workload that runs this extractor against the monthly Crossref
+Metadata Plus snapshot and updates
+[`cometadata/crossref-arxiv-citations`](https://huggingface.co/datasets/cometadata/crossref-arxiv-citations).
+Python orchestration lives in `citations_pipeline/`; the job entry is
+`jobs/pipeline.py`; runs are submitted manually with `submit_job.py`.
+
+### How it works
+
+1. **Snapshot** — reuses the Crossref snapshot mirrored by the affiliations
+   pipeline (`shared-storage/crossref-affiliations-latest/`, consumed via its
+   `_PIPELINE_COMPLETE.json` contract). If no valid mirror exists, and
+   `CROSSREF_API_TOKEN` is set, the job downloads the snapshot itself into
+   `crossref-arxiv-citations-latest/raw-generations/`.
+2. **arXiv index** — built from the DataCite monthly data file already
+   mirrored in the bucket (`datacite-monthly-data-file-<release>/dois/`),
+   cached as `crossref-arxiv-citations-latest/fst/<release>-v1/arxiv.fst`.
+3. **Extract** — this crate is built in-job (`cargo build --release --locked`)
+   from the staged source volume and streams the 280 GB archive on local disk.
+4. **Transform + publish** — the valid output is reshaped into
+   `data/{all,asserted,mined}.parquet` (the dataset's published schema) and
+   committed to the dataset in one parent-SHA-guarded commit together with a
+   refreshed dataset card.
+
+Durable state lives under
+`hf://buckets/cometadata/shared-storage/crossref-arxiv-citations-latest/`:
+`derived-generations/<snapshot>-<run>/` (outputs), root markers
+`_EXTRACTION_COMPLETE.json` (retry pointer) and `_PIPELINE_COMPLETE.json`
+(authoritative; written only after the dataset commit is verified). Retried
+runs reuse verified work via the markers; `--force` recomputes everything but
+never skips verification.
+
+### Run a smoke job
+
+Runs the full chain (Rust build, FST build, extraction, transform) on an
+embedded deterministic archive. No bucket mount, no dataset write, no tokens.
+
+```bash
+hf auth login
+uv run submit_job.py --smoke
+```
+
+Inspect asynchronously (no busy polling):
+
+```bash
+hf jobs inspect JOB_ID --namespace cometadata
+hf jobs logs JOB_ID --namespace cometadata
+```
+
+A successful smoke log ends with `RESULT_JSON=` containing
+`"status":"smoke-completed"`.
+
+### Run production
+
+```bash
+hf auth login
+uv run submit_job.py
+```
+
+Production submits in namespace `cometadata` on `cpu-xl` with a 24-hour
+timeout and label `pipeline=crossref-arxiv-citations`. At roughly $1/hour the
+timeout is an approximate $24 ceiling per run; the first run against a new
+DataCite release spends about an extra hour building the FST. Confirm current
+Jobs pricing and approve the cost before each billable submission.
+
+The submitter checks the bucket for the affiliations mirror and only demands
+`CROSSREF_API_TOKEN` when the mirror is missing. Optional flags:
+`--force` (recompute reusable phases), `--datacite-release YYYY-MM` (pin the
+DataCite release).
+
+Telemetry is emitted as `PIPELINE_EVENT=` JSON lines (phase start/complete/
+fail, progress with throughput and ETA). Events never contain credentials or
+signed URLs.
+
+### Local verification
+
+```bash
+uv run pytest -q
+uv run ruff check .
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo build --release --locked
+```
+
+Local smoke (same entry point the job runs):
+
+```bash
+SOURCE_DIGEST="$(uv run python -c 'from pathlib import Path; from citations_pipeline.paths import runtime_source_digest; print(runtime_source_digest(Path.cwd()))')"
+uv run jobs/pipeline.py --smoke --source-root "$PWD" --source-digest "$SOURCE_DIGEST" --work-root /tmp/citations-smoke-work
+```
