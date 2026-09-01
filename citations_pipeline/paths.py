@@ -7,6 +7,9 @@ from pathlib import Path
 
 DOWNLOAD_PROTOCOL_VERSION = 1
 EXTRACTION_SCHEMA_VERSION = 1
+# Cache discipline: any change to the extractor's `build-index` semantics — i.e. the
+# FST content produced for the same DataCite release — MUST bump FST_SCHEMA_VERSION.
+# It is the only guard against silently reusing a stale cached index.
 FST_SCHEMA_VERSION = 1
 PUBLISH_SCHEMA_VERSION = 1
 MARKER_SCHEMA_VERSION = 1

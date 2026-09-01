@@ -1,5 +1,9 @@
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 def load_job_module():
@@ -22,6 +26,27 @@ def test_parse_args_defaults(monkeypatch) -> None:
     assert args.work_root == Path("/tmp/crossref-arxiv-citations")
     assert args.bucket_root is None
     assert args.smoke is False and args.force is False
+
+
+def test_run_checked_returns_completed_process_on_success(capsys) -> None:
+    module = load_job_module()
+    result = module._run_checked([sys.executable, "-c", "print('hello-stdout')"])
+    assert result.returncode == 0
+    assert result.stdout.strip() == "hello-stdout"
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_run_checked_surfaces_stderr_on_failure(capsys) -> None:
+    module = load_job_module()
+    marker = "E: Unable to locate package citations-marker"
+    script = f"import sys; sys.stderr.write({marker!r} + chr(10)); sys.exit(3)"
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        module._run_checked([sys.executable, "-c", script])
+    assert excinfo.value.returncode == 3
+    captured = capsys.readouterr()
+    assert marker in captured.err
+    assert "exit code 3" in captured.err
 
 
 def test_uv_header_lists_runtime_dependencies() -> None:

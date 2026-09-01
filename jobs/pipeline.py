@@ -45,12 +45,28 @@ def parse_args() -> argparse.Namespace:
 
 
 def _run_checked(arguments: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        arguments,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            arguments,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as error:
+        # capture_output swallows the child's diagnostics, so echo them before
+        # re-raising; otherwise a bootstrap failure only reports an exit code.
+        for stream in (error.stdout, error.stderr):
+            if not stream:
+                continue
+            if isinstance(stream, bytes):
+                stream = stream.decode(errors="replace")
+            print(stream, file=sys.stderr, end="" if stream.endswith("\n") else "\n")
+        print(
+            f"command failed with exit code {error.returncode}: {' '.join(arguments)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
 
 
 def _ensure_debian_packages() -> None:
