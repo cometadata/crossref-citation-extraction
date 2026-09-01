@@ -96,6 +96,7 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "2403.03542");
         assert_eq!(matches[0].arxiv_doi, "10.48550/arXiv.2403.03542");
+        assert_eq!(matches[0].raw, "arXiv:2403.03542v2");
     }
 
     #[test]
@@ -105,6 +106,7 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "hep-ph/9901234");
         assert_eq!(matches[0].arxiv_doi, "10.48550/arXiv.hep-ph/9901234");
+        assert_eq!(matches[0].raw, "arXiv:hep-ph/9901234");
     }
 
     #[test]
@@ -137,6 +139,7 @@ mod tests {
         let matches = extract_arxiv_matches_from_text(text);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "2403.03542");
+        assert_eq!(matches[0].raw, "10.48550/arXiv.2403.03542");
     }
 
     #[test]
@@ -145,6 +148,7 @@ mod tests {
         let matches = extract_arxiv_matches_from_text(text);
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].id, "2403.03542");
+        assert_eq!(matches[0].raw, "arxiv.org/abs/2403.03542");
     }
 
     #[test]

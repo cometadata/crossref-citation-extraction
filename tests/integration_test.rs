@@ -306,6 +306,7 @@ fn test_batched_processing_for_large_partitions() {
                         "mined"
                     }
                     .to_string(),
+                    raw_match: "arXiv:2403.12345".to_string(),
                     ref_json: format!(r#"{{"unstructured": "ref {}"}}"#, i),
                 })
                 .unwrap();

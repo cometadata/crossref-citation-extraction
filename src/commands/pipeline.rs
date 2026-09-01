@@ -391,7 +391,7 @@ fn extract_file(
 
             let mut ref_json_cache: Option<String> = None;
 
-            for (doi, _raw) in matches {
+            for (doi, raw) in matches {
                 if !should_include_citation(&work_doi, &doi) {
                     result.stats.filtered_self_cite += 1;
                     continue;
@@ -411,6 +411,7 @@ fn extract_file(
                     ref_index,
                     cited_id: doi, // Move instead of clone - we own this
                     provenance: provenance.as_str().to_string(),
+                    raw_match: raw,
                     ref_json: ref_json.clone(),
                 });
                 result.stats.extracted += 1;
@@ -905,6 +906,7 @@ mod tests {
                 ref_index: 0,
                 cited_id: "10.48550/arxiv.2403.00001".to_string(),
                 provenance: "mined".to_string(),
+                raw_match: "arXiv:2403.99999".to_string(),
                 ref_json: "{}".to_string(),
             })
             .unwrap();
@@ -922,5 +924,25 @@ mod tests {
         drop(checkpoint);
         let reloaded = ExtractionCheckpoint::new(&cp_path).unwrap();
         assert!(reloaded.is_completed("file1.json"));
+    }
+
+    #[test]
+    fn test_extract_file_captures_raw_match() {
+        let body = serde_json::json!({
+            "items": [{
+                "DOI": "10.1234/citing",
+                "reference": [
+                    {"key": "r1", "unstructured": "See arXiv:2403.03542 for details"}
+                ]
+            }]
+        });
+        let entry = CrossrefEntry {
+            filename: "t.json".to_string(),
+            bytes: serde_json::to_vec(&body).unwrap(),
+        };
+        let mut scratch = String::new();
+        let result = extract_file(&entry, &[], &mut scratch);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].raw_match, "arXiv:2403.03542");
     }
 }

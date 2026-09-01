@@ -14,6 +14,7 @@ pub struct PartitionRow {
     pub ref_index: u32,
     pub cited_id: String,
     pub provenance: String,
+    pub raw_match: String,
     pub ref_json: String,
 }
 
@@ -23,6 +24,7 @@ struct SegmentBuffer {
     ref_indices: Vec<u32>,
     cited_ids: Vec<String>,
     provenances: Vec<String>,
+    raw_matches: Vec<String>,
     ref_jsons: Vec<String>,
 }
 
@@ -33,6 +35,7 @@ impl SegmentBuffer {
             ref_indices: Vec::new(),
             cited_ids: Vec::new(),
             provenances: Vec::new(),
+            raw_matches: Vec::new(),
             ref_jsons: Vec::new(),
         }
     }
@@ -42,6 +45,7 @@ impl SegmentBuffer {
         self.ref_indices.push(row.ref_index);
         self.cited_ids.push(row.cited_id);
         self.provenances.push(row.provenance);
+        self.raw_matches.push(row.raw_match);
         self.ref_jsons.push(row.ref_json);
     }
 
@@ -61,6 +65,7 @@ impl SegmentBuffer {
             Column::new("ref_index".into(), std::mem::take(&mut self.ref_indices)),
             Column::new("cited_id".into(), std::mem::take(&mut self.cited_ids)),
             Column::new("provenance".into(), std::mem::take(&mut self.provenances)),
+            Column::new("raw_match".into(), std::mem::take(&mut self.raw_matches)),
             Column::new("ref_json".into(), std::mem::take(&mut self.ref_jsons)),
         ])
         .map_err(|e| anyhow::anyhow!("Failed to create DataFrame: {}", e))?;
@@ -184,6 +189,7 @@ mod tests {
                     ref_index: i as u32,
                     cited_id: "10.1234/cited".to_string(),
                     provenance: "mined".to_string(),
+                    raw_match: "arXiv:0000.00000".to_string(),
                     ref_json: format!(r#"{{"idx": {}}}"#, i),
                 })
                 .unwrap();
@@ -211,6 +217,7 @@ mod tests {
                 ref_index: 0,
                 cited_id: "10.1234/cited1".to_string(),
                 provenance: "publisher".to_string(),
+                raw_match: "arXiv:0000.00000".to_string(),
                 ref_json: r#"{"test": 1}"#.to_string(),
             })
             .unwrap();
@@ -221,6 +228,7 @@ mod tests {
                 ref_index: 0,
                 cited_id: "10.5678/cited2".to_string(),
                 provenance: "mined".to_string(),
+                raw_match: "arXiv:0000.00000".to_string(),
                 ref_json: r#"{"test": 2}"#.to_string(),
             })
             .unwrap();
@@ -230,5 +238,33 @@ mod tests {
         assert!(dir.path().join("10.1234").exists());
         assert!(dir.path().join("10.5678").exists());
         assert_eq!(writer.partition_count(), 2);
+    }
+
+    #[test]
+    fn test_segments_carry_raw_match_column() {
+        use polars::prelude::*;
+
+        let dir = tempdir().unwrap();
+        let mut writer = SegmentedPartitionWriter::new(dir.path(), 10).unwrap();
+
+        writer
+            .write(PartitionRow {
+                citing_doi: "10.1111/a".to_string(),
+                ref_index: 0,
+                cited_id: "10.48550/arXiv.2403.03542".to_string(),
+                provenance: "mined".to_string(),
+                raw_match: "arXiv:2403.03542".to_string(),
+                ref_json: r#"{"unstructured": "see arXiv:2403.03542"}"#.to_string(),
+            })
+            .unwrap();
+        writer.flush_all().unwrap();
+
+        let segment = dir.path().join("2403").join("segment_0000.parquet");
+        let df = LazyFrame::scan_parquet(&segment, Default::default())
+            .unwrap()
+            .collect()
+            .unwrap();
+        let raws = df.column("raw_match").unwrap().str().unwrap();
+        assert_eq!(raws.get(0), Some("arXiv:2403.03542"));
     }
 }

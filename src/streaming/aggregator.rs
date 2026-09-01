@@ -911,6 +911,7 @@ mod tests {
                     ref_index: 0,
                     cited_id: "10.1234/cited".to_string(),
                     provenance: "publisher".to_string(),
+                    raw_match: "arXiv:2403.00001".to_string(),
                     ref_json: r#"{"unstructured": "ref 1"}"#.to_string(),
                 })
                 .unwrap();
@@ -921,6 +922,7 @@ mod tests {
                     ref_index: 0,
                     cited_id: "10.1234/cited".to_string(),
                     provenance: "mined".to_string(),
+                    raw_match: "arXiv:2403.00002".to_string(),
                     ref_json: r#"{"unstructured": "ref 2"}"#.to_string(),
                 })
                 .unwrap();
