@@ -1,6 +1,11 @@
 # Build artifacts
 /target/
-Cargo.lock
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
 
 # IDE
 .idea/
