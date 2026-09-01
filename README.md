@@ -106,16 +106,20 @@ Each line of the output is a JSON object representing a cited arXiv work:
     {
       "doi": "10.5678/citing-paper",
       "provenance": "publisher",
+      "raw_match": "10.48550/arXiv.2403.03542",
       "reference": {"DOI": "10.48550/arXiv.2403.03542", "doi-asserted-by": "publisher"}
     },
     {
       "doi": "10.5678/another-citing-paper",
       "provenance": "mined",
+      "raw_match": "arXiv:2403.03542",
       "reference": {"unstructured": "See arXiv:2403.03542 for details"}
     }
   ]
 }
 ```
+
+`raw_match` is the exact substring that matched an arXiv identifier pattern.
 
 The `--outputs` option controls which files are generated:
 

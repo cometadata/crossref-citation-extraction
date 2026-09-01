@@ -87,6 +87,17 @@ fn test_arxiv_extraction_end_to_end() {
             || output_content.contains("10.48550/arxiv.2403.12345"),
         "Output should contain validated arXiv DOI"
     );
+
+    for line in output_content.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        for entry in record["cited_by"].as_array().unwrap() {
+            assert!(
+                entry["raw_match"].as_str().is_some(),
+                "cited_by entry missing raw_match: {}",
+                entry
+            );
+        }
+    }
 }
 
 #[test]
