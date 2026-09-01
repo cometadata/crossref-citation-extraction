@@ -18,7 +18,10 @@ const SEGMENT_BATCH_THRESHOLD: usize = 100;
 /// Chunk size for reading parquet files during streaming (rows per chunk).
 /// Must fit in u32 for Polars slice() compatibility.
 const STREAM_CHUNK_SIZE: usize = 500_000;
-const _: () = assert!(STREAM_CHUNK_SIZE <= u32::MAX as usize, "STREAM_CHUNK_SIZE must fit in u32");
+const _: () = assert!(
+    STREAM_CHUNK_SIZE <= u32::MAX as usize,
+    "STREAM_CHUNK_SIZE must fit in u32"
+);
 
 /// Total rows buffered across all merge cursors (bounds merge memory).
 const MERGE_BUFFER_ROWS: usize = 4_000_000;
@@ -94,6 +97,7 @@ fn write_jsonl_record(w: &mut BufWriter<File>, record: &CitedRecordOut<'_>) -> R
 }
 
 /// Flush a group of citations for a single cited DOI to output files.
+#[allow(clippy::too_many_arguments)]
 fn flush_group(
     cited_id: &str,
     citations: &[GroupedCitation],
@@ -180,6 +184,7 @@ fn flush_group(
 
 /// Process a large partition using external sort:
 /// sort each segment, then k-way merge directly into group aggregation.
+#[allow(clippy::too_many_arguments)]
 fn process_partition_external_sort(
     segments: &[PathBuf],
     partition_path: &Path,
@@ -565,6 +570,7 @@ pub fn aggregate_and_validate(
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_partition(
     partition_path: &Path,
     arxiv_index: Option<&FstIndex>,
@@ -620,6 +626,7 @@ fn process_partition(
 
 /// Process a partition with few segments by loading all data into memory at once
 /// This is faster for small partitions but uses more memory
+#[allow(clippy::too_many_arguments)]
 fn process_partition_inmemory(
     segments: &[std::path::PathBuf],
     arxiv_index: Option<&FstIndex>,
@@ -685,6 +692,7 @@ struct GroupedCitation {
 }
 
 /// Write grouped results from a Polars DataFrame to output files
+#[allow(clippy::too_many_arguments)]
 fn write_grouped_results(
     grouped: &DataFrame,
     arxiv_index: Option<&FstIndex>,
@@ -950,7 +958,8 @@ mod tests {
         };
 
         // Run aggregation
-        let stats = aggregate_and_validate(&partition_dir, Some(&index), &outputs, false, 0).unwrap();
+        let stats =
+            aggregate_and_validate(&partition_dir, Some(&index), &outputs, false, 0).unwrap();
 
         assert_eq!(stats.valid_count, 1);
         assert_eq!(stats.failed_count, 0);
@@ -1246,7 +1255,8 @@ mod tests {
             mined: None,
         };
 
-        let stats = aggregate_and_validate(&partition_dir, Some(&index), &outputs, false, 0).unwrap();
+        let stats =
+            aggregate_and_validate(&partition_dir, Some(&index), &outputs, false, 0).unwrap();
 
         // Verify temp files were cleaned up
         assert_no_sorted_temp_files(&partition_path);

@@ -37,10 +37,7 @@ impl ExtractionCheckpoint {
         }
 
         // Open in append mode for writing new completions
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         let writer = BufWriter::new(file);
 
         Ok(Self {
