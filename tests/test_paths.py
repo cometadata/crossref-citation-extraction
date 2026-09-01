@@ -62,8 +62,11 @@ def test_runtime_source_digest_tracks_content(tmp_path: Path) -> None:
     (tmp_path / "src" / "main.rs").write_text("fn main() {}\n")
     (tmp_path / "Cargo.toml").write_text("[package]\n")
     (tmp_path / "Cargo.lock").write_text("# lock\n")
+    (tmp_path / "benches").mkdir()
+    (tmp_path / "benches" / "extraction_bench.rs").write_text("fn bench() {}\n")
     files = paths.runtime_source_files(tmp_path)
     assert (tmp_path / "Cargo.lock") in files
+    assert (tmp_path / "benches" / "extraction_bench.rs") in files
     before = paths.runtime_source_digest(tmp_path)
     (tmp_path / "src" / "main.rs").write_text("fn main() { }\n")
     assert paths.runtime_source_digest(tmp_path) != before

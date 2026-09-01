@@ -35,6 +35,9 @@ RUNTIME_SOURCE_PATTERNS = (
     "Cargo.toml",
     "Cargo.lock",
     "src/**/*.rs",
+    # Cargo.toml declares [[bench]] targets; cargo refuses to parse the
+    # manifest if a declared target file is missing from the staged volume.
+    "benches/**/*.rs",
 )
 
 _GENERATION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
