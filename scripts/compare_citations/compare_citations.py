@@ -13,23 +13,22 @@ Samples citation pairs from the HuggingFace dataset and verifies whether
 each citation exists in the reference metadata of external APIs.
 """
 
-import os
-import re
+import argparse
 import csv
 import json
-import time
-import random
-import argparse
 import logging
+import os
+import random
+import re
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, asdict
-from typing import Optional
+from dataclasses import asdict, dataclass
 from urllib.parse import quote
 
 import requests
 from datasets import load_dataset
 from tqdm import tqdm
-
 
 HUGGINGFACE_DATASET = "cometadata/crossref-arxiv-citations"
 CROSSREF_API = "https://api.crossref.org/works"
@@ -61,7 +60,7 @@ class CitationSample:
     source: str
     raw_match: str
     has_structured_doi_in_source: bool
-    doi_asserted_by: Optional[str] = None
+    doi_asserted_by: str | None = None
 
 
 @dataclass
@@ -69,28 +68,28 @@ class VerificationResult:
     citing_doi: str
     arxiv_id: str
     source: str
-    doi_asserted_by: Optional[str] = None
+    doi_asserted_by: str | None = None
 
     crossref_found: bool = False
     crossref_has_references: bool = False
     crossref_structured_doi_match: bool = False
     crossref_unstructured_match: bool = False
-    crossref_reference_key: Optional[str] = None
-    crossref_error: Optional[str] = None
+    crossref_reference_key: str | None = None
+    crossref_error: str | None = None
 
     openalex_citing_found: bool = False
     openalex_arxiv_in_refs: bool = False
-    openalex_arxiv_work_id: Optional[str] = None
-    openalex_error: Optional[str] = None
+    openalex_arxiv_work_id: str | None = None
+    openalex_error: str | None = None
 
     datacite_event_found: bool = False
-    datacite_total_events: Optional[int] = None
-    datacite_error: Optional[str] = None
+    datacite_total_events: int | None = None
+    datacite_error: str | None = None
 
     opencitations_citing_found: bool = False
     opencitations_arxiv_in_refs: bool = False
-    opencitations_oci: Optional[str] = None
-    opencitations_error: Optional[str] = None
+    opencitations_oci: str | None = None
+    opencitations_error: str | None = None
 
     notes: str = ""
 
@@ -188,14 +187,14 @@ Environment variables:
     return parser.parse_args()
 
 
-def get_crossref_token(args) -> Optional[str]:
+def get_crossref_token(args) -> str | None:
     """Get Crossref Plus token from args or environment."""
     if args.crossref_token:
         return args.crossref_token
     return os.environ.get("CROSSREF_API_TOKEN")
 
 
-def parse_ratio(ratio_str: Optional[str]) -> Optional[tuple[int, int]]:
+def parse_ratio(ratio_str: str | None) -> tuple[int, int] | None:
     """Parse ratio string like '50:50' into (asserted, mined) counts."""
     if not ratio_str:
         return None
@@ -227,7 +226,7 @@ class RateLimiter:
 class APIClient:
     """Base API client with rate limiting and retries."""
 
-    def __init__(self, mailto: str, rps: float = 1.0, headers: Optional[dict] = None):
+    def __init__(self, mailto: str, rps: float = 1.0, headers: dict | None = None):
         self.mailto = mailto
         self.rate_limiter = RateLimiter(rps)
 
@@ -235,7 +234,7 @@ class APIClient:
         if headers:
             self.headers.update(headers)
 
-    def get(self, url: str, params: Optional[dict] = None) -> Optional[dict]:
+    def get(self, url: str, params: dict | None = None) -> dict | None:
         self.rate_limiter.wait()
 
         for attempt in range(MAX_RETRIES):
@@ -276,7 +275,7 @@ class APIClient:
 
 class CrossrefClient(APIClient):
 
-    def __init__(self, mailto: str, token: Optional[str] = None, rps: Optional[float] = None):
+    def __init__(self, mailto: str, token: str | None = None, rps: float | None = None):
         if rps is None:
             rps = DEFAULT_CROSSREF_RPS_WITH_TOKEN if token else DEFAULT_CROSSREF_RPS_WITHOUT_TOKEN
 
@@ -356,7 +355,7 @@ def load_sample_citation_pairs(
     split: str,
     sample_size: int,
     seed: int = 42,
-    ratio: Optional[tuple[int, int]] = None
+    ratio: tuple[int, int] | None = None
 ) -> list[CitationSample]:
     """Stream dataset and return reservoir-sampled citation pairs.
 
@@ -370,12 +369,12 @@ def load_sample_citation_pairs(
         mined_target = sample_size - asserted_target
         logger.info(f"Target ratio: {asserted_target} asserted, {mined_target} mined")
 
-        logger.info(f"Sampling from 'asserted' config...")
+        logger.info("Sampling from 'asserted' config...")
         asserted_samples, seen_asserted = _sample_from_config(
             dataset_name, "asserted", split, asserted_target, "asserted", seed
         )
 
-        logger.info(f"Sampling from 'mined' config...")
+        logger.info("Sampling from 'mined' config...")
         mined_samples, seen_mined = _sample_from_config(
             dataset_name, "mined", split, mined_target, "mined", seed + 1
         )
@@ -406,8 +405,8 @@ class CitationVerifier:
     def __init__(
         self,
         mailto: str,
-        crossref_token: Optional[str] = None,
-        crossref_rps: Optional[float] = None,
+        crossref_token: str | None = None,
+        crossref_rps: float | None = None,
         openalex_rps: float = DEFAULT_OPENALEX_RPS,
         datacite_rps: float = DEFAULT_DATACITE_RPS,
         opencitations_rps: float = DEFAULT_OPENCITATIONS_RPS,
@@ -472,7 +471,7 @@ class CitationVerifier:
                         result.crossref_unstructured_match = True
                         result.crossref_reference_key = ref.get("key")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - record any API failure on the result
             result.crossref_error = str(e)
 
     def verify_openalex(self, sample: CitationSample, result: VerificationResult):
@@ -498,11 +497,13 @@ class CitationVerifier:
             result.openalex_citing_found = True
             referenced_works = citing_data.get("referenced_works", [])
 
-            if result.openalex_arxiv_work_id:
-                if result.openalex_arxiv_work_id in referenced_works:
-                    result.openalex_arxiv_in_refs = True
+            if (
+                result.openalex_arxiv_work_id
+                and result.openalex_arxiv_work_id in referenced_works
+            ):
+                result.openalex_arxiv_in_refs = True
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - record any API failure on the result
             result.openalex_error = str(e)
 
     def verify_datacite(self, sample: CitationSample, result: VerificationResult):
@@ -531,7 +532,7 @@ class CitationVerifier:
                     result.datacite_event_found = True
                     return
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - record any API failure on the result
             result.datacite_error = str(e)
 
     def verify_opencitations(self, sample: CitationSample, result: VerificationResult):
@@ -559,7 +560,7 @@ class CitationVerifier:
                     result.opencitations_oci = ref.get("oci")
                     return
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - record any API failure on the result
             result.opencitations_error = str(e)
 
 
@@ -674,7 +675,7 @@ def print_summary(summary: dict, args: argparse.Namespace) -> None:
     print("=" * 60)
 
     if summary["asserted_results"].get("count", 0) > 0:
-        print(f"\nAsserted citations (structured DOI in reference):")
+        print("\nAsserted citations (structured DOI in reference):")
         print(f"  - Samples verified: {summary['asserted_results']['count']}")
         pub_count = summary['sample_size'].get('asserted_publisher', 0)
         cr_count = summary['sample_size'].get('asserted_crossref', 0)
@@ -685,14 +686,14 @@ def print_summary(summary: dict, args: argparse.Namespace) -> None:
         print(f"  - Not found: {summary['asserted_results']['crossref_no_match']} ({summary['asserted_results']['crossref_no_match_rate']*100:.1f}%)")
 
     if summary["mined_results"].get("count", 0) > 0:
-        print(f"\nMined citations (from unstructured text):")
+        print("\nMined citations (from unstructured text):")
         print(f"  - Samples verified: {summary['mined_results']['count']}")
         print(f"  - Found in Crossref structured refs: {summary['mined_results']['crossref_structured_doi_match']} ({summary['mined_results']['crossref_structured_match_rate']*100:.1f}%)")
         print(f"  - Found in unstructured only: {summary['mined_results']['crossref_unstructured_only']} ({summary['mined_results']['crossref_unstructured_only_rate']*100:.1f}%)")
         print(f"  - Not found: {summary['mined_results']['crossref_no_match']} ({summary['mined_results']['crossref_no_match_rate']*100:.1f}%)")
 
     if not args.skip_openalex:
-        print(f"\nOpenAlex comparison:")
+        print("\nOpenAlex comparison:")
         if summary["asserted_results"].get("count", 0) > 0:
             print(f"  - Asserted match rate: {summary['asserted_results']['openalex_match_rate']*100:.1f}%")
             if summary["asserted_publisher_results"].get("count", 0) > 0:
@@ -703,7 +704,7 @@ def print_summary(summary: dict, args: argparse.Namespace) -> None:
             print(f"  - Mined match rate: {summary['mined_results']['openalex_match_rate']*100:.1f}%")
 
     if not args.skip_datacite:
-        print(f"\nDataCite Event Data comparison:")
+        print("\nDataCite Event Data comparison:")
         if summary["asserted_results"].get("count", 0) > 0:
             print(f"  - Asserted match rate: {summary['asserted_results']['datacite_event_match_rate']*100:.1f}%")
             if summary["asserted_publisher_results"].get("count", 0) > 0:
@@ -714,7 +715,7 @@ def print_summary(summary: dict, args: argparse.Namespace) -> None:
             print(f"  - Mined match rate: {summary['mined_results']['datacite_event_match_rate']*100:.1f}%")
 
     if not args.skip_opencitations:
-        print(f"\nOpenCitations comparison:")
+        print("\nOpenCitations comparison:")
         if summary["asserted_results"].get("count", 0) > 0:
             print(f"  - Asserted match rate: {summary['asserted_results']['opencitations_match_rate']*100:.1f}%")
             if summary["asserted_publisher_results"].get("count", 0) > 0:
@@ -737,7 +738,7 @@ def main() -> int:
     if ratio:
         print(f"  Ratio: {ratio[0]}:{ratio[1]} (asserted:mined)")
     else:
-        print(f"  Ratio: natural (no stratification)")
+        print("  Ratio: natural (no stratification)")
     print(f"  Seed: {args.seed}")
     print(f"  mailto: {args.mailto}")
     if crossref_token:
@@ -806,7 +807,7 @@ def main() -> int:
         for future in futures:
             future.result()  # re-raise any worker exception
 
-    print(f"\nWriting results...")
+    print("\nWriting results...")
 
     write_csv_output(results, args.output_csv)
 
@@ -819,4 +820,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())
