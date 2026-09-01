@@ -94,6 +94,14 @@ def test_archive_size_mismatch(tmp_path: Path) -> None:
         resolve_mirror_snapshot(tmp_path)
 
 
+def test_corrupt_pipeline_marker(tmp_path: Path) -> None:
+    make_mirror(tmp_path)
+    marker = tmp_path / "crossref-affiliations-latest" / "_PIPELINE_COMPLETE.json"
+    marker.write_text("{not json")
+    with pytest.raises(MirrorError, match="unreadable"):
+        resolve_mirror_snapshot(tmp_path)
+
+
 def test_traversal_prefix_rejected(tmp_path: Path) -> None:
     make_mirror(tmp_path)
     marker = tmp_path / "crossref-affiliations-latest" / "_PIPELINE_COMPLETE.json"

@@ -12,7 +12,7 @@ from .paths import (
     GenerationPathError,
     validate_generation_prefix,
 )
-from .state import read_json
+from .state import StateError, read_json
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SNAPSHOT_ID_RE = re.compile(r"^\d{4}-\d{2}$")
@@ -38,7 +38,7 @@ def _read_marker(path: Path, label: str) -> dict[str, Any]:
         raise MirrorError(f"affiliations {label} not found: {path}")
     try:
         payload = read_json(path)
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, StateError) as error:
         raise MirrorError(f"affiliations {label} is unreadable: {error}") from error
     if not isinstance(payload, dict):
         raise MirrorError(f"affiliations {label} is not a JSON object")
