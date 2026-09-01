@@ -14,6 +14,7 @@ pub struct MergeRow {
     pub citing_doi: String,
     pub ref_index: u32,
     pub provenance: String,
+    pub raw_match: String,
     pub ref_json: String,
 }
 
@@ -84,6 +85,7 @@ impl SegmentCursor {
         let refi = chunk.column("ref_index")?.u32()?;
         let cited = chunk.column("cited_id")?.str()?;
         let prov = chunk.column("provenance")?.str()?;
+        let raw = chunk.column("raw_match")?.str()?;
         let json = chunk.column("ref_json")?.str()?;
         for i in 0..n {
             self.buf.push_back(MergeRow {
@@ -91,6 +93,7 @@ impl SegmentCursor {
                 citing_doi: citing.get(i).unwrap_or("").to_string(),
                 ref_index: refi.get(i).unwrap_or(0),
                 provenance: prov.get(i).unwrap_or("mined").to_string(),
+                raw_match: raw.get(i).unwrap_or("").to_string(),
                 ref_json: json.get(i).unwrap_or("null").to_string(),
             });
         }
@@ -175,8 +178,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Write a sorted segment file with the standard 5-column schema.
-    /// Rows are (cited_id, citing_doi, ref_index) tuples; provenance/ref_json filled.
+    /// Write a sorted segment file with the standard 6-column schema.
+    /// Rows are (cited_id, citing_doi, ref_index) tuples;
+    /// provenance/raw_match/ref_json filled.
     fn write_segment(path: &Path, rows: &[(&str, &str, u32)]) {
         let mut df = DataFrame::new(vec![
             Column::new(
@@ -194,6 +198,12 @@ mod tests {
             Column::new(
                 "provenance".into(),
                 rows.iter().map(|_| "mined".to_string()).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "raw_match".into(),
+                rows.iter()
+                    .map(|r| format!("arXiv:{}", r.0))
+                    .collect::<Vec<_>>(),
             ),
             Column::new(
                 "ref_json".into(),
@@ -305,6 +315,23 @@ mod tests {
         let too_big = u32::MAX as usize + 1;
         let err = merge_sorted_segments(&[a], too_big, |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("chunk_rows must be > 0"));
+    }
+
+    /// `raw_match` has to survive the merge: the aggregator reads it off
+    /// MergeRow to build each cited_by entry.
+    #[test]
+    fn test_raw_match_survives_merge() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.parquet");
+        write_segment(&a, &[("id1", "c", 0), ("id2", "c", 0)]);
+
+        let mut raws = Vec::new();
+        merge_sorted_segments(&[a], 1, |row| {
+            raws.push(row.raw_match);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(raws, vec!["arXiv:id1", "arXiv:id2"]);
     }
 
     #[test]

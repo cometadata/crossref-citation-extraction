@@ -128,6 +128,7 @@ fn flush_group(
         let citation_json = serde_json::json!({
             "doi": cit.citing_doi,
             "provenance": cit.provenance,
+            "raw_match": cit.raw_match,
             "reference": reference
         });
         match cit.provenance.as_str() {
@@ -232,6 +233,7 @@ fn process_partition_external_sort(
             current_group.push(GroupedCitation {
                 citing_doi: row.citing_doi,
                 provenance: row.provenance,
+                raw_match: row.raw_match,
                 ref_json: row.ref_json,
             });
             rows_processed += 1;
@@ -665,7 +667,12 @@ fn process_partition_inmemory(
             SortMultipleOptions::default(),
         )
         .group_by([col("cited_id")])
-        .agg([col("citing_doi"), col("provenance"), col("ref_json")])
+        .agg([
+            col("citing_doi"),
+            col("provenance"),
+            col("raw_match"),
+            col("ref_json"),
+        ])
         .collect()?;
 
     write_grouped_results(
@@ -688,6 +695,7 @@ fn process_partition_inmemory(
 struct GroupedCitation {
     citing_doi: String,
     provenance: String,
+    raw_match: String,
     ref_json: String,
 }
 
@@ -706,6 +714,7 @@ fn write_grouped_results(
     let cited_id_col = grouped.column("cited_id")?.str()?;
     let citing_dois_col = grouped.column("citing_doi")?.list()?;
     let provenances_col = grouped.column("provenance")?.list()?;
+    let raw_matches_col = grouped.column("raw_match")?.list()?;
     let ref_jsons_col = grouped.column("ref_json")?.list()?;
 
     let split_by_provenance =
@@ -721,6 +730,7 @@ fn write_grouped_results(
         let grouped = build_cited_by_array_grouped(
             citing_dois_col.get_as_series(i),
             provenances_col.get_as_series(i),
+            raw_matches_col.get_as_series(i),
             ref_jsons_col.get_as_series(i),
         )?;
 
@@ -842,14 +852,17 @@ impl GroupedCitationsByProvenance {
 fn build_cited_by_array_grouped(
     citing_dois: Option<Series>,
     provenances: Option<Series>,
+    raw_matches: Option<Series>,
     ref_jsons: Option<Series>,
 ) -> Result<GroupedCitationsByProvenance> {
     let citing_dois = citing_dois.ok_or_else(|| anyhow::anyhow!("missing citing_dois"))?;
     let provenances = provenances.ok_or_else(|| anyhow::anyhow!("missing provenances"))?;
+    let raw_matches = raw_matches.ok_or_else(|| anyhow::anyhow!("missing raw_matches"))?;
     let ref_jsons = ref_jsons.ok_or_else(|| anyhow::anyhow!("missing ref_jsons"))?;
 
     let dois = citing_dois.str()?;
     let provs = provenances.str()?;
+    let raws = raw_matches.str()?;
     let jsons = ref_jsons.str()?;
 
     let mut result = GroupedCitationsByProvenance::new();
@@ -865,6 +878,7 @@ fn build_cited_by_array_grouped(
         let citation = serde_json::json!({
             "doi": doi,
             "provenance": provenance,
+            "raw_match": raws.get(j).unwrap_or(""),
             "reference": reference
         });
 
@@ -969,6 +983,17 @@ mod tests {
         let valid_content = std::fs::read_to_string(&valid_output).unwrap();
         assert!(valid_content.contains("10.1234/cited"));
         assert!(valid_content.contains("citation_count\":2"));
+
+        let record: serde_json::Value =
+            serde_json::from_str(valid_content.lines().next().unwrap()).unwrap();
+        for entry in record["cited_by"].as_array().unwrap() {
+            let raw = entry["raw_match"].as_str().unwrap();
+            assert!(
+                raw.starts_with("arXiv:2403.0000"),
+                "raw_match missing: {}",
+                entry
+            );
+        }
     }
 
     /// The in-memory path must not inherit the (parallel, arbitrary) segment
@@ -994,6 +1019,10 @@ mod tests {
                 Column::new("ref_index".into(), &[0u32, 0u32]),
                 Column::new("cited_id".into(), &["10.1234/target", "10.1234/target"]),
                 Column::new("provenance".into(), &["mined", "mined"]),
+                Column::new(
+                    "raw_match".into(),
+                    &["arXiv:0000.00000", "arXiv:0000.00000"],
+                ),
                 Column::new("ref_json".into(), &[r#"{"t": 1}"#, r#"{"t": 2}"#]),
             ])
             .unwrap();
@@ -1065,6 +1094,7 @@ mod tests {
                 Column::new("ref_index".into(), &[0u32]),
                 Column::new("cited_id".into(), &[format!("10.1234/{}", cited_suffix)]),
                 Column::new("provenance".into(), &["mined"]),
+                Column::new("raw_match".into(), &["arXiv:0000.00000"]),
                 Column::new("ref_json".into(), &[r#"{"test": true}"#]),
             ])
             .unwrap();
@@ -1132,6 +1162,7 @@ mod tests {
                 Column::new("ref_index".into(), &[0u32]),
                 Column::new("cited_id".into(), &["10.1234/target"]),
                 Column::new("provenance".into(), &["mined"]),
+                Column::new("raw_match".into(), &[format!("arXiv:0000.0000{}", seg_num)]),
                 Column::new("ref_json".into(), &[r#"{"seg": "test"}"#]),
             ])
             .unwrap();
@@ -1185,6 +1216,21 @@ mod tests {
 
         assert_eq!(record["doi"], "10.1234/target");
         assert_eq!(record["citation_count"], 3);
+
+        // The external-sort path builds cited_by in flush_group, not
+        // build_cited_by_array_grouped — it has to carry raw_match too.
+        let mut raws: Vec<&str> = record["cited_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["raw_match"].as_str().unwrap())
+            .collect();
+        raws.sort_unstable();
+        assert_eq!(
+            raws,
+            vec!["arXiv:0000.00000", "arXiv:0000.00001", "arXiv:0000.00002"]
+        );
+
         assert_eq!(stats.partitions_processed, 1);
         assert_eq!(stats.valid_count, 1);
         assert_eq!(stats.total_citations, 3);
@@ -1228,6 +1274,7 @@ mod tests {
                 Column::new("ref_index".into(), &[0u32]),
                 Column::new("cited_id".into(), &["10.9999/target"]),
                 Column::new("provenance".into(), &["mined"]),
+                Column::new("raw_match".into(), &["arXiv:0000.00000"]),
                 Column::new("ref_json".into(), &[r#"{"test": true}"#]),
             ])
             .unwrap();
@@ -1298,6 +1345,10 @@ mod tests {
                     &["10.48550/arxiv.2403.00001", "10.48550/arxiv.2403.00002"],
                 ),
                 Column::new("provenance".into(), &["mined", "mined"]),
+                Column::new(
+                    "raw_match".into(),
+                    &["arXiv:2403.00001", "arXiv:2403.00002"],
+                ),
                 Column::new("ref_json".into(), &[r#"{"t":1}"#, r#"{"t":2}"#]),
             ])
             .unwrap();
