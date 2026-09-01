@@ -294,3 +294,218 @@ def transform_outputs(
         reference_keys=scan.keys,
         dropped_reference_keys=scan.dropped,
     )
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    commit_sha: str
+    commit_url: str
+
+
+def _count(value: int) -> str:
+    return f"{value:,}"
+
+
+def render_dataset_card(
+    stats: dict[str, ConfigStats],
+    *,
+    snapshot_id: str,
+    datacite_release: str,
+    extractor_version: str,
+) -> str:
+    return f"""---
+license: cc0-1.0
+task_categories:
+  - text-classification
+  - feature-extraction
+language:
+  - en
+tags:
+  - arxiv
+  - crossref
+  - citations
+  - preprints
+  - scholarly-communications
+  - bibliometrics
+  - doi
+pretty_name: Crossref arXiv Citations
+size_categories:
+  - 100K<n<1M
+configs:
+  - config_name: all
+    data_files:
+      - split: train
+        path: data/all.parquet
+    default: true
+  - config_name: asserted
+    data_files:
+      - split: train
+        path: data/asserted.parquet
+  - config_name: mined
+    data_files:
+      - split: train
+        path: data/mined.parquet
+---
+
+# Crossref arXiv Citations
+
+A dataset of arXiv preprints and their citations extracted from Crossref
+metadata, validated against DataCite records.
+
+## Dataset Description
+
+This dataset maps arXiv works to the works in Crossref that cite them. Each
+record represents an arXiv preprint with all known citations from
+Crossref-registered works.
+
+Built from the Crossref Metadata Plus monthly snapshot `{snapshot_id}` and the
+DataCite monthly data file `{datacite_release}` with
+[crossref-citation-extraction](https://github.com/cometadata/crossref-arxiv-citation-extraction)
+version {extractor_version}.
+
+### Dataset Configurations
+
+| Config | Description | arXiv Works | Citing Works | Reference Matches |
+|--------|-------------|-------------|--------------|-------------------|
+| `all` | All validated citations (default) | {_count(stats["all"].works)} | {_count(stats["all"].citations)} | {_count(stats["all"].references)} |
+| `asserted` | Citations where the DOI was explicitly provided by the publisher or matched by Crossref | {_count(stats["asserted"].works)} | {_count(stats["asserted"].citations)} | {_count(stats["asserted"].references)} |
+| `mined` | Citations where the DOI was extracted from unstructured text | {_count(stats["mined"].works)} | {_count(stats["mined"].citations)} | {_count(stats["mined"].references)} |
+
+### Loading the Dataset
+
+```python
+from datasets import load_dataset
+
+dataset = load_dataset("cometadata/crossref-arxiv-citations")
+asserted = load_dataset("cometadata/crossref-arxiv-citations", "asserted")
+mined = load_dataset("cometadata/crossref-arxiv-citations", "mined")
+```
+
+## Data Schema
+
+Each record contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `arxiv_doi` | string | The DOI for the arXiv work (format: `10.48550/arXiv.{{id}}`) |
+| `arxiv_id` | string | The arXiv identifier (e.g., `1412.6980`) |
+| `reference_count` | integer | Total number of reference match instances |
+| `citation_count` | integer | Number of unique citing works |
+| `cited_by` | array | List of citing work objects |
+
+Each citing work object in `cited_by` contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `doi` | string | DOI of the citing work |
+| `provenance` | string | Highest-confidence provenance among this work's matches (`publisher` > `crossref` > `mined`) |
+| `matches` | array | Reference matches from this citing work |
+
+Each match contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `provenance` | string | How this match was obtained (see below) |
+| `raw_match` | string | The exact substring that matched an arXiv identifier pattern |
+| `reference` | struct | The Crossref reference metadata (string-valued fields; absent keys are null) |
+
+### Provenance Values
+
+- `publisher` - the reference carries an explicit arXiv DOI with `doi-asserted-by: publisher`
+- `crossref` - the reference carries an explicit arXiv DOI with `doi-asserted-by: crossref`
+- `mined` - the arXiv identifier was extracted from unstructured reference text
+
+The `asserted` config contains only `publisher` and `crossref` matches; the
+`mined` config contains only `mined` matches. A citing work appears in a
+config only with its matches of that config's provenances, and all counts are
+recomputed per config.
+
+## Extraction Process
+
+arXiv references are extracted from the Crossref snapshot by scanning
+reference metadata for arXiv identifiers in modern (`arXiv:2403.03542`),
+legacy (`arXiv:cs.DM/9910013`), DOI (`10.48550/arXiv.2403.03542`), and URL
+(`arxiv.org/abs/2403.03542`) forms. Identifiers are normalized (lowercase,
+version suffixes removed). Extracted arXiv DOIs are validated against an
+index of DOIs built from the DataCite monthly data file `{datacite_release}`;
+only arXiv works registered in DataCite are included.
+
+## Data Sources
+
+- Crossref Metadata Plus monthly snapshot `{snapshot_id}`
+- DataCite monthly data file `{datacite_release}`
+- Extraction tools: [cometadata/crossref-arxiv-citation-extraction](https://github.com/cometadata/crossref-arxiv-citation-extraction)
+
+## Limitations
+
+- Only includes citations registered in Crossref metadata
+- Reference parsing depends on successful identifier extraction from
+  unstructured references
+- The `mined` subset may contain lower-quality matches from noisy reference
+  text
+
+## License
+
+This dataset is released under
+[CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/).
+
+## Citation
+
+```bibtex
+@dataset{{crossref_arxiv_citations,
+  title = {{Crossref arXiv Citations}},
+  author = {{Cometadata}},
+  publisher = {{Hugging Face}},
+  url = {{https://huggingface.co/datasets/cometadata/crossref-arxiv-citations}}
+}}
+```
+"""
+
+
+def publish_dataset(
+    *,
+    api: Any,
+    token: str | None,
+    parquet: dict[str, Path],
+    card: str,
+    snapshot_id: str,
+    events: Any,
+) -> PublicationResult:
+    from huggingface_hub import CommitOperationAdd
+
+    for config in CONFIG_NAMES:
+        path = parquet.get(config)
+        if path is None or not path.is_file():
+            raise PublishError(f"parquet file for config {config} is missing")
+
+    operations = [
+        CommitOperationAdd(
+            path_in_repo="README.md", path_or_fileobj=card.encode("utf-8")
+        )
+    ]
+    for config in CONFIG_NAMES:
+        operations.append(
+            CommitOperationAdd(
+                path_in_repo=f"data/{config}.parquet",
+                path_or_fileobj=str(parquet[config]),
+            )
+        )
+
+    with events.phase("publish_dataset"):
+        try:
+            parent = api.dataset_info(DATASET_REPO, token=token).sha
+            commit = api.create_commit(
+                repo_id=DATASET_REPO,
+                repo_type="dataset",
+                operations=operations,
+                commit_message=f"Update from Crossref snapshot {snapshot_id}",
+                parent_commit=parent,
+                token=token,
+            )
+            api.dataset_info(DATASET_REPO, revision=commit.oid, token=token)
+        except PublishError:
+            raise
+        except Exception as error:
+            raise PublishError(f"dataset commit failed: {error}") from error
+    events.emit("dataset_published", commit=commit.oid)
+    return PublicationResult(commit_sha=commit.oid, commit_url=commit.commit_url)
