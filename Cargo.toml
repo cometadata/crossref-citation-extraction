@@ -61,6 +61,9 @@ parquet = { version = "53", default-features = false }
 # Directory traversal
 walkdir = "2"
 
+# URL parsing and canonicalization
+url = "2.5"
+
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.5"
