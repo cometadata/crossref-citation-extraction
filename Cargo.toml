@@ -64,6 +64,11 @@ walkdir = "2"
 # URL parsing and canonicalization
 url = "2.5"
 
+# DataCite release verification: CSV state reports, manifest digests
+csv = "1.3"
+sha2 = "0.10"
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.5"

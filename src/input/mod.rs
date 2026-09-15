@@ -2,6 +2,7 @@
 
 mod crossref;
 mod datacite;
+pub mod datacite_release;
 mod detection;
 
 pub use crossref::{visit_crossref_entries, CrossrefEntry};
