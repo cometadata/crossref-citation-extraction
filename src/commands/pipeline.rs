@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::cli::{should_include_provenance_filter, PipelineArgs};
-use crate::common::{extract_input_stem, setup_logging, OutputPaths};
+use crate::common::{extract_input_stem, setup_logging, MatchType, OutputPaths};
 use crate::extract::{extract_arxiv_matches_from_text, Provenance};
 use crate::index::{build_fst_index_from_source, FstIndex};
 use crate::input::{
@@ -411,6 +411,7 @@ fn extract_file(
                     ref_index,
                     cited_id: doi, // Move instead of clone - we own this
                     provenance: provenance.as_str().to_string(),
+                    match_type: MatchType::Arxiv,
                     raw_match: raw,
                     ref_json: ref_json.clone(),
                 });
@@ -906,6 +907,7 @@ mod tests {
                 ref_index: 0,
                 cited_id: "10.48550/arxiv.2403.00001".to_string(),
                 provenance: "mined".to_string(),
+                match_type: MatchType::Arxiv,
                 raw_match: "arXiv:2403.99999".to_string(),
                 ref_json: "{}".to_string(),
             })

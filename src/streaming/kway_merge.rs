@@ -7,6 +7,10 @@ use std::collections::{BinaryHeap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use super::partitioning::PartitionMode;
+use super::segmented_writer::{decode_segment_frame, PartitionRow};
+use crate::common::types::MatchType;
+
 /// One logical row from a sorted segment.
 #[derive(Debug)]
 pub struct MergeRow {
@@ -14,8 +18,23 @@ pub struct MergeRow {
     pub citing_doi: String,
     pub ref_index: u32,
     pub provenance: String,
+    pub match_type: MatchType,
     pub raw_match: String,
     pub ref_json: String,
+}
+
+impl From<PartitionRow> for MergeRow {
+    fn from(row: PartitionRow) -> Self {
+        Self {
+            cited_id: row.cited_id,
+            citing_doi: row.citing_doi,
+            ref_index: row.ref_index,
+            provenance: row.provenance,
+            match_type: row.match_type,
+            raw_match: row.raw_match,
+            ref_json: row.ref_json,
+        }
+    }
 }
 
 /// Sort/dedup key: (cited_id, citing_doi, ref_index).
@@ -47,16 +66,18 @@ struct SegmentCursor {
     total_rows: usize,
     next_offset: usize,
     chunk_rows: usize,
+    mode: PartitionMode,
     buf: VecDeque<MergeRow>,
 }
 
 impl SegmentCursor {
-    fn new(path: &Path, chunk_rows: usize) -> Result<Self> {
+    fn new(path: &Path, chunk_rows: usize, mode: PartitionMode) -> Result<Self> {
         Ok(Self {
             path: path.to_path_buf(),
             total_rows: get_parquet_row_count(path)?,
             next_offset: 0,
             chunk_rows,
+            mode,
             buf: VecDeque::new(),
         })
     }
@@ -81,21 +102,8 @@ impl SegmentCursor {
             self.next_offset = self.total_rows;
             return Ok(());
         }
-        let citing = chunk.column("citing_doi")?.str()?;
-        let refi = chunk.column("ref_index")?.u32()?;
-        let cited = chunk.column("cited_id")?.str()?;
-        let prov = chunk.column("provenance")?.str()?;
-        let raw = chunk.column("raw_match")?.str()?;
-        let json = chunk.column("ref_json")?.str()?;
-        for i in 0..n {
-            self.buf.push_back(MergeRow {
-                cited_id: cited.get(i).unwrap_or("").to_string(),
-                citing_doi: citing.get(i).unwrap_or("").to_string(),
-                ref_index: refi.get(i).unwrap_or(0),
-                provenance: prov.get(i).unwrap_or("mined").to_string(),
-                raw_match: raw.get(i).unwrap_or("").to_string(),
-                ref_json: json.get(i).unwrap_or("null").to_string(),
-            });
+        for row in decode_segment_frame(&chunk, self.mode, &self.path)? {
+            self.buf.push_back(MergeRow::from(row));
         }
         self.next_offset += n;
         Ok(())
@@ -120,8 +128,15 @@ impl SegmentCursor {
 ///
 /// Each input file must be sorted by (cited_id, citing_doi, ref_index).
 /// Exact-duplicate keys (across or within segments) are emitted once.
+/// `mode` decides how a segment without a `match_type` column is read:
+/// legacy segments default to arXiv evidence, hashed (full) mode rejects them.
 /// Returns the number of rows emitted after dedup.
-pub fn merge_sorted_segments<F>(segments: &[PathBuf], chunk_rows: usize, mut emit: F) -> Result<u64>
+pub fn merge_sorted_segments<F>(
+    segments: &[PathBuf],
+    chunk_rows: usize,
+    mode: PartitionMode,
+    mut emit: F,
+) -> Result<u64>
 where
     F: FnMut(MergeRow) -> Result<()>,
 {
@@ -139,7 +154,7 @@ where
 
     let mut cursors: Vec<SegmentCursor> = segments
         .iter()
-        .map(|p| SegmentCursor::new(p, chunk_rows))
+        .map(|p| SegmentCursor::new(p, chunk_rows, mode))
         .collect::<Result<_>>()?;
 
     // Min-heap of (key, cursor index).
@@ -178,11 +193,20 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// Write a sorted segment file with the standard 6-column schema.
+    /// Write a sorted segment file with the current 7-column schema.
     /// Rows are (cited_id, citing_doi, ref_index) tuples;
-    /// provenance/raw_match/ref_json filled.
+    /// provenance/match_type/raw_match/ref_json filled.
     fn write_segment(path: &Path, rows: &[(&str, &str, u32)]) {
-        let mut df = DataFrame::new(vec![
+        write_segment_with_schema(path, rows, true);
+    }
+
+    /// Write a segment in the pre-`match_type` 6-column layout.
+    fn write_old_segment(path: &Path, rows: &[(&str, &str, u32)]) {
+        write_segment_with_schema(path, rows, false);
+    }
+
+    fn write_segment_with_schema(path: &Path, rows: &[(&str, &str, u32)], with_match_type: bool) {
+        let mut columns = vec![
             Column::new(
                 "citing_doi".into(),
                 rows.iter().map(|r| r.1.to_string()).collect::<Vec<_>>(),
@@ -209,15 +233,21 @@ mod tests {
                 "ref_json".into(),
                 rows.iter().map(|_| "{}".to_string()).collect::<Vec<_>>(),
             ),
-        ])
-        .unwrap();
+        ];
+        if with_match_type {
+            columns.push(Column::new(
+                "match_type".into(),
+                rows.iter().map(|_| "doi").collect::<Vec<_>>(),
+            ));
+        }
+        let mut df = DataFrame::new(columns).unwrap();
         let file = File::create(path).unwrap();
         ParquetWriter::new(file).finish(&mut df).unwrap();
     }
 
     fn collect_merge(segments: &[PathBuf], chunk_rows: usize) -> Vec<(String, String, u32)> {
         let mut out = Vec::new();
-        merge_sorted_segments(segments, chunk_rows, |row| {
+        merge_sorted_segments(segments, chunk_rows, PartitionMode::Legacy, |row| {
             out.push((row.cited_id, row.citing_doi, row.ref_index));
             Ok(())
         })
@@ -298,7 +328,7 @@ mod tests {
         let a = dir.path().join("a.parquet");
         write_segment(&a, &[("id1", "c", 0)]);
 
-        let err = merge_sorted_segments(&[a], 0, |_| Ok(())).unwrap_err();
+        let err = merge_sorted_segments(&[a], 0, PartitionMode::Legacy, |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("chunk_rows must be > 0"));
     }
 
@@ -313,7 +343,8 @@ mod tests {
         write_segment(&a, &[("id1", "c", 0)]);
 
         let too_big = u32::MAX as usize + 1;
-        let err = merge_sorted_segments(&[a], too_big, |_| Ok(())).unwrap_err();
+        let err =
+            merge_sorted_segments(&[a], too_big, PartitionMode::Legacy, |_| Ok(())).unwrap_err();
         assert!(err.to_string().contains("chunk_rows must be > 0"));
     }
 
@@ -326,12 +357,63 @@ mod tests {
         write_segment(&a, &[("id1", "c", 0), ("id2", "c", 0)]);
 
         let mut raws = Vec::new();
-        merge_sorted_segments(&[a], 1, |row| {
+        merge_sorted_segments(&[a], 1, PartitionMode::Legacy, |row| {
             raws.push(row.raw_match);
             Ok(())
         })
         .unwrap();
         assert_eq!(raws, vec!["arXiv:id1", "arXiv:id2"]);
+    }
+
+    /// `match_type` rides along with every merged row in either mode.
+    #[test]
+    fn test_match_type_survives_merge() {
+        let dir = tempdir().unwrap();
+        let a = dir.path().join("a.parquet");
+        write_segment(&a, &[("id1", "c", 0), ("id2", "c", 0)]);
+
+        for mode in [PartitionMode::Legacy, PartitionMode::Hashed { count: 1 }] {
+            let mut types = Vec::new();
+            merge_sorted_segments(std::slice::from_ref(&a), 1, mode, |row| {
+                types.push(row.match_type);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(types, vec![MatchType::Doi, MatchType::Doi]);
+        }
+    }
+
+    /// A segment without the column is arXiv evidence in legacy mode and a
+    /// schema error in hashed (full) mode.
+    #[test]
+    fn test_old_schema_defaults_in_legacy_and_fails_in_hashed_mode() {
+        let dir = tempdir().unwrap();
+        let old = dir.path().join("old.parquet");
+        write_old_segment(&old, &[("id1", "c", 0)]);
+
+        let mut types = Vec::new();
+        merge_sorted_segments(
+            std::slice::from_ref(&old),
+            8,
+            PartitionMode::Legacy,
+            |row| {
+                types.push(row.match_type);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(types, vec![MatchType::Arxiv]);
+
+        let err = merge_sorted_segments(
+            std::slice::from_ref(&old),
+            8,
+            PartitionMode::Hashed { count: 1 },
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("match_type"), "{message}");
+        assert!(message.contains("old.parquet"), "{message}");
     }
 
     #[test]

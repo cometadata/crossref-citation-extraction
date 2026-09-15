@@ -1,10 +1,14 @@
 pub mod aggregator;
 pub mod checkpoint;
 pub mod kway_merge;
+pub mod limits;
+pub mod partitioning;
 pub mod segmented_writer;
 
 pub use aggregator::aggregate_and_validate;
 pub use checkpoint::ExtractionCheckpoint;
+pub use limits::WriterLimits;
+pub use partitioning::{hashed_partition_key, PartitionMode};
 pub use segmented_writer::{PartitionRow, SegmentedPartitionWriter};
 
 /// Extract partition key from a DOI or arXiv ID.

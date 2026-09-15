@@ -291,6 +291,7 @@ fn test_arxiv_extraction_with_directory_input() {
 
 #[test]
 fn test_batched_processing_for_large_partitions() {
+    use crossref_citation_extraction::common::types::MatchType;
     use crossref_citation_extraction::common::OutputPaths;
     use crossref_citation_extraction::index::FstIndex;
     use crossref_citation_extraction::streaming::{PartitionRow, SegmentedPartitionWriter};
@@ -317,6 +318,7 @@ fn test_batched_processing_for_large_partitions() {
                         "mined"
                     }
                     .to_string(),
+                    match_type: MatchType::Arxiv,
                     raw_match: "arXiv:2403.12345".to_string(),
                     ref_json: format!(r#"{{"unstructured": "ref {}"}}"#, i),
                 })

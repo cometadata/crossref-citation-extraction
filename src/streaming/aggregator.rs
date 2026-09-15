@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::checkpoint::AggregationCheckpoint;
 use super::kway_merge::{merge_sorted_segments, MergeRow};
+use super::partitioning::PartitionMode;
 use crate::index::FstIndex;
 
 /// Maximum number of segments to process at once in memory.
@@ -211,8 +212,10 @@ fn process_partition_external_sort(
     let mut current_group: Vec<GroupedCitation> = Vec::new();
     let mut rows_processed = 0u64;
 
+    // Legacy partitions may predate the match_type column.
+    let mode = PartitionMode::Legacy;
     let merge_result = (|| -> Result<()> {
-        merge_sorted_segments(&sorted_files, chunk_rows, |row: MergeRow| {
+        merge_sorted_segments(&sorted_files, chunk_rows, mode, |row: MergeRow| {
             if current_cited_id.as_deref() != Some(row.cited_id.as_str()) {
                 if let Some(id) = current_cited_id.take() {
                     flush_group(
@@ -933,6 +936,7 @@ mod tests {
                     ref_index: 0,
                     cited_id: "10.1234/cited".to_string(),
                     provenance: "publisher".to_string(),
+                    match_type: crate::common::types::MatchType::Arxiv,
                     raw_match: "arXiv:2403.00001".to_string(),
                     ref_json: r#"{"unstructured": "ref 1"}"#.to_string(),
                 })
@@ -944,6 +948,7 @@ mod tests {
                     ref_index: 0,
                     cited_id: "10.1234/cited".to_string(),
                     provenance: "mined".to_string(),
+                    match_type: crate::common::types::MatchType::Arxiv,
                     raw_match: "arXiv:2403.00002".to_string(),
                     ref_json: r#"{"unstructured": "ref 2"}"#.to_string(),
                 })
