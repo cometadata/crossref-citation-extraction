@@ -1,7 +1,7 @@
 # DataCite citation mining and full Hugging Face run
 
 Date: 2026-09-15
-Status: chat design approved; written spec awaiting review
+Status: approved for implementation planning on 2026-09-15
 
 ## Objective
 
