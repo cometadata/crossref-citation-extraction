@@ -61,6 +61,34 @@ pub enum Commands {
         #[arg(long, default_value = "INFO")]
         log_level: String,
     },
+
+    /// Build the memory-mapped DataCite DOI and landing-page URL index bundle
+    ///
+    /// Scans a complete, verified DataCite monthly release once, externally
+    /// sorts its DOI, host and URL/DOI keys, and writes an immutable bundle
+    /// (`dois.fst`, `hosts.fst`, `urls.fst`, `url-targets.bin`,
+    /// `_INDEX_COMPLETE.json`) into a new output directory.
+    BuildDataciteIndex {
+        /// DataCite monthly release root (holds MANIFEST.json, STATUS.json and dois/)
+        #[arg(short, long)]
+        input: String,
+
+        /// Bundle directory to create; must not already hold a completed bundle
+        #[arg(short, long)]
+        output: String,
+
+        /// Memory budget for the external sort, in MiB
+        #[arg(
+            long,
+            default_value_t = 4096,
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+        )]
+        sort_memory_mb: usize,
+
+        /// Log level
+        #[arg(long, default_value = "INFO")]
+        log_level: String,
+    },
 }
 
 #[derive(Parser, Clone)]
