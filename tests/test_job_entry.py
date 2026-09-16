@@ -336,23 +336,37 @@ def test_main_verifies_source_before_bootstrap(monkeypatch, capsys) -> None:
 # --- bootstrap ---
 
 
-def test_bootstrap_is_noop_when_tools_present(monkeypatch, capsys) -> None:
+def test_bootstrap_is_noop_when_tools_present(monkeypatch, tmp_path: Path, capsys) -> None:
     module = load_job_module()
     calls: list[list[str]] = []
+    queries: list[list[str]] = []
 
     def fake_run_checked(arguments):
         calls.append(arguments)
         return SimpleNamespace(stdout=f"{arguments[0]} 1.90.0\n")
 
+    def installed(arguments, **kwargs):
+        # Never the host's real dpkg-query, whatever machine runs the tests.
+        queries.append(arguments)
+        return SimpleNamespace(returncode=0, stdout="install ok installed")
+
+    marker = tmp_path / "debian_version"
+    marker.write_text("13\n")
+    monkeypatch.setattr(module, "DEBIAN_MARKER", marker)
+    monkeypatch.setattr(module.subprocess, "run", installed)
     monkeypatch.setattr(module, "_run_checked", fake_run_checked)
     monkeypatch.setattr(
         module.shutil,
         "which",
         lambda name: None if name == "apt-get" else f"/usr/bin/{name}",
     )
+    # Both toolchain variables are restored after the test.
     monkeypatch.delenv("CROSSREF_RUSTC_VERSION", raising=False)
+    monkeypatch.delenv("CROSSREF_CARGO_VERSION", raising=False)
     module._ensure_debian_packages()
     assert calls == []
+    assert [query[-1] for query in queries] == list(module.DEBIAN_PACKAGES)
+    assert all(query[0] == "dpkg-query" for query in queries)
     module._ensure_rust()
     assert calls == [["rustc", "--version"], ["cargo", "--version"]]
     assert os.environ["CROSSREF_RUSTC_VERSION"] == "rustc 1.90.0"

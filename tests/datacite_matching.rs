@@ -893,3 +893,74 @@ fn a_doi_token_ends_at_the_next_doi_start_and_long_tokens_are_never_looked_up() 
     assert_eq!(counters(&overlong), (1, 0, 0, 0));
     assert_eq!(counting.doi_probes.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn a_single_candidate_url_resolves_beside_an_unrelated_doi() {
+    let index = index(
+        &["10.1234/a", "10.1234/b"],
+        &[("https://example.org/a", &["10.1234/a"])],
+    );
+    let matches = run(
+        &index,
+        json!({"DOI": "10.1234/b", "URL": "https://example.org/a"}),
+    );
+    assert_eq!(
+        confirmed(&matches),
+        vec![
+            (
+                "10.1234/a",
+                Provenance::Mined,
+                MatchType::Url,
+                "https://example.org/a"
+            ),
+            ("10.1234/b", Provenance::Mined, MatchType::Doi, "10.1234/b"),
+        ]
+    );
+    assert!(matches.ambiguous.is_empty());
+    assert_eq!(counters(&matches), (0, 0, 0, 0));
+}
+
+#[test]
+fn old_style_arxiv_abs_urls_are_arxiv_evidence() {
+    let index = index(&["10.48550/arxiv.hep-ph/9901234"], &[]);
+    let matches = run(
+        &index,
+        json!({"unstructured": "See https://arxiv.org/abs/hep-ph/9901234 for details"}),
+    );
+    assert_eq!(
+        confirmed(&matches),
+        vec![(
+            "10.48550/arxiv.hep-ph/9901234",
+            Provenance::Mined,
+            MatchType::Arxiv,
+            "arxiv.org/abs/hep-ph/9901234"
+        )]
+    );
+    assert_eq!(counters(&matches), (0, 0, 0, 0));
+}
+
+#[test]
+fn an_asserted_structured_doi_outside_the_registry_emits_no_asserted_match() {
+    let index = index(&["10.1234/a"], &[]);
+    let unregistered = run(
+        &index,
+        json!({"DOI": "10.5555/unregistered", "doi-asserted-by": "publisher"}),
+    );
+    assert!(unregistered.confirmed.is_empty());
+    assert_eq!(counters(&unregistered), (1, 0, 0, 0));
+
+    // The assertion never lends its provenance to other evidence.
+    let with_text = run(
+        &index,
+        json!({
+            "DOI": "10.5555/unregistered",
+            "doi-asserted-by": "publisher",
+            "unstructured": "see 10.1234/a"
+        }),
+    );
+    assert_eq!(
+        confirmed(&with_text),
+        vec![("10.1234/a", Provenance::Mined, MatchType::Doi, "10.1234/a")]
+    );
+    assert_eq!(counters(&with_text), (1, 0, 0, 0));
+}

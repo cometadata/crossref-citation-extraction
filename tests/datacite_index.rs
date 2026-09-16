@@ -348,6 +348,37 @@ fn rejects_invalid_manifest_versions_and_kinds() -> anyhow::Result<()> {
 }
 
 #[test]
+fn url_targets_sidecar_has_the_documented_byte_layout() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let (_, bundle) = build_fixture(
+        tmp.path(),
+        &[
+            json!({"id":"10.1234/a","attributes":{"url":"https://example.org/a"}}),
+            json!({"id":"10.1234/c","attributes":{"url":"https://example.org/shared"}}),
+            json!({"id":"10.1234/b","attributes":{"url":"https://example.org/shared"}}),
+        ],
+        &[],
+    )?;
+    // Per URL in key order: a little-endian u64 candidate count, then each
+    // sorted candidate as a little-endian u32 byte length and its UTF-8 DOI.
+    let mut expected = Vec::new();
+    for dois in [&["10.1234/a"][..], &["10.1234/b", "10.1234/c"][..]] {
+        expected.extend_from_slice(&(dois.len() as u64).to_le_bytes());
+        for doi in dois {
+            expected.extend_from_slice(&(doi.len() as u32).to_le_bytes());
+            expected.extend_from_slice(doi.as_bytes());
+        }
+    }
+    assert_eq!(fs::read(bundle.join(URL_TARGETS_FILE))?, expected);
+    let index = DataciteIndex::load(&bundle)?;
+    assert_eq!(
+        index.url_dois("https://example.org/shared", 4096)?,
+        ["10.1234/b", "10.1234/c"]
+    );
+    Ok(())
+}
+
+#[test]
 fn deduplicates_repeated_url_doi_pairs() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let (_, bundle) = build_fixture(

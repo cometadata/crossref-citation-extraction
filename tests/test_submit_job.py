@@ -222,6 +222,51 @@ def test_benchmark_mode_labels_and_defaults(tmp_path: Path, monkeypatch) -> None
     assert any(getattr(v, "kind", "") == "bucket" for v in api.run_kwargs["volumes"])
 
 
+def test_smoke_forwards_no_secrets_even_with_a_crossref_token(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CROSSREF_API_TOKEN", "crossref-secret")
+    api = FakeApi(bucket_files=[])
+    submit(make_config(make_source_root(tmp_path), smoke=True), make_services(api))
+    assert api.run_kwargs["secrets"] == {}
+    assert "crossref-secret" not in json.dumps(api.run_kwargs["script_args"])
+    assert api.list_calls == []
+
+
+@pytest.mark.parametrize("mode", ["legacy", "benchmark"])
+def test_bucket_modes_forward_the_crossref_token_when_set(
+    tmp_path: Path, monkeypatch, mode: str
+) -> None:
+    monkeypatch.setenv("CROSSREF_API_TOKEN", "crossref-secret")
+    api = FakeApi(bucket_files=MIRROR_FILES)
+    submit(make_config(make_source_root(tmp_path), mode=mode), make_services(api))
+    assert api.run_kwargs["secrets"] == {
+        "HF_TOKEN": "hf-token",
+        "CROSSREF_API_TOKEN": "crossref-secret",
+    }
+    assert "crossref-secret" not in json.dumps(api.run_kwargs["script_args"])
+    assert "crossref-secret" not in json.dumps(api.run_kwargs["env"])
+
+
+@pytest.mark.parametrize(
+    "flags", [["--smoke"], ["--legacy-arxiv"], ["--benchmark"], []]
+)
+def test_tokens_never_appear_on_stdout(
+    tmp_path: Path, monkeypatch, capsys, flags: list[str]
+) -> None:
+    monkeypatch.setenv("CROSSREF_API_TOKEN", "crossref-secret")
+    root = make_source_root(tmp_path)
+    monkeypatch.setattr(submit_job, "PROJECT_ROOT", root)
+    api = FakeApi(bucket_files=MIRROR_FILES)
+    submit_job.main(flags, services=make_services(api))
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["id"] == "job-1"
+    for secret in ("crossref-secret", "hf-token"):
+        assert secret not in captured.out
+        assert secret not in captured.err
+
+
 def test_mode_defaults_table() -> None:
     assert MODE_DEFAULTS == {
         "legacy": ("cpu-xl", "24h"),
