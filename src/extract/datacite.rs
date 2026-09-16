@@ -30,7 +30,7 @@ use crate::common::{ArxivMatch, MatchType};
 use crate::extract::arxiv::extract_arxiv_matches_from_text;
 use crate::extract::reference::{
     boundary_variants, contains_arxiv_context, scan_doi_tokens, scan_url_tokens, search_fields,
-    Decoded, EntityDecoder, FieldText, Token, DOI_FIELD, URL_FIELD,
+    Decoded, EntityDecoder, FieldText, Token, DOI_FIELD, MAX_DOI_TOKEN_BYTES, URL_FIELD,
 };
 use crate::extract::Provenance;
 use crate::index::datacite::TargetLookup;
@@ -176,6 +176,16 @@ enum Miss {
     DegenerateUrl(String),
 }
 
+/// What trying the variants of a DOI-shaped token found.
+#[derive(Debug)]
+enum DoiOutcome {
+    /// A variant is registered and was recorded as evidence.
+    Matched,
+    /// No variant is registered: the canonical form of the shortest
+    /// normalizable variant, if any.
+    Unmatched(Option<String>),
+}
+
 /// What evaluating a URL-shaped token found.
 #[derive(Debug)]
 struct UrlOutcome {
@@ -210,11 +220,18 @@ struct LookupCache<'a> {
 
 impl LookupCache<'_> {
     fn contains_doi(&mut self, doi: &str) -> bool {
+        self.probe_doi(doi, true)
+    }
+
+    /// Membership of `doi`, memoized. A miss is remembered only when
+    /// `remember_miss` is set and the DOI is at most
+    /// [`MAX_MEMOIZED_MISS_BYTES`] long.
+    fn probe_doi(&mut self, doi: &str, remember_miss: bool) -> bool {
         if let Some(&hit) = self.dois.get(doi) {
             return hit;
         }
         let hit = self.index.contains_doi(doi);
-        if hit || doi.len() <= MAX_MEMOIZED_MISS_BYTES {
+        if hit || (remember_miss && doi.len() <= MAX_MEMOIZED_MISS_BYTES) {
             self.dois.insert(doi.to_owned(), hit);
         }
         hit
@@ -281,6 +298,15 @@ impl<'a> Matcher<'a> {
     /// Mine one field: the structured whole value first, then the arXiv
     /// parser, then embedded URL tokens, then embedded DOI tokens.
     ///
+    /// A DOI token cut short by a later DOI start is first tried whole, up
+    /// to the next whitespace, for a registered variant only: a hit is
+    /// evidence and claims the whole token, so `10.7777/outer.10.8888/inner`
+    /// cites the outer DOI and not also the inner one. Without a hit the
+    /// cut token is evaluated as usual. Each DOI start therefore costs at
+    /// most two bounded sets of variants, each no longer than
+    /// [`MAX_DOI_TOKEN_BYTES`], and the misses of whole-token tries are
+    /// neither counted nor memoized.
+    ///
     /// Matching runs on the entity-decoded text; evidence is always sliced
     /// from the original value. Text the arXiv parser matched belongs to
     /// it, so `arXiv:cs.DM/9910013` is not also a scheme-less URL and
@@ -337,13 +363,39 @@ impl<'a> Matcher<'a> {
             if overlaps(&scratch.claimed, &original) {
                 continue;
             }
+            let raw_of = |length: usize| raw_from(field, &decoded, token.start, length);
+            if token.full_end > token.end && token.full_end - token.start <= MAX_DOI_TOKEN_BYTES {
+                let whole = decoded.original_range(token.start, token.full_end);
+                if !overlaps(&scratch.claimed, &whole) {
+                    let text = &decoded.text[token.start..token.full_end];
+                    let outcome = self.evaluate_doi(
+                        field.field,
+                        token.start,
+                        boundary_variants(text),
+                        raw_of,
+                        false,
+                    );
+                    if matches!(outcome, DoiOutcome::Matched) {
+                        scratch.claimed.push(whole);
+                        continue;
+                    }
+                }
+            }
             let text = &decoded.text[token.start..token.end];
             let miss = if token.overlong {
                 // Longer than any registrable DOI: counted, never looked up.
                 normalize_doi(text).map(Miss::Doi)
             } else {
-                let raw_of = |length: usize| raw_from(field, &decoded, token.start, length);
-                self.evaluate_doi(field.field, token.start, boundary_variants(text), raw_of)
+                match self.evaluate_doi(
+                    field.field,
+                    token.start,
+                    boundary_variants(text),
+                    raw_of,
+                    true,
+                ) {
+                    DoiOutcome::Matched => None,
+                    DoiOutcome::Unmatched(primary) => primary.map(Miss::Doi),
+                }
             };
             self.note_miss(miss);
         }
@@ -374,21 +426,23 @@ impl<'a> Matcher<'a> {
     }
 
     /// Try the variants of a DOI-shaped token, longest first; the first
-    /// registered variant wins. `raw_of` gives the evidence for a variant
-    /// of the given length. Returns the miss to count when nothing matched.
+    /// registered variant wins and is recorded as evidence. `raw_of` gives
+    /// the evidence for a variant of the given length. `remember_misses`
+    /// allows failed probes to be memoized.
     fn evaluate_doi<'t>(
         &mut self,
         field: usize,
         offset: usize,
         variants: impl Iterator<Item = &'t str>,
         raw_of: impl Fn(usize) -> String,
-    ) -> Option<Miss> {
+        remember_misses: bool,
+    ) -> DoiOutcome {
         let mut primary = None;
         for variant in variants {
             let Some(canonical) = normalize_doi(variant) else {
                 continue;
             };
-            if self.cache.contains_doi(&canonical) {
+            if self.cache.probe_doi(&canonical, remember_misses) {
                 self.candidates.push(Candidate {
                     doi: canonical,
                     provenance: Provenance::Mined,
@@ -397,11 +451,11 @@ impl<'a> Matcher<'a> {
                     offset,
                     raw: raw_of(variant.len()),
                 });
-                return None;
+                return DoiOutcome::Matched;
             }
             primary = Some(canonical);
         }
-        primary.map(Miss::Doi)
+        DoiOutcome::Unmatched(primary)
     }
 
     /// Try the variants of a URL-shaped token, longest first. A resolver

@@ -36,7 +36,8 @@ pub const MAX_BOUNDARY_STRIPS: usize = 4;
 /// DOIs of at most 255 characters, so the bound is generous; a DOI-shaped
 /// token that runs past it without whitespace or another DOI start is
 /// reported as [`Token::overlong`] and capped just past the bound, and
-/// nothing beyond the bound is matched.
+/// nothing beyond the bound is matched. [`Token::full_end`] is capped the
+/// same way.
 pub const MAX_DOI_TOKEN_BYTES: usize = 1024;
 
 /// Trailing characters that may be citation punctuation rather than part
@@ -101,6 +102,11 @@ pub struct Token {
     pub kind: TokenKind,
     pub start: usize,
     pub end: usize,
+    /// Where the token would end if later DOI starts did not cut it: the
+    /// next whitespace or control character, capped just past
+    /// [`MAX_DOI_TOKEN_BYTES`] like `end`. Equal to `end` unless a DOI start
+    /// cut the token, and always equal to `end` for a URL token.
+    pub full_end: usize,
     /// A DOI token longer than [`MAX_DOI_TOKEN_BYTES`]: `end` is the first
     /// character boundary past the bound, and the token must not be looked
     /// up.
@@ -119,22 +125,32 @@ static URL_START: LazyLock<Regex> = LazyLock::new(|| {
 /// Append every DOI token in `text`. Each start is extended to the next
 /// whitespace or control character, the next DOI start, or just past
 /// [`MAX_DOI_TOKEN_BYTES`], whichever comes first, so `10.1/a,10.2/b`
-/// yields `10.1/a,` and `10.2/b`. Tokens never overlap, which keeps the
-/// scanned bytes linear in the length of the field however many DOIs it
-/// joins without whitespace.
+/// yields `10.1/a,` and `10.2/b`. Tokens never overlap. Each token also
+/// records in [`Token::full_end`] where it would end without the DOI-start
+/// cut (`10.1/a,10.2/b` for the first one), so a DOI whose suffix embeds
+/// another DOI prefix can still be tried whole. The end of each
+/// whitespace-delimited run is found once for all the starts inside it,
+/// which keeps the scanned bytes linear in the length of the field however
+/// many DOIs it joins without whitespace.
 pub fn scan_doi_tokens(text: &str, out: &mut Vec<Token>) {
     let mut starts = DOI_START
         .find_iter(text)
         .map(|found| found.start())
         .peekable();
+    // The end of the whitespace-delimited run holding the previous start.
+    // Starts are increasing, so a start before it lies in the same run.
+    let mut run_end = 0;
     while let Some(start) = starts.next() {
-        let next_start = starts.peek().copied().unwrap_or(text.len());
-        let limit = ceil_char_boundary(text, start + MAX_DOI_TOKEN_BYTES + 1).min(next_start);
-        let end = token_end(&text[..limit], start);
+        if start >= run_end {
+            run_end = token_end(text, start);
+        }
+        let full_end = run_end.min(ceil_char_boundary(text, start + MAX_DOI_TOKEN_BYTES + 1));
+        let end = full_end.min(starts.peek().copied().unwrap_or(text.len()));
         out.push(Token {
             kind: TokenKind::Doi,
             start,
             end,
+            full_end,
             overlong: end - start > MAX_DOI_TOKEN_BYTES,
         });
     }
@@ -165,6 +181,7 @@ pub fn scan_url_tokens(text: &str, out: &mut Vec<Token>) {
                 kind: TokenKind::Url,
                 start,
                 end,
+                full_end: end,
                 overlong: false,
             });
             position = end;
@@ -438,6 +455,36 @@ mod tests {
         assert!(out[0].overlong);
         assert_eq!(out[0].end, MAX_DOI_TOKEN_BYTES + 2);
         assert!(long.is_char_boundary(out[0].end));
+    }
+
+    #[test]
+    fn doi_tokens_record_where_their_whitespace_delimited_token_ends() {
+        let text = "10.5555/data/10.2/set, 10.1/a;10.2/b\t10.3/c";
+        let mut out = Vec::new();
+        scan_doi_tokens(text, &mut out);
+        let spans: Vec<(&str, &str)> = out
+            .iter()
+            .map(|t| (&text[t.start..t.end], &text[t.start..t.full_end]))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                ("10.5555/data/", "10.5555/data/10.2/set,"),
+                ("10.2/set,", "10.2/set,"),
+                ("10.1/a;", "10.1/a;10.2/b"),
+                ("10.2/b", "10.2/b"),
+                ("10.3/c", "10.3/c"),
+            ]
+        );
+
+        // The whole token is capped just past the length bound like `end`.
+        let long = format!("10.1/a,10.2/{}", "b".repeat(2 * MAX_DOI_TOKEN_BYTES));
+        out.clear();
+        scan_doi_tokens(&long, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].end, out[0].full_end), (7, MAX_DOI_TOKEN_BYTES + 1));
+        assert!(out[1].overlong);
+        assert_eq!(out[1].full_end, out[1].end);
     }
 
     #[test]

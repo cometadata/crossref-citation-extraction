@@ -269,10 +269,14 @@ the registry during the bundle build and the candidates during matching.
 
 **DOIs.** Recognized forms are the structured `DOI` field, bare `10.…`
 tokens in text (a token runs to the next whitespace or the next
-`10.<registrant>/` start, so comma-joined DOIs are separate tokens; a
-DOI-shaped token longer than 1,024 bytes is counted as unmatched and never
-looked up), `doi:` wrappers (case-insensitive, whitespace after the
-colon allowed), and resolver URLs on `doi.org`, `dx.doi.org`, or
+`10.<registrant>/` start, so comma-joined DOIs are separate tokens; a token
+cut short by such a start is first tried whole, up to the next whitespace,
+and a registered whole token wins and claims its text, so
+`10.5555/data/10.2/set` still matches and `10.7777/outer.10.8888/inner`
+cites only the outer DOI when both are registered; a DOI-shaped token longer
+than 1,024 bytes is counted as unmatched and never looked up), `doi:`
+wrappers (case-insensitive, whitespace after the colon allowed), and
+resolver URLs on `doi.org`, `dx.doi.org`, or
 `www.doi.org` with or without a scheme (the DOI is the resolver path,
 percent-decoded once; a query or fragment is not part of it). The canonical
 form is `10.<registrant>/<suffix>` with ASCII letters lowercased; the

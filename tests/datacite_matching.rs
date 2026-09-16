@@ -862,17 +862,30 @@ fn thousands_of_comma_joined_dois_in_one_field_match_with_linear_work() {
     assert_eq!(confirmed(&matches), expected);
     assert_eq!(counters(&matches), ((COUNT / 2) as u64, 0, 0, 0));
 
-    // Structural bound, independent of wall time: each DOI start yields one
-    // token of at most MAX_BOUNDARY_STRIPS + 1 variants, and the tokens do
-    // not overlap, so the probed bytes stay linear in the field length.
-    let variants = crossref_citation_extraction::extract::reference::MAX_BOUNDARY_STRIPS + 1;
+    // Structural bound, independent of wall time: each DOI start is tried as
+    // at most two tokens (the whole whitespace-delimited token when a later
+    // DOI start cut it, then the cut token) of at most
+    // MAX_BOUNDARY_STRIPS + 1 variants each, and no probe is longer than
+    // MAX_DOI_TOKEN_BYTES, so the work stays linear in the number of starts.
+    assert_doi_work_is_bounded(&counting, COUNT);
+}
+
+/// Every DOI start costs at most `2 × (MAX_BOUNDARY_STRIPS + 1)` membership
+/// probes, each at most `MAX_DOI_TOKEN_BYTES` long.
+fn assert_doi_work_is_bounded(counting: &ProbeCountingIndex<'_>, starts: usize) {
+    use crossref_citation_extraction::extract::reference::{
+        MAX_BOUNDARY_STRIPS, MAX_DOI_TOKEN_BYTES,
+    };
+    let per_start = 2 * (MAX_BOUNDARY_STRIPS + 1);
     let probes = counting.doi_probes.load(Ordering::SeqCst);
     let probe_bytes = counting.doi_probe_bytes.load(Ordering::SeqCst);
-    assert!(probes <= COUNT * variants, "{probes} DOI probes");
     assert!(
-        probe_bytes <= field.len() * variants,
-        "{probe_bytes} probed bytes for a {}-byte field",
-        field.len()
+        probes <= starts * per_start,
+        "{probes} DOI probes for {starts} starts"
+    );
+    assert!(
+        probe_bytes <= starts * per_start * MAX_DOI_TOKEN_BYTES,
+        "{probe_bytes} probed bytes for {starts} starts"
     );
 }
 
@@ -1159,4 +1172,158 @@ fn registered_bare_site_roots_never_match_but_their_pages_do() {
     assert!(punctuated.confirmed.is_empty());
     assert_eq!(counters(&punctuated), (0, 0, 0, 0));
     assert_eq!(punctuated.degenerate_urls, 1);
+}
+
+#[test]
+fn dois_that_embed_another_doi_prefix_match_from_bare_text() {
+    let index = index(&["10.5555/data/10.2/set", "10.5555/pkg.10.1234/v2"], &[]);
+    let cases = [
+        (
+            "Data 10.5555/data/10.2/set",
+            "10.5555/data/10.2/set",
+            "10.5555/data/10.2/set",
+        ),
+        (
+            "doi:10.5555/pkg.10.1234/v2.",
+            "10.5555/pkg.10.1234/v2",
+            "10.5555/pkg.10.1234/v2",
+        ),
+        (
+            "(doi:10.5555/PKG.10.1234/v2), see",
+            "10.5555/pkg.10.1234/v2",
+            "10.5555/PKG.10.1234/v2",
+        ),
+        (
+            "&lt;10.5555/data/10.2/set&gt;",
+            "10.5555/data/10.2/set",
+            "10.5555/data/10.2/set",
+        ),
+    ];
+    for (text, doi, raw) in cases {
+        for field in ["article-title", "unstructured"] {
+            let matches = run(&index, json!({ field: text }));
+            assert_eq!(
+                confirmed(&matches),
+                vec![(doi, Provenance::Mined, MatchType::Doi, raw)],
+                "{field}: {text}"
+            );
+            assert_eq!(counters(&matches), (0, 0, 0, 0), "{field}: {text}");
+        }
+    }
+}
+
+#[test]
+fn an_embedded_registered_doi_is_not_emitted_inside_a_registered_outer_doi() {
+    let index = index(&["10.7777/outer.10.8888/inner", "10.8888/inner"], &[]);
+    let outer = run(
+        &index,
+        json!({"unstructured": "See 10.7777/outer.10.8888/inner."}),
+    );
+    assert_eq!(
+        confirmed(&outer),
+        vec![(
+            "10.7777/outer.10.8888/inner",
+            Provenance::Mined,
+            MatchType::Doi,
+            "10.7777/outer.10.8888/inner"
+        )]
+    );
+    assert_eq!(counters(&outer), (0, 0, 0, 0));
+
+    // The inner DOI cited on its own is still its own citation.
+    let both = run(
+        &index,
+        json!({"unstructured": "10.7777/outer.10.8888/inner and 10.8888/inner"}),
+    );
+    assert_eq!(
+        confirmed(&both),
+        vec![
+            (
+                "10.7777/outer.10.8888/inner",
+                Provenance::Mined,
+                MatchType::Doi,
+                "10.7777/outer.10.8888/inner"
+            ),
+            (
+                "10.8888/inner",
+                Provenance::Mined,
+                MatchType::Doi,
+                "10.8888/inner"
+            ),
+        ]
+    );
+    assert_eq!(counters(&both), (0, 0, 0, 0));
+
+    // An unregistered outer token does not hide the registered DOI after it.
+    let fallback = run(&index, json!({"unstructured": "10.9999/x.10.8888/inner"}));
+    assert_eq!(
+        confirmed(&fallback),
+        vec![(
+            "10.8888/inner",
+            Provenance::Mined,
+            MatchType::Doi,
+            "10.8888/inner"
+        )]
+    );
+    assert_eq!(counters(&fallback), (1, 0, 0, 0), "10.9999/x");
+}
+
+#[test]
+fn a_matched_structured_doi_with_an_embedded_prefix_counts_nothing_unmatched() {
+    let index = index(
+        &[
+            "10.5555/pkg.10.1234/v2",
+            "10.7777/outer.10.8888/inner",
+            "10.8888/inner",
+        ],
+        &[],
+    );
+    let cases = [
+        (
+            json!({"DOI": "10.5555/pkg.10.1234/v2", "doi-asserted-by": "publisher"}),
+            (
+                "10.5555/pkg.10.1234/v2",
+                Provenance::Publisher,
+                "10.5555/pkg.10.1234/v2",
+            ),
+        ),
+        (
+            json!({"DOI": "doi:10.7777/OUTER.10.8888/inner"}),
+            (
+                "10.7777/outer.10.8888/inner",
+                Provenance::Mined,
+                "doi:10.7777/OUTER.10.8888/inner",
+            ),
+        ),
+    ];
+    for (reference, (doi, provenance, raw)) in cases {
+        let matches = run(&index, reference.clone());
+        assert_eq!(
+            confirmed(&matches),
+            vec![(doi, provenance, MatchType::Doi, raw)],
+            "{reference}"
+        );
+        assert_eq!(counters(&matches), (0, 0, 0, 0), "{reference}");
+    }
+}
+
+#[test]
+fn embedded_doi_starts_cost_a_bounded_number_of_probes() {
+    const RUNS: usize = 2_000;
+    // Three DOI starts per whitespace-delimited token, none registered: the
+    // first two are cut by a later start, so both readings are tried.
+    let text = (0..RUNS)
+        .map(|i| format!("10.{i}/a.10.{i}/b.10.{i}/c."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let memory = index(&["10.1234/other"], &[]);
+    let counting = ProbeCountingIndex {
+        inner: &memory,
+        doi_probes: AtomicUsize::new(0),
+        doi_probe_bytes: AtomicUsize::new(0),
+    };
+    let matches = run(&counting, json!({ "unstructured": text }));
+    assert!(matches.confirmed.is_empty());
+    assert_eq!(counters(&matches), ((3 * RUNS) as u64, 0, 0, 0));
+    assert_doi_work_is_bounded(&counting, 3 * RUNS);
 }
