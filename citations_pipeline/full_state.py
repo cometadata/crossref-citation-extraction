@@ -46,6 +46,9 @@ FULL_PIPELINE_KIND = "datacite-pipeline"
 # repository each one owns. A pipeline marker must carry exactly these.
 PUBLICATION_KINDS = ("datacite", "arxiv")
 PUBLICATION_REPOS = {"datacite": DATACITE_DATASET_REPO, "arxiv": DATASET_REPO}
+# Per-generation receipt journal: `{"datacite": receipt, "arxiv": receipt}`,
+# any subset, one entry appended after each verified publication.
+PUBLICATIONS_JOURNAL_NAME = "_PUBLICATIONS.json"
 
 _MIB = 1024 * 1024
 _MAX_BYTES = 2**63 - 1
@@ -392,3 +395,36 @@ class FullPipelineMarker:
             publications=_publications(payload["publications"], "publications"),
             completed_at=_string(payload["completed_at"], "completed_at"),
         )
+
+
+def publications_to_dict(
+    receipts: dict[str, PublicationReceipt],
+) -> dict[str, Any]:
+    """Serialize a (possibly partial) receipt journal in publication order."""
+    unknown = sorted(receipts.keys() - set(PUBLICATION_KINDS))
+    if unknown:
+        raise StateError(f"publication journal has unknown kinds: {unknown}")
+    return {
+        kind: receipts[kind].to_dict() for kind in PUBLICATION_KINDS if kind in receipts
+    }
+
+
+def publications_from_dict(payload: Any) -> dict[str, PublicationReceipt]:
+    """Parse a `_PUBLICATIONS.json` journal: any subset of the publication
+    kinds, each receipt naming the repository that kind owns."""
+    entries = _mapping(payload, "publication journal")
+    unknown = sorted(entries.keys() - set(PUBLICATION_KINDS))
+    if unknown:
+        raise StateError(f"publication journal has unknown kinds: {unknown}")
+    receipts: dict[str, PublicationReceipt] = {}
+    for kind in PUBLICATION_KINDS:
+        if kind not in entries:
+            continue
+        receipt = PublicationReceipt.from_dict(entries[kind])
+        if receipt.repo_id != PUBLICATION_REPOS[kind]:
+            raise StateError(
+                f"publication journal[{kind}].repo_id must be "
+                f"{PUBLICATION_REPOS[kind]!r}"
+            )
+        receipts[kind] = receipt
+    return receipts

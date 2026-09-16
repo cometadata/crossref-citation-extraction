@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import shutil
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-
-import zstandard
 
 from .arxiv_index import discover_datacite_release, ensure_fst
 from .bucket import BucketStore, HfBucketStore
 from .extractor import build_extractor, run_build_index, run_extraction
+from .full_state import ResourceSettings
 from .mirror import MirrorError, ResolvedSnapshot, resolve_mirror_snapshot
 from .paths import (
     ARCHIVE_NAME,
@@ -24,6 +23,9 @@ from .paths import (
     PipelinePaths,
     runtime_source_digest,
 )
+from .pipeline_io import PipelineError, stage_snapshot, tree_file_metadata
+from .pipeline_io import compress_file as _compress_file
+from .pipeline_io import count_lines as _count_lines
 from .publish import (
     ConfigStats,
     publish_dataset,
@@ -37,18 +39,13 @@ from .state import (
     StateError,
     can_reuse_extraction,
     read_json,
-    sha256_file,
     utc_now,
     write_atomic_json,
 )
-from .telemetry import EventLogger, ProgressTracker
+from .telemetry import EventLogger
 from .transfer import fallback_download_snapshot
 
-STAGE_CHUNK_BYTES = 16 * 1024 * 1024
-
-
-class PipelineError(RuntimeError):
-    pass
+PIPELINE_MODES = ("legacy", "datacite", "smoke", "benchmark")
 
 
 @dataclass(frozen=True)
@@ -63,6 +60,18 @@ class PipelineConfig:
     hf_token: str | None
     crossref_token: str | None
     run_id: str
+    # Full mode (Task 11 onwards). Defaults keep every legacy construction
+    # site working: `run_pipeline` handles `legacy`; `run_full_pipeline`
+    # handles `datacite`; smoke and benchmark reuse the full-mode phases.
+    mode: str = "legacy"
+    resources: ResourceSettings = field(default_factory=ResourceSettings)
+    expected_snapshot_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in PIPELINE_MODES:
+            raise ValueError(
+                f"mode must be one of {PIPELINE_MODES}: {self.mode!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -139,11 +148,6 @@ def run_pipeline(
     if config.smoke:
         return _run_smoke(config, deps)
     return _run_production(config, deps)
-
-
-def _count_lines(path: Path) -> int:
-    with path.open("rb") as handle:
-        return sum(1 for _line in handle)
 
 
 def _run_smoke(
@@ -232,46 +236,9 @@ def _reusable_extraction(
 def _stage_snapshot(
     paths: PipelinePaths, resolved: ResolvedSnapshot, events: Any
 ) -> Path:
-    if resolved.archive_is_local:
-        return resolved.archive_path
-    source = resolved.archive_path
-    current_size = source.stat().st_size if source.is_file() else -1
-    if current_size != resolved.archive_size:
-        raise PipelineError(
-            "mirror archive changed before staging; rerun, or set "
-            f"CROSSREF_API_TOKEN for the fallback download: {source}"
-        )
-    target = paths.snapshot_local
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    def report(payload: dict[str, object]) -> None:
-        events.emit("progress", **payload)
-
-    with events.phase("stage_snapshot"):
-        with (
-            ProgressTracker(
-                phase="stage_snapshot",
-                total_bytes=resolved.archive_size,
-                progress=report,
-            ) as tracker,
-            source.open("rb") as src,
-            target.open("wb") as dst,
-        ):
-            while chunk := src.read(STAGE_CHUNK_BYTES):
-                dst.write(chunk)
-                tracker.advance(len(chunk))
-    staged = target.stat().st_size
-    if staged != resolved.archive_size:
-        raise PipelineError(
-            f"staged archive size mismatch: {staged} != {resolved.archive_size}"
-        )
-    return target
-
-
-def _compress_file(source: Path, target: Path) -> None:
-    compressor = zstandard.ZstdCompressor()
-    with source.open("rb") as src, target.open("wb") as dst:
-        compressor.copy_stream(src, dst)
+    # Legacy markers carry the archive digest but the legacy contract never
+    # compared it during staging; the full pipeline does (see pipeline_io).
+    return stage_snapshot(paths, resolved, events, verify_digest=False)
 
 
 def _persist_derived_generation(
@@ -326,13 +293,7 @@ def _persist_derived_generation(
             "publish_schema_version": PUBLISH_SCHEMA_VERSION,
         },
     )
-    files: dict[str, dict[str, Any]] = {}
-    for path in sorted(local.rglob("*")):
-        if path.is_file():
-            files[path.relative_to(local).as_posix()] = {
-                "size": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
+    files = tree_file_metadata(local)
     marker = ExtractionMarker(
         schema_version=MARKER_SCHEMA_VERSION,
         extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
