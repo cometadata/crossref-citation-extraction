@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import base64
+import gzip
+import hashlib
+import json
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Self
 
 import pytest
@@ -123,3 +129,117 @@ class FakeSession:
 @pytest.fixture
 def fake_session() -> FakeSession:
     return FakeSession()
+
+
+# --- DataCite monthly release fixtures (full mode) ---------------------------
+#
+# These mirror the Rust `tests/support/mod.rs` helpers: a single
+# `dois/updated_YYYY-MM/` folder holding one metadata part and one state
+# report, a `MANIFEST.json` listing exactly those files with base64 SHA-256
+# digests, and a `Complete` `STATUS.json`. `write_full_datacite_release` is
+# the low-level builder for hand-crafted bytes; `make_full_datacite_release`
+# writes the default gzip content.
+
+FULL_RELEASE_MONTH = "2026-07"
+
+
+def gzip_bytes(data: bytes) -> bytes:
+    """Gzip `data` as one member with a zero mtime so fixtures are deterministic."""
+    return gzip.compress(data, mtime=0)
+
+
+def metadata_jsonl(records: Sequence[dict[str, Any]]) -> bytes:
+    return "".join(
+        json.dumps(record, separators=(",", ":")) + "\n" for record in records
+    ).encode("utf-8")
+
+
+def state_csv(states: Sequence[tuple[str, str]]) -> bytes:
+    lines = ["doi,state,client_id,updated"]
+    lines.extend(
+        f"{doi},{state},example.repo,2026-07-15T00:00:00.000Z" for doi, state in states
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def part_path(month: str, index: int) -> str:
+    return f"dois/updated_{month}/part_{index:04d}.jsonl.gz"
+
+
+def csv_path(month: str) -> str:
+    return f"dois/updated_{month}/{month}.csv.gz"
+
+
+def write_full_datacite_release(
+    root: Path,
+    month: str,
+    files: Sequence[tuple[str, bytes]],
+    *,
+    status: str = "Complete",
+    transfer_complete: bool = True,
+) -> None:
+    """Write each `(relative_path, bytes)` file under `root`, a `MANIFEST.json`
+    describing exactly those files, `STATUS.json` for `month`, and (by default)
+    the mirror's `_TRANSFER_COMPLETE.json`."""
+    root.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for relative, data in files:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        entries.append(
+            {
+                "filename": relative,
+                "size": len(data),
+                "sha256": base64.b64encode(hashlib.sha256(data).digest()).decode(
+                    "ascii"
+                ),
+            }
+        )
+    (root / "MANIFEST.json").write_text(json.dumps(entries, indent=2) + "\n")
+    (root / "STATUS.json").write_text(
+        json.dumps(
+            {
+                "month": month,
+                "datetime": "2026-08-01T07:53:35.713625+00:00",
+                "status": status,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    if transfer_complete:
+        (root / "_TRANSFER_COMPLETE.json").write_text("{}\n")
+
+
+def make_full_datacite_release(
+    root: Path,
+    month: str = FULL_RELEASE_MONTH,
+    *,
+    metadata: Sequence[dict[str, Any]] | None = None,
+    states: Sequence[tuple[str, str]] | None = None,
+    transfer_complete: bool = True,
+) -> None:
+    """Write a complete single-month release: `part_0000.jsonl.gz` holding
+    `metadata` and `<month>.csv.gz` holding `states`, both gzip."""
+    if metadata is None:
+        metadata = [{"id": "10.1234/a", "attributes": {"url": "https://example.org/a"}}]
+    if states is None:
+        states = [("10.1234/a", "findable")]
+    write_full_datacite_release(
+        root,
+        month,
+        [
+            (part_path(month, 0), gzip_bytes(metadata_jsonl(metadata))),
+            (csv_path(month), gzip_bytes(state_csv(states))),
+        ],
+        transfer_complete=transfer_complete,
+    )
+
+
+@pytest.fixture
+def full_datacite_release(tmp_path: Path) -> Path:
+    """A complete mirrored release at `<tmp_path>/mnt/datacite-monthly-data-file-2026-07`."""
+    root = tmp_path / "mnt" / f"datacite-monthly-data-file-{FULL_RELEASE_MONTH}"
+    make_full_datacite_release(root)
+    return root

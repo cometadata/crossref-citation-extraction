@@ -15,10 +15,25 @@ PUBLISH_SCHEMA_VERSION = 1
 MARKER_SCHEMA_VERSION = 1
 MIRROR_MARKER_SCHEMA_VERSION = 2
 
+# Full-mode (DataCite) versions. These are deliberately distinct from the
+# legacy arXiv versions above so no legacy cache, marker, or checkpoint can
+# satisfy a full-mode identity. Bump DATACITE_INDEX_VERSION when the bundle
+# layout changes and NORMALIZATION_VERSION when DOI/URL canonicalization
+# changes; both are part of the bundle cache key.
+DATACITE_INDEX_VERSION = 2
+NORMALIZATION_VERSION = 1
+DATACITE_EXTRACTION_VERSION = 2
+DATACITE_MARKER_VERSION = 2
+DATACITE_PUBLISH_SCHEMA_VERSION = 2
+ARXIV_PUBLISH_SCHEMA_VERSION = PUBLISH_SCHEMA_VERSION
+PARTITION_ALGORITHM = "fnv1a64-v1"
+
 BUCKET_ID = "cometadata/shared-storage"
 BUCKET_PREFIX_NAME = "crossref-arxiv-citations-latest"
 AFFILIATIONS_PREFIX_NAME = "crossref-affiliations-latest"
 DATASET_REPO = "cometadata/crossref-arxiv-citations"
+DATACITE_PREFIX_NAME = "crossref-datacite-citations-latest"
+DATACITE_DATASET_REPO = "cometadata/crossref-datacite-citations"
 ARCHIVE_NAME = "all.json.tar.gz"
 INPUT_STEM = "all.json"
 OUTPUT_KINDS = ("valid", "failed", "publisher", "crossref", "mined")
@@ -43,6 +58,7 @@ RUNTIME_SOURCE_PATTERNS = (
 _GENERATION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _SNAPSHOT_ID = re.compile(r"^\d{4}-\d{2}$")
 _RUN_ID = re.compile(r"^[0-9a-f]{32}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class GenerationPathError(ValueError):
@@ -61,6 +77,18 @@ def validate_generation_prefix(value: str, expected_root: str) -> str:
     if name in {"", ".", ".."} or not _GENERATION_NAME.fullmatch(name):
         raise GenerationPathError("generation name is invalid")
     return f"{expected_root}/{name}"
+
+
+def bundle_prefix(release: str, inventory_sha256: str) -> Path:
+    """Relative cache-key directory of a verified DataCite index bundle:
+    `indexes/<release>-v<DATACITE_INDEX_VERSION>-<inventory_sha256>`."""
+    if not _SNAPSHOT_ID.fullmatch(release):
+        raise GenerationPathError("DataCite release must have YYYY-MM form")
+    if not _SHA256_HEX.fullmatch(inventory_sha256):
+        raise GenerationPathError(
+            "inventory digest must be a lowercase SHA-256 digest"
+        )
+    return Path("indexes") / f"{release}-v{DATACITE_INDEX_VERSION}-{inventory_sha256}"
 
 
 def _generation_name(snapshot_id: str, run_id: str) -> str:
@@ -115,10 +143,21 @@ class PipelinePaths:
     derived_local: Path
     smoke_dir: Path
     download_staging: Path
+    # Full mode: durable bundle cache root under the owned prefix, the local
+    # work directory for staged/verified bundles, and the run identity file.
+    indexes: Path
+    bundle_local: Path
+    identity_local: Path
 
     @classmethod
-    def from_roots(cls, bucket_root: Path, work_root: Path) -> PipelinePaths:
-        prefix = bucket_root / BUCKET_PREFIX_NAME
+    def from_roots(
+        cls,
+        bucket_root: Path,
+        work_root: Path,
+        *,
+        prefix_name: str = BUCKET_PREFIX_NAME,
+    ) -> PipelinePaths:
+        prefix = bucket_root / prefix_name
         return cls(
             bucket_root=bucket_root,
             work_root=work_root,
@@ -135,6 +174,9 @@ class PipelinePaths:
             derived_local=work_root / "derived",
             smoke_dir=work_root / "smoke",
             download_staging=work_root / "download-staging",
+            indexes=prefix / "indexes",
+            bundle_local=work_root / "bundle",
+            identity_local=work_root / "run-identity.json",
         )
 
     def fst_prefix(self, release: str) -> FstPaths:

@@ -77,6 +77,39 @@ def run_build_index(
     )
 
 
+def run_build_datacite_index(
+    binary: ExtractorBinary,
+    records: Path,
+    output: Path,
+    sort_memory_mb: int,
+    runner: Runner = subprocess.run,
+) -> None:
+    """Build a full DataCite index bundle from a monthly release root.
+
+    `output` is left for the Rust builder to create: it stages under the
+    parent and refuses an existing, non-empty output directory."""
+    if (
+        isinstance(sort_memory_mb, bool)
+        or not isinstance(sort_memory_mb, int)
+        or sort_memory_mb <= 0
+    ):
+        raise ExtractorError("sort_memory_mb must be a positive integer")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        runner,
+        [
+            str(binary.path),
+            "build-datacite-index",
+            "--input",
+            str(records),
+            "--output",
+            str(output),
+            "--sort-memory-mb",
+            str(sort_memory_mb),
+        ],
+    )
+
+
 @dataclass(frozen=True)
 class ExtractionOutputs:
     valid: Path
