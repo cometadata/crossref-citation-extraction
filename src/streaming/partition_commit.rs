@@ -22,7 +22,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::{bail, ensure, Context, Result};
 use log::info;
@@ -47,27 +48,66 @@ pub const FAILPOINT_AFTER_RENAME_BEFORE_PROGRESS: &str = "after_rename_before_pr
 /// after a temporary output is complete and before it replaces the target.
 pub const FAILPOINT_DURING_FINAL_ASSEMBLY: &str = "during_final_assembly";
 
-static FAILPOINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-
-/// Arm (`Some(name)`) or clear (`None`) the failpoint that aborts the next
-/// pass through the named commit boundary, simulating a crash there.
-///
-/// A test hook only: nothing in the CLI or the environment can set it, and
-/// it stays armed until cleared, so tests that use it must serialize.
-#[doc(hidden)]
-pub fn set_failpoint(name: Option<&str>) {
-    let slot = FAILPOINT.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = name.map(str::to_owned);
+/// One armed failpoint: a boundary name and the path subtree it covers.
+struct ArmedFailpoint {
+    id: u64,
+    name: String,
+    under: PathBuf,
 }
 
-/// Fail if the failpoint `name` is armed.
-pub(crate) fn hit_failpoint(name: &str) -> Result<()> {
-    let Some(slot) = FAILPOINT.get() else {
+static FAILPOINTS: OnceLock<Mutex<Vec<ArmedFailpoint>>> = OnceLock::new();
+static NEXT_FAILPOINT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Disarms its failpoint when dropped, so a failing assertion can never
+/// leave a boundary armed for the tests that follow.
+#[doc(hidden)]
+#[must_use = "the failpoint is disarmed as soon as this guard drops"]
+pub struct FailpointGuard {
+    id: u64,
+}
+
+impl Drop for FailpointGuard {
+    fn drop(&mut self) {
+        if let Some(armed) = FAILPOINTS.get() {
+            lock(armed).retain(|failpoint| failpoint.id != self.id);
+        }
+    }
+}
+
+/// Arm the failpoint `name` for every commit boundary whose path lies under
+/// `under`, simulating a crash there, until the returned guard drops.
+///
+/// Boundaries outside `under` are unaffected, so tests working in separate
+/// temporary directories can arm failpoints concurrently. A test hook only:
+/// nothing in the CLI or the environment can arm one.
+#[doc(hidden)]
+pub fn arm_failpoint(name: &str, under: &Path) -> FailpointGuard {
+    let id = NEXT_FAILPOINT_ID.fetch_add(1, Ordering::Relaxed);
+    lock(FAILPOINTS.get_or_init(|| Mutex::new(Vec::new()))).push(ArmedFailpoint {
+        id,
+        name: name.to_owned(),
+        under: under.to_path_buf(),
+    });
+    FailpointGuard { id }
+}
+
+/// Fail if the failpoint `name` is armed for a subtree containing `path`.
+pub(crate) fn hit_failpoint(name: &str, path: &Path) -> Result<()> {
+    let Some(armed) = FAILPOINTS.get() else {
         return Ok(());
     };
-    let armed = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if armed.as_deref() == Some(name) {
-        bail!("failpoint {name} triggered");
+    let armed = lock(armed);
+    if armed
+        .iter()
+        .any(|failpoint| failpoint.name == name && path.starts_with(&failpoint.under))
+    {
+        bail!("failpoint {name} triggered at {}", path.display());
     }
     Ok(())
 }
@@ -333,12 +373,12 @@ impl PartitionStaging {
         commit.save_atomic(&staging_dir)?;
 
         let committed_dir = aggregation_dir.join(&partition);
-        hit_failpoint(FAILPOINT_BEFORE_RENAME)?;
+        hit_failpoint(FAILPOINT_BEFORE_RENAME, &committed_dir)?;
         // Promotion boundary: the marker and fragments are already synced here.
         anyhow::ensure!(!committed_dir.exists(), "partition already committed");
         std::fs::rename(&staging_dir, &committed_dir)?;
         sync_dir(&aggregation_dir)?;
-        hit_failpoint(FAILPOINT_AFTER_RENAME_BEFORE_PROGRESS)?;
+        hit_failpoint(FAILPOINT_AFTER_RENAME_BEFORE_PROGRESS, &committed_dir)?;
         Ok((committed_dir, commit))
     }
 }
@@ -404,15 +444,26 @@ mod tests {
         assert!(dir.path().join("note.txt").exists());
     }
 
+    /// Armed failpoints fire only for their own name under their own root,
+    /// and only while the guard lives. The roots here are never created on
+    /// disk, so this cannot interact with any other test's directories.
     #[test]
-    fn failpoints_abort_only_when_armed() {
-        assert!(hit_failpoint(FAILPOINT_BEFORE_RENAME).is_ok());
-        set_failpoint(Some(FAILPOINT_DURING_FINAL_ASSEMBLY));
-        assert!(hit_failpoint(FAILPOINT_BEFORE_RENAME).is_ok());
-        let err = hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY).unwrap_err();
-        assert!(err.to_string().contains(FAILPOINT_DURING_FINAL_ASSEMBLY));
-        set_failpoint(None);
-        assert!(hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY).is_ok());
+    fn failpoints_fire_only_for_their_root_while_armed() {
+        let root = Path::new("/failpoint-test/scope");
+        let inside = root.join("h0001");
+        let outside = Path::new("/failpoint-test/other/h0001");
+        assert!(hit_failpoint(FAILPOINT_BEFORE_RENAME, &inside).is_ok());
+        {
+            let _armed = arm_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY, root);
+            let _other = arm_failpoint(FAILPOINT_BEFORE_RENAME, outside);
+            assert!(hit_failpoint(FAILPOINT_BEFORE_RENAME, &inside).is_ok());
+            assert!(hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY, outside).is_ok());
+            let err = hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY, &inside).unwrap_err();
+            assert!(err.to_string().contains(FAILPOINT_DURING_FINAL_ASSEMBLY));
+            assert!(hit_failpoint(FAILPOINT_BEFORE_RENAME, outside).is_err());
+        }
+        assert!(hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY, &inside).is_ok());
+        assert!(hit_failpoint(FAILPOINT_BEFORE_RENAME, outside).is_ok());
         assert_eq!(
             tmp_output_path(Path::new("/out/valid.jsonl")),
             PathBuf::from("/out/valid.jsonl.tmp")

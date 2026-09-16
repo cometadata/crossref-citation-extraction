@@ -7,7 +7,6 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use anyhow::Result;
 use crossref_citation_extraction::index::datacite::IndexFile;
@@ -33,9 +32,6 @@ use crossref_citation_extraction::{
 };
 use polars::prelude::*;
 use serde_json::{json, Value};
-
-/// Failpoints are process-global; tests that arm them run one at a time.
-static FAILPOINT_GUARD: Mutex<()> = Mutex::new(());
 
 #[test]
 fn both_aggregation_paths_deduplicate_reference_tuples() -> anyhow::Result<()> {
@@ -583,9 +579,6 @@ fn in_memory_guard_falls_back_when_metadata_underestimates() -> Result<()> {
 
 #[test]
 fn resume_after_each_failpoint_matches_a_clean_run() -> Result<()> {
-    let _serial = FAILPOINT_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = tempfile::tempdir()?;
     let index = build_index(tmp.path(), &INDEXED)?;
     let rows = evidence_rows();
@@ -618,10 +611,11 @@ fn resume_after_each_failpoint_matches_a_clean_run() -> Result<()> {
         fs::create_dir_all(&out)?;
         let outputs = all_outputs(&out);
 
-        partition_commit::set_failpoint(Some(failpoint));
+        // Scoped to this test's directory, so parallel tests are unaffected.
+        let armed = partition_commit::arm_failpoint(failpoint, tmp.path());
         let err = aggregate_datacite(&parts, &index, &outputs, limits(4096), &identity(), false)
             .expect_err("armed failpoint must abort the run");
-        partition_commit::set_failpoint(None);
+        drop(armed);
         assert!(format!("{err:#}").contains(failpoint), "{err:#}");
         assert_eq!(
             segment_digests(&parts)?,
@@ -886,9 +880,6 @@ fn ambiguity_key(row: &Value) -> (String, u64, String) {
 
 #[test]
 fn ambiguities_are_deduplicated_sorted_and_conflicts_rejected() -> Result<()> {
-    let _serial = FAILPOINT_GUARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = tempfile::tempdir()?;
     let input = tmp.path().join("ambiguities");
     let shared = ambiguity(
@@ -969,10 +960,11 @@ fn ambiguities_are_deduplicated_sorted_and_conflicts_rejected() -> Result<()> {
     // A crash at either commit boundary leaves the old output untouched,
     // and the resumed run reproduces it exactly.
     for failpoint in [FAILPOINT_BEFORE_RENAME, FAILPOINT_DURING_FINAL_ASSEMBLY] {
-        partition_commit::set_failpoint(Some(failpoint));
+        // Scoped to this test's directory, so parallel tests are unaffected.
+        let armed = partition_commit::arm_failpoint(failpoint, tmp.path());
         let err = aggregate_ambiguities(&input, &output, &limits(16 << 20), &identity(), false)
             .expect_err("armed failpoint must abort the run");
-        partition_commit::set_failpoint(None);
+        drop(armed);
         assert!(format!("{err:#}").contains(failpoint), "{err:#}");
         assert_eq!(fs::read(&output)?, first, "{failpoint} replaced the output");
         let (committed, staging) = aggregation_entries(&input)?;

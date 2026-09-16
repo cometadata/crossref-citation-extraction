@@ -392,7 +392,7 @@ fn write_output(fragment: Option<(PathBuf, u64)>, output: &Path) -> Result<u64> 
         .map_err(|e| e.into_error())?
         .sync_all()
         .with_context(|| format!("Failed to sync {}", tmp.display()))?;
-    hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY)?;
+    hit_failpoint(FAILPOINT_DURING_FINAL_ASSEMBLY, output)?;
     fs::rename(&tmp, output)
         .with_context(|| format!("Failed to move {} to {}", tmp.display(), output.display()))?;
     sync_parent(output)?;

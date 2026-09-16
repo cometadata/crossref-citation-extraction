@@ -1,15 +1,17 @@
 pub mod aggregator;
 pub mod ambiguity;
 pub mod checkpoint;
+pub mod datacite_aggregator;
 pub mod kway_merge;
 pub mod limits;
 pub mod partition_commit;
 pub mod partitioning;
 pub mod segmented_writer;
 
-pub use aggregator::{aggregate_and_validate, aggregate_datacite};
+pub use aggregator::aggregate_and_validate;
 pub use ambiguity::aggregate_ambiguities;
 pub use checkpoint::ExtractionCheckpoint;
+pub use datacite_aggregator::aggregate_datacite;
 pub use limits::{AggregationLimits, WriterLimits};
 pub use partition_commit::PartitionCommit;
 pub use partitioning::{hashed_partition_key, PartitionMode};
