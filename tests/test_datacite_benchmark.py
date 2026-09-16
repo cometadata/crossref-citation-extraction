@@ -14,8 +14,11 @@ import hashlib
 import io
 import itertools
 import json
+import os
+import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pyarrow as pa
@@ -28,8 +31,11 @@ from citations_pipeline.benchmark import (
     READINESS_LADDER,
     SETTINGS_KEYS,
     BenchmarkDependencies,
+    MeasuredRunner,
     MemoryReading,
+    PhaseMeter,
     ResourceWatermark,
+    _run_stress,
     compare_arxiv_projection,
     cost_estimate,
     create_synthetic_stress,
@@ -42,6 +48,8 @@ from citations_pipeline.benchmark import (
     run_benchmark,
     sample_crossref_archive,
     select_configuration,
+    timing_summary,
+    tree_bytes,
     write_production_settings,
 )
 from citations_pipeline.bucket import LocalBucketStore
@@ -50,18 +58,23 @@ from citations_pipeline.datacite_index import (
     BundleResult,
     DataciteRelease,
     discover_release,
+    ensure_bundle,
 )
 from citations_pipeline.datacite_publish import transform_datacite_outputs
+from citations_pipeline.datacite_smoke import SMOKE_RESOURCES
 from citations_pipeline.extractor import (
     ExtractionOutputs,
     ExtractorBinary,
     FullExtractionOutputs,
+    build_extractor,
+    run_datacite_extraction,
 )
 from citations_pipeline.full_state import ResourceSettings
 from citations_pipeline.mirror import ResolvedSnapshot
-from citations_pipeline.paths import DATACITE_PREFIX_NAME, PipelinePaths
+from citations_pipeline.paths import DATACITE_PREFIX_NAME, PipelinePaths, runtime_source_digest
 from citations_pipeline.pipeline import PipelineConfig
 from citations_pipeline.pipeline_io import PipelineError
+from citations_pipeline.state import utc_now
 from citations_pipeline.telemetry import EventLogger
 from test_full_pipeline import (
     RUN,
@@ -272,6 +285,105 @@ def test_cgroup_resident_excludes_page_cache_and_tracks_a_maximum(tmp_path):
     assert unavailable.memory_peak is None and unavailable.phase_memory_peak is None
 
 
+NODE_DISK = SimpleNamespace(total=2 * 10**12, used=987 * 10**9, free=13 * 10**9)
+
+
+def test_watermark_measures_the_owned_work_tree_not_the_node_filesystem(tmp_path, monkeypatch):
+    # The node's filesystem reports every tenant's files; only the trees the
+    # job owns may feed a disk projection.
+    monkeypatch.setattr("citations_pipeline.benchmark.shutil.disk_usage", lambda path: NODE_DISK)
+    work = tmp_path / "work"
+    (work / "snapshot").mkdir(parents=True)
+    (work / "snapshot" / "all.json.tar.gz").write_bytes(b"a" * 1000)
+    (work / "bundle").mkdir()
+    (work / "bundle" / "dois.fst").write_bytes(b"b" * 300)
+    (tmp_path / "elsewhere").mkdir()
+    (tmp_path / "elsewhere" / "other-tenant.bin").write_bytes(b"c" * 5000)
+    watermark = ResourceWatermark(work, interval=3600.0)
+    assert watermark.poll() == 1300
+    assert watermark.peak_owned == 1300
+    assert watermark.filesystem_used_peak == NODE_DISK.used
+    before = watermark.mark_phase(watch=work / "partitions")
+    (work / "partitions").mkdir()
+    (work / "partitions" / "segment_0000.parquet").write_bytes(b"d" * 700)
+    watermark.poll()
+    (work / "partitions" / "segment_0000.parquet").unlink()
+    after = watermark.poll()
+    assert (before, after) == (1300, 1300)
+    assert watermark.phase_peak_owned == 2000
+    assert watermark.watch_peak == 700
+    assert watermark.peak_owned == 2000
+    assert tree_bytes(work) == 1300
+
+
+def test_measured_runner_forwards_output_and_reports_its_own_child(capsys):
+    script = (
+        "print('2026-09-16 16:31:43 INFO  [x] event=phase phase=index_load status=completed "
+        "release=2026-07 elapsed_s=21.300')\n"
+        "print('event=phase phase=aggregation status=started partitions=256')\n"
+        "print('event=phase phase=aggregation status=completed valid=1 elapsed_s=0.250')\n"
+        "block = bytearray(64 * 1024 * 1024)\n"
+        "block[::4096] = b'x' * len(range(0, len(block), 4096))\n"
+    )
+    runner = MeasuredRunner()
+    result = runner([sys.executable, "-c", script])
+    assert result.returncode == 0
+    run = runner.runs[-1]
+    assert run.phase_seconds == {"index_load": 21.3, "aggregation": 0.25}
+    assert run.peak_rss_bytes >= 64 * 1024 * 1024
+    assert run.elapsed_seconds > 0
+    out = capsys.readouterr().out
+    assert "event=phase phase=index_load status=completed" in out
+    assert "phase=aggregation status=started" in out
+    failed = runner([sys.executable, "-c", "import sys; print('partial'); sys.exit(3)"])
+    assert failed.returncode == 3
+    assert runner.runs[-1].returncode == 3 and runner.runs[-1].phase_seconds == {}
+
+
+def test_phase_meter_growth_and_child_peaks_come_from_the_job_itself(tmp_path, monkeypatch):
+    monkeypatch.setattr("citations_pipeline.benchmark.shutil.disk_usage", lambda path: NODE_DISK)
+    work = tmp_path / "work"
+    (work / "bundle").mkdir(parents=True)
+    (work / "bundle" / "dois.fst").write_bytes(b"b" * 100)
+    lines: list[str] = []
+    unavailable = lambda: MemoryReading(None, "unavailable")  # noqa: E731
+    runner = MeasuredRunner()
+    watermark = ResourceWatermark(work, interval=3600.0, memory_sampler=unavailable)
+    meter = PhaseMeter(
+        EventLogger(output=lines.append), memory_probe=unavailable,
+        watermark=watermark, work_root=work, runner=runner,
+    )
+    with meter.phase("transform_sample", watch=work / "transform") as measured:
+        (work / "transform").mkdir()
+        (work / "transform" / "flat.parquet").write_bytes(b"x" * 4096)
+        runner([sys.executable, "-c", "print('event=phase phase=aggregation status=completed elapsed_s=0.5')"])
+    disk = measured["disk"]
+    assert disk["owned_before_bytes"] == 100
+    assert disk["owned_after_bytes"] == 4196
+    assert disk["phase_growth_bytes"] == 4096
+    assert disk["watched_tree_peak_bytes"] == 4096
+    # Reported for context only.
+    assert disk["filesystem_used_after_bytes"] == NODE_DISK.used
+    assert [child["phase_seconds"] for child in measured["children"]] == [{"aggregation": 0.5}]
+    assert measured["memory"]["child_peak_rss_bytes"] == measured["children"][0]["peak_rss_bytes"]
+    event = json.loads(lines[-1].removeprefix("PIPELINE_EVENT="))
+    assert event["event"] == "phase_measured" and event["phase_peak_owned_bytes"] == 4196
+
+
+def test_timing_summary_separates_per_run_fixed_costs():
+    child = SimpleNamespace(phase_seconds={"index_load": 21.3, "aggregation": 0.2})
+    summary = timing_summary(23.16, 8, child)
+    assert summary["index_load_seconds"] == 21.3
+    assert summary["aggregation_seconds"] == 0.2
+    assert summary["fixed_seconds"] == pytest.approx(21.5)
+    assert summary["variable_seconds"] == pytest.approx(1.66)
+    assert summary["variable_seconds_per_member"] == pytest.approx(1.66 / 8)
+    # A run that logged nothing keeps its whole duration variable; a fixed
+    # cost larger than the measured phase never goes negative.
+    assert timing_summary(10.0, 4, None)["variable_seconds_per_member"] == 2.5
+    assert timing_summary(1.0, 4, child)["variable_seconds"] == 0.0
+
+
 # --- extrapolation ----------------------------------------------------------------------
 
 
@@ -280,6 +392,12 @@ def measured_numbers() -> dict[str, Any]:
         "total_members": 1000,
         "sampled_members": 10,
         "window_seconds_per_member": [1.5, 2.0, 1.0],
+        # The same windows once each run's index load and aggregation are
+        # subtracted; the slowest variable cost is 1.5 s per member.
+        "window_variable_seconds_per_member": [1.0, 1.5, 0.5],
+        "index_load_seconds": 20.0,
+        "aggregation_seconds_max": 4.0,
+        "sample_aggregation_seconds": 0.1,
         # Three windows of differing density; the sample mean is 5 matches
         # and 10 raw bytes per member, the densest window 8 and 20.
         "window_confirmed_matches_per_member": [4.0, 8.0, 3.0],
@@ -305,15 +423,20 @@ def measured_numbers() -> dict[str, Any]:
         "transform_self_peak_bytes": 500,
         "extraction_budget_bytes": 1_200,
         "transform_budget_bytes": 600,
-        "cgroup_resident_peak_bytes": None,
+        "production_resident_peak_bytes": None,
+        "observed_peak_owned_bytes": 0,
     }
 
 
 def test_extrapolation_formulas_on_synthetic_numbers():
     result = extrapolate(measured_numbers())
     components = result["components_seconds"]
-    # Slowest representative window x total members.
-    assert components["extraction"] == pytest.approx(2.0 * 1000)
+    # Slowest representative window's variable cost x total members; the
+    # per-run fixed costs are paid once: the index load as measured, the
+    # aggregation from the sample scaled by rows (never below the slowest run).
+    assert components["extraction"] == pytest.approx(1.5 * 1000)
+    assert components["index_load"] == pytest.approx(20.0)
+    assert components["aggregation"] == pytest.approx(max(4.0, 0.1 * 160))
     # Rows and bytes follow the densest window (8 matches, 20 raw bytes per
     # member), not the sample mean (5 and 10): 160x rows, 200x bytes.
     assert result["densest_window_matches_per_member"] == 8.0
@@ -388,10 +511,57 @@ def test_extrapolation_follows_the_densest_window():
     assert extrapolate(empty)["row_ratio"] == pytest.approx(100.0)
 
 
-def test_extrapolation_uses_the_cgroup_resident_peak_when_larger():
+def test_extrapolation_uses_the_production_resident_peak_when_larger():
     numbers = measured_numbers()
-    numbers["cgroup_resident_peak_bytes"] = 9_000
+    numbers["production_resident_peak_bytes"] = 9_000
     assert extrapolate(numbers)["peak_memory_bytes"] == 9_000
+
+
+def test_fixed_costs_are_not_multiplied_by_total_members():
+    # Attempt 4's real windows: 8 members each, a cold 21.3 s index load in
+    # the first window and a warm 3.8 s one later, over 37,011 members.
+    numbers = measured_numbers()
+    windows = [
+        timing_summary(23.16, 8, SimpleNamespace(phase_seconds={"index_load": 21.3, "aggregation": 0.2})),
+        timing_summary(11.32, 8, SimpleNamespace(phase_seconds={"index_load": 3.8, "aggregation": 4.0})),
+    ]
+    numbers.update(
+        total_members=37_011,
+        window_seconds_per_member=[23.16 / 8, 11.32 / 8],
+        window_variable_seconds_per_member=[w["variable_seconds_per_member"] for w in windows],
+        index_load_seconds=21.3,
+        aggregation_seconds_max=4.0,
+    )
+    result = extrapolate(numbers)
+    components = result["components_seconds"]
+    slowest_variable = (11.32 - 3.8 - 4.0) / 8
+    assert components["extraction"] == pytest.approx(slowest_variable * 37_011)
+    assert components["index_load"] == pytest.approx(21.3)
+    # The old projection (slowest whole window x members) was ~30 h.
+    assert components["extraction"] < (23.16 / 8) * 37_011 / 5
+    # Raising a per-run fixed cost moves the total by that cost, not by
+    # that cost x members.
+    slower_load = extrapolate({**numbers, "index_load_seconds": 121.3})
+    assert slower_load["projected_total_seconds_point"] - result[
+        "projected_total_seconds_point"
+    ] == pytest.approx(100.0)
+    assert slower_load["components_seconds"]["extraction"] == components["extraction"]
+
+
+def test_memory_projection_ignores_legacy_and_build_peaks():
+    numbers = measured_numbers()
+    numbers["legacy_child_peak_bytes"] = 20 * 10**9
+    result = extrapolate(numbers)
+    assert result["peak_memory_bytes"] == pytest.approx(1500)
+    assert result["memory"]["legacy_bytes"] == 20 * 10**9
+
+
+def test_disk_projection_never_falls_below_the_observed_owned_peak():
+    numbers = measured_numbers()
+    numbers["observed_peak_owned_bytes"] = 10**9
+    result = extrapolate(numbers)
+    assert result["projected_peak_disk_bytes_point"] == 10**9
+    assert result["projected_peak_disk_bytes"] == pytest.approx(1.5 * 10**9)
 
 
 # --- readiness ladder and settings --------------------------------------------------------
@@ -590,6 +760,8 @@ def test_semantic_comparison_reports_pair_sets(tmp_path):
 
 
 ARCHIVE_MEMBERS = 24
+# Larger than every configured budget, so only a legacy leak could reach it.
+LEGACY_RESIDENT = 100 * 10**9
 
 
 def crossref_archive_bytes(count: int = ARCHIVE_MEMBERS) -> bytes:
@@ -644,6 +816,13 @@ class Case:
         )
         self.memory_readings = itertools.count(1_000_000, 1_000_000)
         self.resident_readings = itertools.count(500_000, 250_000)
+        # Set while a non-production child (the legacy index build) holds
+        # memory, so the report can prove it never reaches readiness.
+        self.resident_override: int | None = None
+        self.child_phase_lines = (
+            "event=phase phase=index_load status=completed release=2026-07 elapsed_s=2.000",
+            "event=phase phase=aggregation status=completed valid=2 elapsed_s=0.500",
+        )
 
     def deps(self) -> BenchmarkDependencies:
         def refuse(name: str):
@@ -666,7 +845,7 @@ class Case:
             run_legacy_extraction=self._run_legacy_extraction,
             list_hardware=lambda: [Hardware("cpu-basic", 0.000167), Hardware("cpu-upgrade", 0.0005), Hardware("cpu-xl", 1 / 60), Hardware("cpu-performance", 1.9 / 60)],
             memory_probe=lambda: MemoryReading(next(self.memory_readings), "cgroup-v2"),
-            resident_probe=lambda: MemoryReading(next(self.resident_readings), "cgroup-v2-stat"),
+            resident_probe=self._resident,
             prepare_dataset=refuse("prepare_dataset"),
             publish_pair=refuse("publish_pair"),
             publish_prepared=refuse("publish_prepared"),
@@ -680,6 +859,12 @@ class Case:
 
     def events(self) -> list[dict[str, Any]]:
         return [json.loads(line.removeprefix("PIPELINE_EVENT=")) for line in self.lines]
+
+    def _resident(self) -> MemoryReading:
+        reading = next(self.resident_readings)
+        if self.resident_override is not None:
+            reading = self.resident_override
+        return MemoryReading(reading, "cgroup-v2-stat")
 
     def _resolve_mirror(self, bucket_root: Path) -> ResolvedSnapshot:
         self.calls.append("resolve_mirror")
@@ -709,8 +894,13 @@ class Case:
         (temp_dir / "partitions" / "segment_0000.parquet").write_bytes(b"x" * 4096)
         with tarfile.open(archive, "r:gz") as tar:
             members = [m for m in tar.getmembers() if m.isreg()]
+        # The extractor logs its per-run fixed costs; the benchmark reads
+        # them through the measured runner.
+        script = "".join(f"print({line!r})\n" for line in self.child_phase_lines)
+        assert kwargs["runner"]([sys.executable, "-c", script]).returncode == 0
         names = {kind: output_dir / f"all.json_{kind}.jsonl" for kind in ("valid", "failed", "publisher", "crossref", "mined", "ambiguous_urls")}
-        records = fixture_records()
+        # The shared-URL stress archive confirms nothing by design.
+        records = [] if "shared-url" in archive.parts else fixture_records()
         write_jsonl(names["valid"], records)
         write_jsonl(names["failed"], [])
         for provenance in ("publisher", "crossref", "mined"):
@@ -737,14 +927,17 @@ class Case:
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         return FullExtractionOutputs(**names, report=report_path)
 
-    def _build_legacy_index(self, binary: ExtractorBinary, records: Path, output: Path) -> None:
+    def _build_legacy_index(self, binary: ExtractorBinary, records: Path, output: Path, **kwargs: Any) -> None:
         self.calls.append("build_legacy_index")
         assert records == self.release.root / "dois"
+        assert isinstance(kwargs["runner"], MeasuredRunner)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"fst")
+        self.resident_override = LEGACY_RESIDENT
 
     def _run_legacy_extraction(self, binary: ExtractorBinary, **kwargs: Any) -> ExtractionOutputs:
         self.calls.append("run_legacy_extraction")
+        self.resident_override = None
         assert kwargs["fst"].is_file()
         self.legacy_archives.append(kwargs["archive"])
         out: Path = kwargs["output_dir"]
@@ -758,7 +951,22 @@ class Case:
         return ExtractionOutputs(**paths)
 
 
-def test_run_benchmark_measures_reports_and_never_publishes(tmp_path):
+def write_legacy_fst_cache(case: Case, content: bytes, *, digest: str | None = None) -> Path:
+    cache = PipelinePaths.from_roots(case.mount, case.work).fst_prefix("2026-07")
+    cache.root.mkdir(parents=True)
+    cache.fst.write_bytes(content)
+    cache.marker.write_text(json.dumps({
+        "schema_version": 1, "fst_schema_version": 1, "datacite_release": "2026-07",
+        "fst_sha256": digest or hashlib.sha256(content).hexdigest(), "fst_size": len(content),
+        "extractor_version": "2.1.0", "completed_at": utc_now(),
+    }))
+    return cache.fst
+
+
+def test_run_benchmark_measures_reports_and_never_publishes(tmp_path, monkeypatch):
+    # The node filesystem claims to be almost full; only the job's own trees
+    # may decide readiness.
+    monkeypatch.setattr("citations_pipeline.benchmark.shutil.disk_usage", lambda path: NODE_DISK)
     case = Case(tmp_path)
     result = run_benchmark(case.config, case.deps())
 
@@ -815,18 +1023,49 @@ def test_run_benchmark_measures_reports_and_never_publishes(tmp_path):
         assert stress["extraction"]["elapsed_seconds"] >= 0
         assert stress["transform"]["elapsed_seconds"] >= 0
         assert stress["output_bytes"]["raw"] > 0
+    assert report["synthetic"]["high_degree"]["transform"]["confirmed_citations"] > 0
+    shared = report["synthetic"]["shared_url"]
+    assert shared["transform"]["confirmed_citations"] == 0
+    assert shared["transform"]["no_confirmed_citations"] is True
+    assert shared["transform"]["counts"]["datacite"]["all"] == {"works": 0, "citations": 0, "references": 0}
+    assert shared["output_bytes"]["derived"] == 0
     assert "high_degree" not in json.dumps(report["extrapolation"])
-    # The non-reclaimable high-water mark feeds the projection; memory.peak
-    # (page cache included) is reported for information only.
+    # The non-reclaimable high-water mark of the phases production runs
+    # feeds the projection; the legacy index build's resident memory and
+    # memory.peak (page cache included) are reported for information only.
     assert report["measurement"]["memory_source"] == "cgroup-v2-stat"
     assert report["measurement"]["memory_peak_source"] == "cgroup-v2"
-    resident = report["measurement"]["cgroup_resident_peak_bytes"]
-    assert resident >= 500_000
-    assert report["extrapolation"]["inputs"]["cgroup_resident_peak_bytes"] == resident
+    assert report["measurement"]["cgroup_resident_peak_bytes"] == LEGACY_RESIDENT
+    production_resident = report["extrapolation"]["inputs"]["production_resident_peak_bytes"]
+    assert production_resident == max(
+        phase["memory"]["cgroup_resident_peak_bytes"]
+        for name, phase in report["phases"].items()
+        if name in {"prepare_index", "source_transfer", "extract_sample", "transform_sample",
+                    "compress_outputs", "persist_sample_outputs"}
+        or name.startswith("extract_window_")
+    )
+    assert 500_000 <= production_resident < LEGACY_RESIDENT
+    assert report["phases"]["prepare_legacy_fst"]["memory"]["cgroup_resident_peak_bytes"] == LEGACY_RESIDENT
+    memory = report["extrapolation"]["memory"]
+    assert report["peak_memory_bytes"] == max(
+        memory["extraction_bytes"], memory["transform_bytes"], production_resident
+    )
+    assert report["peak_memory_bytes"] < LEGACY_RESIDENT
     assert "cgroup_peak_bytes" not in report["extrapolation"]["inputs"]
     assert report["measurement"]["cgroup_peak_bytes"] >= 1_000_000
-    assert report["extrapolation"]["memory"]["cgroup_resident_bytes"] == resident
-    assert report["phases"]["extract_sample"]["memory"]["cgroup_resident_peak_bytes"] >= 500_000
+    assert report["extrapolation"]["memory"]["production_resident_bytes"] == production_resident
+    # Per-run fixed costs come from the extractor's own phase log lines.
+    for window in report["extraction"]["windows"]:
+        assert window["index_load_seconds"] == 2.0
+        assert window["aggregation_seconds"] == 0.5
+        assert window["fixed_seconds"] == 2.5
+        assert window["child_peak_rss_bytes"] > 0
+    assert report["extrapolation"]["components_seconds"]["index_load"] == 2.0
+    # Disk comes from the job's own trees, never the node filesystem.
+    assert report["measurement"]["disk_source"] == "owned-tree-sizes"
+    assert report["measurement"]["filesystem_used_peak_bytes"] == NODE_DISK.used
+    assert report["projected_peak_disk_bytes"] < NODE_DISK.used
+    assert report["legacy"]["fst_source"] == "built"
     # Rows and bytes are projected from the densest window's per-member rates.
     windows = report["extraction"]["windows"]
     assert all(w["member_count"] == len(w["members"]) for w in windows)
@@ -840,10 +1079,9 @@ def test_run_benchmark_measures_reports_and_never_publishes(tmp_path):
         max(w["confirmed_matches_per_member"] for w in windows) * ARCHIVE_MEMBERS
     )
     assert isinstance(report["samples"]["doi_heavy"]["members"], list)
-    assert report["measurement"]["disk_source"] == "shutil.disk_usage+tree"
     assert set(report["phases"]) >= {
         "prepare_index", "source_transfer", "sample_archive", "extract_window_00",
-        "extract_sample", "build_legacy_fst", "extract_legacy", "transform_sample",
+        "extract_sample", "prepare_legacy_fst", "extract_legacy", "transform_sample",
         "compress_outputs", "persist_sample_outputs",
     }
     assert report["phases"]["extract_sample"]["memory"]["children_maxrss_after_bytes"] >= 0
@@ -866,6 +1104,76 @@ def test_run_benchmark_measures_reports_and_never_publishes(tmp_path):
     assert not (case.paths.prefix / "_PIPELINE_COMPLETE.json").exists()
     assert not (case.paths.prefix / "_EXTRACTION_COMPLETE.json").exists()
     assert TOKEN not in json.dumps(report) and TOKEN not in "".join(case.lines)
+
+
+def test_run_benchmark_reuses_a_verified_legacy_fst_from_the_arxiv_cache(tmp_path):
+    case = Case(tmp_path)
+    cached = write_legacy_fst_cache(case, b"cached-legacy-fst")
+    result = run_benchmark(case.config, case.deps())
+    assert result["status"] == "benchmark-ready"
+    assert "build_legacy_index" not in case.calls
+    report = json.loads(Path(result["report_path"]).read_text())
+    assert report["legacy"]["fst_source"] == "cache"
+    assert report["legacy"]["fst_sha256"] == hashlib.sha256(b"cached-legacy-fst").hexdigest()
+    assert "legacy_fst_prepared" in [e["event"] for e in case.events()]
+    # Read-only: the arXiv-owned cache is exactly as it was.
+    assert cached.read_bytes() == b"cached-legacy-fst"
+
+
+def test_run_benchmark_builds_the_legacy_fst_when_no_cache_verifies(tmp_path):
+    case = Case(tmp_path)
+    cached = write_legacy_fst_cache(case, b"cached-legacy-fst", digest="0" * 64)
+    result = run_benchmark(case.config, case.deps())
+    assert case.calls.count("build_legacy_index") == 1
+    report = json.loads(Path(result["report_path"]).read_text())
+    assert report["legacy"]["fst_source"] == "built"
+    # Nothing is written back to the arXiv-owned cache.
+    assert cached.read_bytes() == b"cached-legacy-fst"
+    assert json.loads((cached.parent / "_FST_COMPLETE.json").read_text())["fst_sha256"] == "0" * 64
+
+
+def test_shared_url_stress_case_records_zero_citations_with_the_real_extractor(tmp_path):
+    root = Path(__file__).resolve().parents[1]
+    lines: list[str] = []
+    events = EventLogger(output=lines.append)
+    target = Path(os.environ.get("CARGO_TARGET_DIR") or tmp_path / "cargo-target")
+    binary = build_extractor(root, target, events)
+    work = tmp_path / "work"
+    config = PipelineConfig(
+        source_root=root, source_digest=runtime_source_digest(root), work_root=work,
+        bucket_root=tmp_path / "mnt", smoke=False, force=False, datacite_release=None,
+        hf_token=TOKEN, crossref_token=None, run_id=RUN, mode="benchmark",
+        resources=SMOKE_RESOURCES,
+    )
+    deps = BenchmarkDependencies(
+        events=events, api_factory=None, store_factory=None, resolve_mirror=None,
+        fallback_transfer=None, build_extractor=None, discover_release=discover_release,
+        ensure_bundle=ensure_bundle, run_extraction=run_datacite_extraction,
+        transform=transform_datacite_outputs, build_legacy_index=None,
+        run_legacy_extraction=None, list_hardware=None,
+        memory_probe=lambda: MemoryReading(None, "unavailable"), prepare_dataset=None,
+        publish_pair=None, publish_prepared=None, verify_current=None,
+    )
+    runner = MeasuredRunner()
+    watermark = ResourceWatermark(work, interval=3600.0)
+    meter = PhaseMeter(
+        events, memory_probe=deps.memory_probe, watermark=watermark, work_root=work, runner=runner
+    )
+    cases = create_synthetic_stress(tmp_path / "synthetic", degree=12)
+    result = _run_stress(config, deps, binary, meter, runner, cases["shared_url"], tmp_path / "synthetic")
+    stats = result["extraction"]["stats"]
+    assert stats["confirmed_matches"] == 0
+    assert stats["ambiguous_urls"] == 12
+    assert result["transform"]["confirmed_citations"] == 0
+    assert result["transform"]["no_confirmed_citations"] is True
+    for kind in ("datacite", "arxiv"):
+        for config_name in ("all", "asserted", "mined"):
+            assert result["transform"]["counts"][kind][config_name] == {
+                "works": 0, "citations": 0, "references": 0,
+            }
+    assert result["transform"]["counts"]["ambiguous_urls"] == 12
+    assert result["extraction"]["index_load_seconds"] is not None
+    assert result["extraction"]["aggregation_seconds"] is not None
 
 
 def test_run_benchmark_withholds_settings_for_a_tiny_source(tmp_path):

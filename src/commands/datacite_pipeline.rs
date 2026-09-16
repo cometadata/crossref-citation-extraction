@@ -222,14 +222,15 @@ pub fn run_datacite_pipeline(args: &PipelineArgs) -> Result<()> {
     let input_size = input_size_bytes(&input)?;
 
     info!("event=phase phase=index_load status=started bundle={bundle_dir}");
+    let index_started = Instant::now();
     let index = DataciteIndex::load(Path::new(bundle_dir))
         .with_context(|| format!("loading DataCite index bundle {bundle_dir}"))?;
     info!(
         "event=phase phase=index_load status=completed release={} bundle_manifest_sha256={} \
-         elapsed_s={:.1}",
+         elapsed_s={:.3}",
         index.manifest().release,
         index.manifest_sha256(),
-        started.elapsed().as_secs_f64()
+        index_started.elapsed().as_secs_f64()
     );
     let (identity, identity_sha256) = resolve_identity(args, &cfg, &index, input_size)?;
     info!(
@@ -332,6 +333,7 @@ pub fn run_datacite_pipeline(args: &PipelineArgs) -> Result<()> {
          merge_fan_in={} sort_workers={}",
         cfg.partitions, limits.memory_bytes, limits.merge_fan_in, limits.sort_workers
     );
+    let aggregation_started = Instant::now();
     let aggregation = aggregate_datacite(
         &ws.partitions,
         &index,
@@ -350,14 +352,16 @@ pub fn run_datacite_pipeline(args: &PipelineArgs) -> Result<()> {
     )?;
     info!(
         "event=phase phase=aggregation status=completed valid={} failed={} citations={} \
-         publisher={} crossref={} mined={} ambiguity_rows={ambiguity_rows} reused_partitions={}",
+         publisher={} crossref={} mined={} ambiguity_rows={ambiguity_rows} reused_partitions={} \
+         elapsed_s={:.3}",
         aggregation.valid_count,
         aggregation.failed_count,
         aggregation.total_citations,
         aggregation.publisher_citations,
         aggregation.crossref_citations,
         aggregation.mined_citations,
-        aggregation.reused_partitions
+        aggregation.reused_partitions,
+        aggregation_started.elapsed().as_secs_f64()
     );
 
     let report = ExtractionReport {

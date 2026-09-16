@@ -1405,6 +1405,13 @@ def _emit_built(
     )
 
 
+class NoConfirmedCitationsError(PublishError):
+    """The valid extractor output holds no confirmed citation, so there is
+    nothing to publish. Production treats it as a failure; the benchmark's
+    shared-URL stress case, which confirms nothing by design, records a
+    zero-citation transform instead."""
+
+
 def transform_datacite_outputs(
     valid_path: Path,
     ambiguous_path: Path,
@@ -1424,7 +1431,7 @@ def transform_datacite_outputs(
     with events.phase("flatten_valid_output"):
         flattened = flatten_valid_jsonl(valid_path, references_staging)
     if flattened.rows == 0:
-        raise PublishError("no confirmed citations to publish")
+        raise NoConfirmedCitationsError("no confirmed citations to publish")
     with events.phase("flatten_ambiguous_urls"):
         ambiguity = flatten_ambiguous_jsonl(ambiguous_path, ambiguity_staging)
 

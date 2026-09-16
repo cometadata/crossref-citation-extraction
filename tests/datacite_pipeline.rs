@@ -429,6 +429,21 @@ fn many_matches_in_one_member_flow_through_bounded_batches() -> Result<()> {
     ] {
         ensure!(log.contains(needle), "missing {needle:?} in:\n{log}");
     }
+    // The benchmark subtracts the per-run fixed costs from each window, so
+    // index loading and aggregation report their own durations.
+    for phase in ["index_load", "aggregation"] {
+        let prefix = format!("event=phase phase={phase} status=completed ");
+        let line = log
+            .lines()
+            .find(|line| line.contains(&prefix))
+            .with_context(|| format!("missing {prefix:?} in:\n{log}"))?;
+        let seconds: f64 = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("elapsed_s="))
+            .with_context(|| format!("no elapsed_s in {line:?}"))?
+            .parse()?;
+        ensure!(seconds >= 0.0, "negative duration in {line:?}");
+    }
     assert!(!tmp.path().join("parts").exists(), "intermediates removed");
     Ok(())
 }

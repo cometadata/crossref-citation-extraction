@@ -7,19 +7,26 @@ publishes a dataset. It stages the real Crossref snapshot once, streams it
 to select a strided-window sample of whole members (recording the members,
 the traversal count and the decompression time), extracts every window and
 the whole sample with the full DataCite bundle, runs the legacy arXiv
-extraction on the same sample for a semantic comparison, transforms,
+extraction on the same sample for a semantic comparison (reusing the legacy
+pipeline's verified arXiv FST cache when one matches the release), transforms,
 compresses and persists the sample outputs, runs two synthetic stress
 archives (a high-degree target and a shared landing page), and extrapolates
-a complete run from the slowest representative window plus the measured
-fixed costs. The extrapolation, the readiness ladder and the pricing feed
-`benchmark-report.json`; `production-settings.json` is written only for the
-first configuration with the required headroom, and only when the sample is
-representative and the semantic comparison holds.
+a complete run from the slowest representative window's variable cost plus
+the per-run fixed costs paid once. The extrapolation, the readiness ladder
+and the pricing feed `benchmark-report.json`; `production-settings.json` is
+written only for the first configuration with the required headroom, and
+only when the sample is representative and the semantic comparison holds.
 
-Memory comes from the job's cgroup counters when they exist and always from
-`resource.getrusage` around each child process; disk from a sampler thread
-over `shutil.disk_usage` plus explicit tree sizing at phase boundaries.
-Nothing is ever inferred from serialized output size alone.
+Every extractor child runs through `MeasuredRunner`, which forwards its log,
+reads the index-load and aggregation durations it reports, and reads that
+child's own peak resident set size from `os.wait4`. Memory readiness uses
+those child peaks and the cgroup non-reclaimable high-water mark of the
+phases production runs; the legacy comparison, the synthetic stress cases
+and the Rust build are reported but never feed readiness. Disk is the summed
+size of the trees the job owns under the work root, sampled by a thread and
+at phase boundaries; `shutil.disk_usage` describes the node's shared
+filesystem and is recorded for context only. Nothing is ever inferred from
+serialized output size alone.
 """
 
 from __future__ import annotations
@@ -31,8 +38,10 @@ import io
 import json
 import math
 import os
+import re
 import resource
 import shutil
+import subprocess
 import sys
 import tarfile
 import threading
@@ -45,8 +54,10 @@ from typing import Any, NamedTuple
 
 import pyarrow.parquet as pq
 
+from .arxiv_index import DataciteRelease as LegacyRelease
+from .arxiv_index import ensure_fst
 from .datacite_index import BundleResult, DataciteRelease, discover_release
-from .datacite_publish import DatasetTransform
+from .datacite_publish import DatasetTransform, NoConfirmedCitationsError
 from .extractor import (
     FULL_OUTPUT_KINDS,
     ExtractionReport,
@@ -71,7 +82,7 @@ from .full_pipeline import (
     verify_source,
 )
 from .full_state import ResourceSettings, RunIdentity
-from .paths import ARCHIVE_NAME, DATACITE_PREFIX_NAME, PipelinePaths
+from .paths import ARCHIVE_NAME, CONFIG_NAMES, DATACITE_PREFIX_NAME, PipelinePaths
 from .pipeline import PipelineConfig
 from .pipeline_io import PipelineError, compress_file
 from .state import sha256_file, utc_now, write_atomic_json
@@ -142,7 +153,25 @@ READINESS_LADDER = (
 # CPU-bound phases scale conservatively with the vCPU ratio (16 -> 32 is
 # 0.6, not 0.5); memory and disk never scale.
 CPU_SCALE = {("cpu-xl", "cpu-performance"): 0.6, ("cpu-performance", "cpu-xl"): 2.0}
-CPU_BOUND_COMPONENTS = ("index_preparation", "extraction", "transform", "compression")
+CPU_BOUND_COMPONENTS = (
+    "index_preparation",
+    "extraction",
+    "aggregation",
+    "transform",
+    "compression",
+)
+# The phases a production run also executes. Their memory feeds readiness;
+# the benchmark-only phases (sampling, the legacy comparison, the synthetic
+# stress cases) are reported but never do.
+PRODUCTION_PHASES = (
+    "prepare_index",
+    "source_transfer",
+    "extract_sample",
+    "transform_sample",
+    "compress_outputs",
+    "persist_sample_outputs",
+)
+WINDOW_PHASE_PREFIX = "extract_window_"
 TIME_UNCERTAINTY = 0.25
 DISK_UNCERTAINTY = 1.5
 GROUP_SCALE = 1.5
@@ -423,44 +452,170 @@ def rusage_self_bytes() -> int:
     return maxrss_to_bytes(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
 
 
+def is_production_phase(name: str) -> bool:
+    return name in PRODUCTION_PHASES or name.startswith(WINDOW_PHASE_PREFIX)
+
+
 def tree_bytes(root: Path) -> int:
-    """Explicit `du`-style size of every regular file under `root`."""
+    """Explicit `du`-style size of every regular file under `root` (symlinks
+    are not followed). Files that disappear during the walk are skipped."""
     total = 0
-    if not root.exists():
-        return 0
-    for path in root.rglob("*"):
+    pending = [root]
+    while pending:
+        directory = pending.pop()
         try:
-            if path.is_file() and not path.is_symlink():
-                total += path.stat().st_size
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
         except OSError:
             continue
     return total
 
 
+def _filesystem_used(path: Path) -> int | None:
+    try:
+        return shutil.disk_usage(path).used
+    except OSError:
+        return None
+
+
+# The extractor's phase completion lines, e.g.
+# `event=phase phase=index_load status=completed ... elapsed_s=3.812`.
+_PHASE_COMPLETED = re.compile(
+    r"event=phase phase=(?P<phase>\w+) status=completed\b.*?"
+    r"\belapsed_s=(?P<seconds>\d+(?:\.\d+)?)"
+)
+
+
+@dataclass(frozen=True)
+class ChildRun:
+    """One extractor invocation: its subcommand, exit status, wall time, its
+    own peak resident set size, and the phase durations it logged."""
+
+    command: str
+    returncode: int
+    elapsed_seconds: float
+    peak_rss_bytes: int | None
+    phase_seconds: dict[str, float]
+
+
+class MeasuredRunner:
+    """A `subprocess.run` stand-in for the extractor invocations.
+
+    The child's stdout is forwarded line by line (the job log keeps every
+    extractor event) and scanned for `event=phase ... status=completed ...
+    elapsed_s=` lines. The child is reaped with `os.wait4`, whose rusage
+    describes that process alone, so a phase's memory is the memory of the
+    process production runs rather than `RUSAGE_CHILDREN`'s running maximum
+    over every child ever started (the Rust build, the legacy index build).
+    """
+
+    def __init__(self, output: Any | None = None) -> None:
+        self._output = output
+        self.runs: list[ChildRun] = []
+
+    def __call__(
+        self, arguments: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess:
+        output = self._output if self._output is not None else sys.stdout
+        phases: dict[str, float] = {}
+        started = time.perf_counter()
+        process = subprocess.Popen(
+            arguments,
+            stdout=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            **kwargs,
+        )
+        assert process.stdout is not None
+        try:
+            for line in process.stdout:
+                output.write(line)
+                output.flush()
+                match = _PHASE_COMPLETED.search(line)
+                if match is not None:
+                    phases[match.group("phase")] = float(match.group("seconds"))
+        except BaseException:
+            process.kill()
+            raise
+        finally:
+            process.stdout.close()
+            _pid, status, usage = os.wait4(process.pid, 0)
+            process.returncode = os.waitstatus_to_exitcode(status)
+        run = ChildRun(
+            command=arguments[1] if len(arguments) > 1 else Path(arguments[0]).name,
+            returncode=process.returncode,
+            elapsed_seconds=time.perf_counter() - started,
+            peak_rss_bytes=maxrss_to_bytes(usage.ru_maxrss) if usage.ru_maxrss else None,
+            phase_seconds=phases,
+        )
+        self.runs.append(run)
+        return subprocess.CompletedProcess(arguments, process.returncode)
+
+
+def timing_summary(
+    elapsed_seconds: float, members: int, child: Any | None
+) -> dict[str, Any]:
+    """Split one extraction run into the per-run fixed costs the extractor
+    logged (index load, aggregation) and the variable remainder.
+
+    A run that logged neither keeps its whole duration variable, which only
+    overstates the per-member cost."""
+    phases = getattr(child, "phase_seconds", None) or {}
+    index_load = phases.get("index_load")
+    aggregation = phases.get("aggregation")
+    fixed = (index_load or 0.0) + (aggregation or 0.0)
+    variable = max(elapsed_seconds - fixed, 0.0)
+    return {
+        "index_load_seconds": index_load,
+        "aggregation_seconds": aggregation,
+        "fixed_seconds": fixed,
+        "variable_seconds": variable,
+        "variable_seconds_per_member": variable / max(members, 1),
+    }
+
+
 class ResourceWatermark:
-    """A sampler thread polling every `interval` seconds: the work volume's
-    usage (run-wide and per-phase high-water marks, plus an optional watched
-    tree) and, through `memory_sampler`, the cgroup's non-reclaimable memory,
-    kept as a high-water mark over samples (run-wide and per phase)."""
+    """A sampler thread polling every `interval` seconds: the job's own disk
+    usage, the summed size of the trees it owns (`owned_roots`, by default
+    the work root that holds the staged archive, the bundle copy, the
+    partition and temp directories, the outputs and the transform scratch),
+    as run-wide and per-phase high-water marks plus an optional watched tree;
+    and, through `memory_sampler`, the cgroup's non-reclaimable memory, kept
+    as a high-water mark over samples (run-wide and per phase).
+
+    `shutil.disk_usage` describes the node's shared filesystem, other
+    tenants included; it is recorded for context and never feeds readiness.
+    The owned roots must not nest."""
 
     def __init__(
         self,
         work_root: Path,
         *,
+        owned_roots: Iterable[Path] | None = None,
         interval: float = 1.0,
         memory_sampler: Callable[[], MemoryReading] | None = None,
     ) -> None:
         self.work_root = work_root
+        self.owned_roots = tuple(owned_roots) if owned_roots is not None else (work_root,)
         self.interval = interval
         self.memory_sampler = memory_sampler
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._watch: Path | None = None
-        self.baseline_used = 0
-        self.peak_used = 0
-        self.phase_peak_used = 0
+        self.baseline_owned = 0
+        self.peak_owned = 0
+        self.phase_peak_owned = 0
         self.watch_peak = 0
+        self.filesystem_used: int | None = None
+        self.filesystem_used_peak: int | None = None
         self.samples = 0
         self.memory_peak: int | None = None
         self.phase_memory_peak: int | None = None
@@ -468,7 +623,7 @@ class ResourceWatermark:
 
     def start(self) -> None:
         self.work_root.mkdir(parents=True, exist_ok=True)
-        self.baseline_used = self._used()
+        self.baseline_owned = self.owned_bytes()
         self.poll()
         self._thread = threading.Thread(
             target=self._run, name="resource-watermark", daemon=True
@@ -482,36 +637,41 @@ class ResourceWatermark:
             self._thread = None
         self.poll()
 
-    def _used(self) -> int:
-        return shutil.disk_usage(self.work_root).used
+    def owned_bytes(self) -> int:
+        return sum(tree_bytes(root) for root in self.owned_roots)
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             self.poll()
 
     def poll(self) -> int:
-        used = self._used()
+        """Sample once; returns the owned bytes right now."""
+        owned = self.owned_bytes()
         watch = self._watch
         watched = tree_bytes(watch) if watch is not None else 0
+        filesystem = _filesystem_used(self.work_root)
         memory = self.memory_sampler() if self.memory_sampler is not None else None
         with self._lock:
             self.samples += 1
-            self.peak_used = max(self.peak_used, used)
-            self.phase_peak_used = max(self.phase_peak_used, used)
+            self.peak_owned = max(self.peak_owned, owned)
+            self.phase_peak_owned = max(self.phase_peak_owned, owned)
             self.watch_peak = max(self.watch_peak, watched)
+            if filesystem is not None:
+                self.filesystem_used = filesystem
+                self.filesystem_used_peak = max(self.filesystem_used_peak or 0, filesystem)
             if memory is not None and memory.peak_bytes is not None:
                 self.memory_source = memory.source
                 self.memory_peak = max(self.memory_peak or 0, memory.peak_bytes)
                 self.phase_memory_peak = max(
                     self.phase_memory_peak or 0, memory.peak_bytes
                 )
-        return used
+        return owned
 
     def mark_phase(self, watch: Path | None = None) -> int:
         with self._lock:
             self._watch = watch
             self.watch_peak = 0
-            self.phase_peak_used = 0
+            self.phase_peak_owned = 0
             self.phase_memory_peak = None
         return self.poll()
 
@@ -521,9 +681,12 @@ class ResourceWatermark:
 
 
 class PhaseMeter:
-    """Wraps `events.phase` and records wall-clock, `getrusage` deltas for
-    children and self, the cgroup peak (informational, page cache included),
-    the cgroup non-reclaimable high-water mark, and the disk marks per phase."""
+    """Wraps `events.phase` and records per phase: wall-clock; the peak
+    resident set size and logged phase durations of every extractor child
+    `runner` ran during the phase; the cgroup non-reclaimable high-water mark;
+    the owned-tree disk marks; and, for context only, `getrusage` running
+    maxima, the cgroup peak (page cache included) and the node filesystem's
+    usage."""
 
     def __init__(
         self,
@@ -532,11 +695,13 @@ class PhaseMeter:
         memory_probe: Callable[[], MemoryReading],
         watermark: ResourceWatermark,
         work_root: Path,
+        runner: MeasuredRunner | None = None,
     ) -> None:
         self.events = events
         self.memory_probe = memory_probe
         self.disk = watermark
         self.work_root = work_root
+        self.runner = runner
         self.phases: dict[str, dict[str, Any]] = {}
         self.memory_source = "rusage"
 
@@ -544,25 +709,32 @@ class PhaseMeter:
     def phase(
         self, name: str, *, watch: Path | None = None
     ) -> Iterator[dict[str, Any]]:
-        used_before = self.disk.mark_phase(watch)
+        filesystem_before = _filesystem_used(self.work_root)
+        owned_before = self.disk.mark_phase(watch)
         children_before = rusage_children_bytes()
         cgroup_before = self.memory_probe()
+        runs_before = len(self.runner.runs) if self.runner is not None else 0
         record: dict[str, Any] = {}
         started = time.perf_counter()
         with self.events.phase(name):
             yield record
         elapsed = time.perf_counter() - started
-        used_after = self.disk.poll()
+        owned_after = self.disk.poll()
         self.disk.unwatch()
         children_after = rusage_children_bytes()
         cgroup_after = self.memory_probe()
         resident_peak = self.disk.phase_memory_peak
         if resident_peak is not None:
             self.memory_source = self.disk.memory_source
+        children = self.runner.runs[runs_before:] if self.runner is not None else []
+        child_peaks = [run.peak_rss_bytes for run in children if run.peak_rss_bytes]
         record.update(
             {
                 "elapsed_seconds": elapsed,
+                "production_phase": is_production_phase(name),
+                "children": [asdict(run) for run in children],
                 "memory": {
+                    "child_peak_rss_bytes": max(child_peaks) if child_peaks else None,
                     "children_maxrss_before_bytes": children_before,
                     "children_maxrss_after_bytes": children_after,
                     "children_maxrss_delta_bytes": children_after - children_before,
@@ -574,14 +746,15 @@ class PhaseMeter:
                     "cgroup_resident_source": self.disk.memory_source,
                 },
                 "disk": {
-                    "used_before_bytes": used_before,
-                    "used_after_bytes": used_after,
-                    "phase_peak_used_bytes": self.disk.phase_peak_used,
+                    "owned_before_bytes": owned_before,
+                    "owned_after_bytes": owned_after,
+                    "phase_peak_owned_bytes": self.disk.phase_peak_owned,
                     "phase_growth_bytes": max(
-                        self.disk.phase_peak_used - used_before, 0
+                        self.disk.phase_peak_owned - owned_before, 0
                     ),
                     "watched_tree_peak_bytes": self.disk.watch_peak if watch else None,
-                    "work_tree_bytes_after": tree_bytes(self.work_root),
+                    "filesystem_used_before_bytes": filesystem_before,
+                    "filesystem_used_after_bytes": _filesystem_used(self.work_root),
                 },
             }
         )
@@ -590,10 +763,10 @@ class PhaseMeter:
             "phase_measured",
             phase=name,
             elapsed_seconds=round(elapsed, 3),
-            children_maxrss_after_bytes=children_after,
+            child_peak_rss_bytes=record["memory"]["child_peak_rss_bytes"],
             cgroup_peak_after_bytes=cgroup_after.peak_bytes,
             cgroup_resident_peak_bytes=resident_peak,
-            phase_peak_used_bytes=self.disk.phase_peak_used,
+            phase_peak_owned_bytes=self.disk.phase_peak_owned,
         )
 
 
@@ -622,16 +795,26 @@ def transform_budget_bytes(resources: ResourceSettings) -> int:
 
 def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
     """Project a complete run from the measured numbers, printing every
-    formula. Time comes from the slowest representative window; matched rows
-    and output bytes from the densest representative window (per-member
-    rates x total members), so every scaled term follows the worst window
-    rather than the sample mean; memory takes the measured child peaks
-    scaled for larger cited-work groups, never below the configured
-    budgets."""
+    formula.
+
+    Extraction time is the slowest representative window's variable cost
+    per member (its duration minus the index load and aggregation that
+    extractor run logged) x total members; each window run pays those fixed
+    costs once, and so does the full run: the index load as the slowest
+    measured load, the aggregation as the sample's aggregation scaled by the
+    row ratio, never below the slowest measured aggregation. Matched rows and
+    output bytes follow the densest representative window (per-member rates
+    x total members), so every scaled term follows the worst window rather
+    than the sample mean. Memory takes the extractor children's own peaks
+    scaled for larger cited-work groups, never below the configured budgets,
+    and the cgroup non-reclaimable high-water mark of the phases production
+    runs; the legacy comparison and the Rust build never count. Disk comes
+    from the trees the job owns, never the node's filesystem."""
     total = numbers["total_members"]
     sampled = max(numbers["sampled_members"], 1)
     member_scale = total / sampled
     slowest = max(numbers["window_seconds_per_member"] or [0.0])
+    slowest_variable = max(numbers["window_variable_seconds_per_member"] or [0.0])
     sample_matches = numbers["sample_confirmed_matches"]
     sample_raw = numbers["raw_output_bytes"]
     # Densest-window rates; the sample mean is the floor when a run had no
@@ -656,10 +839,16 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         publication = derived_projected / (persisted / persistence_seconds)
     else:
         publication = persistence_projected
+    aggregation = max(
+        float(numbers["aggregation_seconds_max"]),
+        numbers["sample_aggregation_seconds"] * row_ratio,
+    )
     components = {
         "source_transfer": float(numbers["source_transfer_seconds"]),
         "index_preparation": float(numbers["index_preparation_seconds"]),
-        "extraction": slowest * total,
+        "extraction": slowest_variable * total,
+        "index_load": float(numbers["index_load_seconds"]),
+        "aggregation": aggregation,
         "transform": numbers["transform_seconds"] * row_ratio,
         "compression": numbers["compression_seconds"] * byte_ratio,
         "persistence": persistence_projected,
@@ -684,7 +873,8 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         + derived_projected
         + numbers["compressed_output_bytes"] * byte_ratio
     )
-    disk_point = max(before, after)
+    observed = float(numbers["observed_peak_owned_bytes"])
+    disk_point = max(before, after, observed)
 
     extraction_memory = max(
         numbers["extraction_child_peak_bytes"] * GROUP_SCALE,
@@ -694,18 +884,27 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         numbers["transform_self_peak_bytes"] * GROUP_SCALE,
         numbers["transform_budget_bytes"],
     )
-    candidates = [
-        extraction_memory,
-        transform_memory,
-        float(numbers["legacy_child_peak_bytes"]),
-    ]
-    cgroup = numbers.get("cgroup_resident_peak_bytes")
-    if cgroup is not None:
-        candidates.append(float(cgroup))
+    candidates = [extraction_memory, transform_memory]
+    resident = numbers.get("production_resident_peak_bytes")
+    if resident is not None:
+        candidates.append(float(resident))
     peak_memory = max(candidates)
 
     formulas = {
-        "extraction": "slowest representative window seconds per member x total members",
+        "extraction": (
+            "slowest representative window variable seconds per member x total "
+            "members, where a window's variable seconds are its measured duration "
+            "minus the index load and aggregation seconds its extractor run logged "
+            "(never negative)"
+        ),
+        "index_load": (
+            "slowest index load any benchmark extraction logged, paid once by the "
+            "full run (never multiplied by members)"
+        ),
+        "aggregation": (
+            "max(slowest aggregation any benchmark extraction logged, sample "
+            "aggregation seconds x row ratio), paid once by the full run"
+        ),
         "member_scale": "total members / sampled members (informational)",
         "projected_confirmed_matches": (
             "max over representative windows of (confirmed matches / members) "
@@ -717,8 +916,8 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         ),
         "row_ratio": (
             "projected confirmed matches / sample confirmed matches; scales the "
-            "row-driven terms (transform seconds, ambiguity rows); member scale "
-            "when the sample matched nothing"
+            "row-driven terms (aggregation, transform seconds, ambiguity rows); "
+            "member scale when the sample matched nothing"
         ),
         "byte_ratio": (
             "projected raw output bytes / sample raw output bytes; scales every "
@@ -740,17 +939,21 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
             "low band = sum x (1 - TIME_UNCERTAINTY)"
         ),
         "disk": (
-            "before release = fixed work tree + staged archive + segments + "
+            "sizes of the trees the job owns under the work root, never the node "
+            "filesystem: before release = fixed work tree + staged archive + segments + "
             "AGGREGATION_TEMP_FACTOR x segments + raw outputs; after release = fixed work "
             "tree + raw outputs + transform scratch + derived + compressed outputs; "
             "segments = max(observed temp peak, raw output bytes) x byte ratio; every "
-            "output term scales by byte ratio; peak = max(before, after) x DISK_UNCERTAINTY"
+            "output term scales by byte ratio; peak = max(before, after, observed "
+            "owned-tree high-water mark) x DISK_UNCERTAINTY"
         ),
         "memory": (
             "max(extraction child peak x GROUP_SCALE, configured extraction budget), "
             "max(transform self peak x GROUP_SCALE, DuckDB limit x (1 + PYARROW_HEADROOM)), "
-            "legacy child peak, cgroup non-reclaimable high-water mark (anon + kernel, "
-            "page cache excluded); the largest wins"
+            "cgroup non-reclaimable high-water mark (anon + kernel, page cache excluded) "
+            "of the phases production runs; the largest wins. Child peaks are each "
+            "extractor process's own ru_maxrss (os.wait4); the Rust build, the legacy "
+            "index build and extraction, and the synthetic stress cases are excluded"
         ),
     }
     return {
@@ -761,6 +964,7 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         "densest_window_matches_per_member": matches_per_member,
         "densest_window_raw_bytes_per_member": raw_per_member,
         "slowest_window_seconds_per_member": slowest,
+        "slowest_window_variable_seconds_per_member": slowest_variable,
         "projected_confirmed_matches": projected_matches,
         "projected_raw_output_bytes": projected_raw,
         "projected_ambiguous_urls": projected_ambiguous,
@@ -774,14 +978,15 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
             "derived_bytes": derived_projected,
             "before_release_bytes": before,
             "after_release_bytes": after,
+            "observed_peak_owned_bytes": observed,
         },
         "projected_peak_disk_bytes_point": disk_point,
         "projected_peak_disk_bytes": disk_point * DISK_UNCERTAINTY,
         "memory": {
             "extraction_bytes": extraction_memory,
             "transform_bytes": transform_memory,
-            "legacy_bytes": numbers["legacy_child_peak_bytes"],
-            "cgroup_resident_bytes": cgroup,
+            "production_resident_bytes": resident,
+            "legacy_bytes": numbers.get("legacy_child_peak_bytes"),
         },
         "peak_memory_bytes": peak_memory,
         "uncertainty": {
@@ -1190,9 +1395,10 @@ def compare_arxiv_projection(
 class BenchmarkDependencies:
     """`FullDependencies` plus the legacy path, pricing and the memory probes
     (`memory_probe` reads the cgroup peak for information; `resident_probe`
-    reads the non-reclaimable footprint the watermark thread samples). The
-    publication callables are present only so the full-pipeline phases
-    duck-type; the benchmark never calls them."""
+    reads the non-reclaimable footprint the watermark thread samples).
+    `ensure_legacy_fst` is the legacy pipeline's verified FST cache, used
+    read-only. The publication callables are present only so the
+    full-pipeline phases duck-type; the benchmark never calls them."""
 
     events: Any
     api_factory: Callable[..., Any]
@@ -1213,6 +1419,7 @@ class BenchmarkDependencies:
     publish_prepared: Callable[..., Any]
     verify_current: Callable[..., Any]
     resident_probe: Callable[[], MemoryReading] = read_cgroup_resident
+    ensure_legacy_fst: Callable[..., Any] = ensure_fst
     stride: int = DEFAULT_STRIDE
     window: int = DEFAULT_WINDOW
     synthetic_degree: int = SYNTHETIC_DEGREE
@@ -1262,6 +1469,7 @@ class ExtractionRun:
     identity: RunIdentity
     outputs: FullExtractionOutputs
     report: ExtractionReport
+    child: ChildRun | None
 
 
 def check_benchmark_config(config: PipelineConfig) -> None:
@@ -1303,6 +1511,7 @@ def _extract(
     config: PipelineConfig,
     deps: BenchmarkDependencies,
     binary: ExtractorBinary,
+    runner: MeasuredRunner,
     *,
     label: str,
     archive: Path,
@@ -1315,6 +1524,7 @@ def _extract(
     )
     identity_path = run_dir / "run-identity.json"
     write_atomic_json(identity_path, identity.to_dict())
+    runs_before = len(runner.runs)
     outputs = deps.run_extraction(
         binary,
         archive=archive,
@@ -1324,7 +1534,9 @@ def _extract(
         temp_dir=run_dir / "temp",
         resources=config.resources,
         events=deps.events,
+        runner=runner,
     )
+    child = runner.runs[-1] if len(runner.runs) > runs_before else None
     report = load_extraction_report(
         outputs.report, identity_sha256=identity.fingerprint()
     )
@@ -1335,7 +1547,9 @@ def _extract(
         stats=report.stats,
         aggregation=report.aggregation,
     )
-    return ExtractionRun(label=label, identity=identity, outputs=outputs, report=report)
+    return ExtractionRun(
+        label=label, identity=identity, outputs=outputs, report=report, child=child
+    )
 
 
 def _raw_output_bytes(outputs: FullExtractionOutputs) -> int:
@@ -1358,6 +1572,8 @@ def _run_summary(
         "member_count": members,
         "elapsed_seconds": elapsed,
         "seconds_per_member": elapsed / max(members, 1),
+        **timing_summary(elapsed, members, run.child),
+        "child_peak_rss_bytes": run.child.peak_rss_bytes if run.child else None,
         "confirmed_matches_per_member": stats["confirmed_matches"] / max(members, 1),
         "raw_bytes_per_member": raw_bytes / max(members, 1),
         "references_per_second": _rate(references, elapsed),
@@ -1392,16 +1608,30 @@ def _copy_transform_files(transforms: dict[str, DatasetTransform], local: Path) 
             shutil.copyfile(path, target)
 
 
+def _zero_counts(ambiguous_urls: int) -> dict[str, Any]:
+    empty = {"works": 0, "citations": 0, "references": 0}
+    counts: dict[str, Any] = {
+        kind: {name: dict(empty) for name in CONFIG_NAMES} for kind in PUBLICATION_KINDS
+    }
+    counts["ambiguous_urls"] = ambiguous_urls
+    return counts
+
+
 def _run_stress(
     config: PipelineConfig,
     deps: BenchmarkDependencies,
     binary: ExtractorBinary,
     meter: PhaseMeter,
+    runner: MeasuredRunner,
     case: SyntheticCase,
     root: Path,
 ) -> dict[str, Any]:
     """Extract and transform one synthetic archive with its own locally
-    verified bundle; reported under `synthetic` only."""
+    verified bundle; reported under `synthetic` only.
+
+    The shared-URL case confirms nothing by design, so its transform has no
+    citations to publish: that is recorded as a zero-citation transform,
+    with the extraction's measurements and ambiguity counts intact."""
     events = deps.events
     work = root / case.name
     release = discover_release(case.release_root.parent, None)
@@ -1432,6 +1662,7 @@ def _run_stress(
             config,
             deps,
             binary,
+            runner,
             label=f"synthetic_{case.name}",
             archive=case.archive,
             release=release,
@@ -1439,15 +1670,29 @@ def _run_stress(
             run_dir=run_dir,
         )
     extraction = _run_summary(run, measured, members)
+    transforms: dict[str, DatasetTransform] | None
     with meter.phase(f"synthetic_{case.name}_transform") as measured:
-        transforms = deps.transform(
-            run.outputs.valid,
-            run.outputs.ambiguous_urls,
-            work / "transform",
-            events,
-            config.resources,
+        try:
+            transforms = deps.transform(
+                run.outputs.valid,
+                run.outputs.ambiguous_urls,
+                work / "transform",
+                events,
+                config.resources,
+            )
+        except NoConfirmedCitationsError:
+            transforms = None
+    if transforms is None:
+        counts = _zero_counts(run.report.stats["ambiguous_urls"])
+        derived = 0
+        events.emit(
+            "synthetic_transform_empty",
+            case=case.name,
+            ambiguous_urls=counts["ambiguous_urls"],
         )
-    derived = sum(sum(t.sizes.values()) for t in transforms.values())
+    else:
+        counts = counts_from_transforms(transforms)
+        derived = sum(sum(t.sizes.values()) for t in transforms.values())
     return {
         "degree": case.degree,
         "target": case.target,
@@ -1460,7 +1705,9 @@ def _run_stress(
             "self_maxrss_after_bytes": measured["memory"]["self_maxrss_after_bytes"],
             "cgroup_peak_after_bytes": measured["memory"]["cgroup_peak_after_bytes"],
             "disk_growth_bytes": measured["disk"]["phase_growth_bytes"],
-            "counts": counts_from_transforms(transforms),
+            "no_confirmed_citations": transforms is None,
+            "confirmed_citations": counts["datacite"]["all"]["references"],
+            "counts": counts,
         },
         "output_bytes": {"raw": extraction["raw_output_bytes"], "derived": derived},
     }
@@ -1491,13 +1738,22 @@ def run_benchmark(
     store = deps.store_factory(
         api=api, token=config.hf_token, mount_root=config.bucket_root
     )
-    disk = ResourceWatermark(config.work_root, memory_sampler=deps.resident_probe)
+    # Everything the job writes lives under the work root: the staged
+    # archive, the bundle copy, the Rust build, and every run's partitions,
+    # outputs and transform scratch.
+    disk = ResourceWatermark(
+        config.work_root,
+        owned_roots=(config.work_root,),
+        memory_sampler=deps.resident_probe,
+    )
     disk.start()
+    runner = MeasuredRunner()
     meter = PhaseMeter(
         events,
         memory_probe=deps.memory_probe,
         watermark=disk,
         work_root=config.work_root,
+        runner=runner,
     )
 
     def progress(payload: dict[str, object]) -> None:
@@ -1551,6 +1807,7 @@ def run_benchmark(
                     config,
                     deps,
                     binary,
+                    runner,
                     label=label,
                     archive=Path(record["archive"]),
                     release=release,
@@ -1566,6 +1823,7 @@ def run_benchmark(
                 config,
                 deps,
                 binary,
+                runner,
                 label="sample",
                 archive=sample_archive,
                 release=release,
@@ -1574,9 +1832,33 @@ def run_benchmark(
             )
         sample_summary = _run_summary(sample, measured, sampling["selected_members"])
 
-        fst = root / "legacy" / "arxiv.fst"
-        with meter.phase("build_legacy_fst") as fst_measured:
-            deps.build_legacy_index(binary, release.root / "dois", fst)
+        # The legacy pipeline caches its verified arXiv FST under its own
+        # prefix; reuse it read-only (no store) and build only when no cached
+        # FST verifies for this release.
+        legacy_paths = PipelinePaths.from_roots(config.bucket_root, root / "legacy")
+        with meter.phase("prepare_legacy_fst") as fst_measured:
+            legacy_fst = deps.ensure_legacy_fst(
+                paths=legacy_paths,
+                release=LegacyRelease(
+                    release=release.release, dois_path=release.root / "dois"
+                ),
+                build_index=lambda records, output: deps.build_legacy_index(
+                    binary, records, output, runner=runner
+                ),
+                extractor_version=binary.version,
+                store=None,
+                events=events,
+                force=False,
+            )
+        fst = legacy_fst.local_path
+        fst_source = "cache" if legacy_fst.reused else "built"
+        events.emit(
+            "legacy_fst_prepared",
+            source=fst_source,
+            release=legacy_fst.release,
+            sha256=legacy_fst.sha256,
+            size=legacy_fst.size,
+        )
         with meter.phase("extract_legacy") as legacy_measured:
             legacy = deps.run_legacy_extraction(
                 binary,
@@ -1585,8 +1867,11 @@ def run_benchmark(
                 output_dir=root / "legacy" / "outputs",
                 temp_dir=root / "legacy" / "temp",
                 events=events,
+                runner=runner,
             )
-        with meter.phase("transform_sample") as transform_measured:
+        with meter.phase(
+            "transform_sample", watch=root / "sample" / "transform"
+        ) as transform_measured:
             transforms = deps.transform(
                 sample.outputs.valid,
                 sample.outputs.ambiguous_urls,
@@ -1617,7 +1902,9 @@ def run_benchmark(
             root / "synthetic", degree=deps.synthetic_degree
         )
         synthetic = {
-            name: _run_stress(config, deps, binary, meter, case, root / "synthetic")
+            name: _run_stress(
+                config, deps, binary, meter, runner, case, root / "synthetic"
+            )
             for name, case in cases.items()
         }
 
@@ -1629,14 +1916,41 @@ def run_benchmark(
             for p in phases.values()
             if p["memory"]["cgroup_peak_after_bytes"] is not None
         ]
-        extraction_peak = max(
-            [w["children_maxrss_after_bytes"] for w in windows]
-            + [sample_summary["children_maxrss_after_bytes"]]
-        )
+        production_residents = [
+            p["memory"]["cgroup_resident_peak_bytes"]
+            for name, p in phases.items()
+            if is_production_phase(name)
+            and p["memory"]["cgroup_resident_peak_bytes"] is not None
+        ]
+        runs = [*windows, sample_summary]
+        extraction_peaks = [
+            run["child_peak_rss_bytes"] for run in runs if run["child_peak_rss_bytes"]
+        ]
+        index_loads = [
+            run["index_load_seconds"]
+            for run in runs
+            if run["index_load_seconds"] is not None
+        ]
+        aggregations = [
+            run["aggregation_seconds"]
+            for run in runs
+            if run["aggregation_seconds"] is not None
+        ]
+        legacy_peaks = [
+            peak
+            for measured in (fst_measured, legacy_measured)
+            if (peak := measured["memory"]["child_peak_rss_bytes"]) is not None
+        ]
         numbers = {
             "total_members": sampling["total_members"],
             "sampled_members": sampling["selected_members"],
             "window_seconds_per_member": [w["seconds_per_member"] for w in windows],
+            "window_variable_seconds_per_member": [
+                w["variable_seconds_per_member"] for w in windows
+            ],
+            "index_load_seconds": max(index_loads, default=0.0),
+            "aggregation_seconds_max": max(aggregations, default=0.0),
+            "sample_aggregation_seconds": sample_summary["aggregation_seconds"] or 0.0,
             "window_confirmed_matches_per_member": [
                 w["confirmed_matches_per_member"] for w in windows
             ],
@@ -1657,14 +1971,15 @@ def run_benchmark(
                 sample_summary["disk_growth_bytes"],
             ),
             "raw_output_bytes": sample_summary["raw_output_bytes"],
-            "transform_scratch_bytes": transform_measured["disk"]["phase_growth_bytes"],
+            "transform_scratch_bytes": max(
+                transform_measured["disk"]["watched_tree_peak_bytes"] or 0,
+                transform_measured["disk"]["phase_growth_bytes"],
+            ),
             "derived_bytes": derived_bytes,
             "compressed_output_bytes": compressed_bytes,
-            "extraction_child_peak_bytes": extraction_peak,
-            "legacy_child_peak_bytes": max(
-                fst_measured["memory"]["children_maxrss_after_bytes"],
-                legacy_measured["memory"]["children_maxrss_after_bytes"],
-            ),
+            "observed_peak_owned_bytes": disk.peak_owned,
+            "extraction_child_peak_bytes": max(extraction_peaks, default=0),
+            "legacy_child_peak_bytes": max(legacy_peaks, default=None),
             "transform_self_peak_bytes": transform_measured["memory"][
                 "self_maxrss_after_bytes"
             ],
@@ -1672,7 +1987,7 @@ def run_benchmark(
                 config.resources, bundle_bytes, workers
             ),
             "transform_budget_bytes": transform_budget_bytes(config.resources),
-            "cgroup_resident_peak_bytes": disk.memory_peak,
+            "production_resident_peak_bytes": max(production_residents, default=None),
         }
         extrapolation = extrapolate(numbers)
         pricing = fetch_pricing(deps.list_hardware)
@@ -1722,7 +2037,7 @@ def run_benchmark(
                 "extraction_workers": workers,
                 "memory_total_bytes": _physical_memory_bytes(),
                 "disk_total_bytes": shutil.disk_usage(config.work_root).total,
-                "disk_baseline_used_bytes": disk.baseline_used,
+                "disk_baseline_owned_bytes": disk.baseline_owned,
             },
             "sampling": sampling,
             "samples": {
@@ -1737,14 +2052,16 @@ def run_benchmark(
             },
             "extraction": {"sample": sample_summary, "windows": windows},
             "legacy": {
-                "fst_build_seconds": fst_measured["elapsed_seconds"],
-                "fst_bytes": fst.stat().st_size if fst.is_file() else 0,
+                "fst_source": fst_source,
+                "fst_reused": legacy_fst.reused,
+                "fst_prepare_seconds": fst_measured["elapsed_seconds"],
+                "fst_sha256": legacy_fst.sha256,
+                "fst_bytes": legacy_fst.size,
                 "extraction_seconds": legacy_measured["elapsed_seconds"],
                 "pairs": semantic["legacy_pairs"],
                 "works": semantic["legacy_works"],
-                "children_maxrss_after_bytes": legacy_measured["memory"][
-                    "children_maxrss_after_bytes"
-                ],
+                "child_peak_rss_bytes": numbers["legacy_child_peak_bytes"],
+                "note": "reported only; never feeds readiness",
             },
             "semantic": semantic,
             "transform": {
@@ -1765,6 +2082,15 @@ def run_benchmark(
             "measurement": {
                 "memory_source": meter.memory_source,
                 "cgroup_resident_peak_bytes": disk.memory_peak,
+                "production_resident_peak_bytes": numbers[
+                    "production_resident_peak_bytes"
+                ],
+                "resident_note": (
+                    "cgroup_resident_peak_bytes is the run-wide high-water mark, "
+                    "including the Rust build and the legacy index build, and is "
+                    "informational; readiness uses the phases production runs and "
+                    "each extractor child's own peak"
+                ),
                 "memory_peak_source": (
                     meter.phases["extract_sample"]["memory"]["cgroup_source"]
                 ),
@@ -1772,15 +2098,21 @@ def run_benchmark(
                 "cgroup_peak_note": (
                     "memory.peak counts file-backed page cache and is reported for "
                     "information only; peak_memory_bytes uses the non-reclaimable "
-                    "high-water mark and the getrusage peaks"
+                    "high-water mark and the child peaks"
                 ),
                 "rusage_unit": "bytes"
                 if sys.platform.startswith("darwin")
                 else "kibibytes",
-                "disk_source": "shutil.disk_usage+tree",
+                "disk_source": "owned-tree-sizes",
+                "owned_roots": [str(root_path) for root_path in disk.owned_roots],
                 "sample_interval_seconds": disk.interval,
                 "samples": disk.samples,
-                "disk_peak_used_bytes": disk.peak_used,
+                "disk_peak_owned_bytes": disk.peak_owned,
+                "filesystem_used_peak_bytes": disk.filesystem_used_peak,
+                "filesystem_note": (
+                    "shutil.disk_usage reports the node's shared filesystem, other "
+                    "tenants included; context only, never a readiness input"
+                ),
             },
             "extrapolation": extrapolation,
             "components_seconds": extrapolation["components_seconds"],
