@@ -15,7 +15,12 @@
 //! listed file, hashing the compressed bytes as they are decoded, and fails
 //! unless each file's size and digest match the manifest. Nothing here falls
 //! back to partial coverage: a missing state report, an unlisted or unexpected
-//! file, truncated gzip, a malformed record, or an invalid DOI is an error.
+//! file, truncated gzip, a malformed record, an unknown state, or a record
+//! whose two valid identifiers disagree is an error. The one tolerated data
+//! defect is a DOI that is not syntactically valid (the registry spells a
+//! handful with whitespace inside the suffix): such a row or record is
+//! counted in [`SourceStats::invalid_dois`] and skipped whole, never
+//! repaired, so it can neither be matched nor stop the build.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -80,16 +85,24 @@ pub struct SourceFile {
     pub sha256: String,
 }
 
-/// Counts from a completed scan. URL counts cover metadata records only;
+/// Counts from a completed scan. The record counts cover emitted records
+/// only; a row or record skipped for an invalid DOI is counted once in
+/// `invalid_dois` and nowhere else. URL counts cover metadata records only;
 /// state-report rows carry no landing page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SourceStats {
+    /// Metadata records emitted with a valid DOI.
     pub metadata_records: u64,
+    /// State-report rows emitted with a valid DOI.
     pub csv_records: u64,
     /// Metadata records whose `attributes.url` is missing or null.
     pub missing_urls: u64,
     /// Metadata records whose `attributes.url` is neither string nor null.
     pub invalid_urls: u64,
+    /// State-report rows and metadata records skipped because their DOI
+    /// (`doi` column, `id`, or `attributes.doi`) is not syntactically valid.
+    /// Each occurrence counts, so one DOI listed in both sources counts twice.
+    pub invalid_dois: u64,
 }
 
 /// A validated DataCite monthly data file.
@@ -203,7 +216,9 @@ impl MonthlyRelease {
     /// so a caller that receives `Err` must discard everything it was
     /// handed. Metadata lines go through [`decode_metadata_record`];
     /// state-report rows must carry the documented header and a `findable`
-    /// or `registered` state.
+    /// or `registered` state. A row or record whose DOI is not valid is
+    /// counted in [`SourceStats::invalid_dois`] and skipped without being
+    /// emitted; the file is still verified in full.
     pub fn scan(&self, emit: &mut dyn FnMut(RegistryRecord) -> Result<()>) -> Result<SourceStats> {
         let mut stats = SourceStats::default();
         for file in &self.files {
@@ -220,12 +235,13 @@ impl MonthlyRelease {
         }
         info!(
             "DataCite release {}: {} metadata records, {} state-report rows, \
-             {} missing URLs, {} invalid URLs",
+             {} missing URLs, {} invalid URLs, {} invalid DOIs skipped",
             self.release,
             stats.metadata_records,
             stats.csv_records,
             stats.missing_urls,
-            stats.invalid_urls
+            stats.invalid_urls,
+            stats.invalid_dois
         );
         Ok(stats)
     }
@@ -553,15 +569,26 @@ fn scan_metadata(
         if text.trim().is_empty() {
             continue;
         }
-        let record =
+        let decoded =
             decode_metadata_record(text).with_context(|| format!("{}:{number}", path.display()))?;
-        stats.metadata_records += 1;
-        if record.url_invalid {
-            stats.invalid_urls += 1;
-        } else if record.url.is_none() {
-            stats.missing_urls += 1;
+        match decoded {
+            MetadataRecord::Valid(record) => {
+                stats.metadata_records += 1;
+                if record.url_invalid {
+                    stats.invalid_urls += 1;
+                } else if record.url.is_none() {
+                    stats.missing_urls += 1;
+                }
+                emit(record)?;
+            }
+            MetadataRecord::InvalidDoi { field, value } => {
+                stats.invalid_dois += 1;
+                debug!(
+                    "{}:{number}: skipping record with invalid DOI in {field}: {value:?}",
+                    path.display()
+                );
+            }
         }
-        emit(record)?;
     }
     Ok(lines.into_inner())
 }
@@ -601,8 +628,14 @@ fn scan_state_report(
             "{}:{line}: state {state:?} is neither findable nor registered",
             path.display()
         );
-        let doi = normalize_doi(doi)
-            .with_context(|| format!("{}:{line}: invalid DOI {doi:?}", path.display()))?;
+        let Some(doi) = normalize_doi(doi) else {
+            stats.invalid_dois += 1;
+            debug!(
+                "{}:{line}: skipping row with invalid DOI {doi:?}",
+                path.display()
+            );
+            continue;
+        };
         stats.csv_records += 1;
         emit(RegistryRecord {
             doi,
@@ -646,15 +679,35 @@ struct Attributes<'a> {
     url: Option<&'a RawValue>,
 }
 
-/// Decode one JSONL metadata line into its registry record.
+/// The outcome of decoding one well-formed metadata line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataRecord {
+    /// A record whose identifier is a valid DOI.
+    Valid(RegistryRecord),
+    /// A record whose `id` or `attributes.doi` is present but not a valid
+    /// DOI. The caller counts it and skips the record whole: the other
+    /// identifier field is not consulted, whitespace is not repaired, and
+    /// the landing page is not indexed.
+    InvalidDoi {
+        /// `"id"` or `"attributes.doi"`, whichever failed first.
+        field: &'static str,
+        /// The offending value exactly as written.
+        value: String,
+    },
+}
+
+/// Decode one JSONL metadata line.
 ///
 /// Accepts unwrapped `id`/`attributes` records and singleton `data`
 /// wrappers, and id-only rows. Every DOI is canonicalized with
-/// [`normalize_doi`]; a record whose `id` and `attributes.doi` disagree after
-/// normalization, or whose DOI is invalid, is an error rather than a skipped
-/// row. A missing or null `attributes.url` yields `url: None`; any other
-/// non-string value sets `url_invalid` and keeps the DOI.
-pub fn decode_metadata_record(line: &str) -> Result<RegistryRecord> {
+/// [`normalize_doi`]. Malformed JSON, a non-object or non-singleton `data`
+/// value, a non-string identifier, a record with neither `id` nor
+/// `attributes.doi`, and two valid identifiers that disagree after
+/// normalization are errors. A present identifier that is not a valid DOI
+/// yields [`MetadataRecord::InvalidDoi`] instead, for the caller to count
+/// and skip. A missing or null `attributes.url` yields `url: None`; any
+/// other non-string value sets `url_invalid` and keeps the DOI.
+pub fn decode_metadata_record(line: &str) -> Result<MetadataRecord> {
     let envelope: Envelope = serde_json::from_str(line).context("malformed JSON record")?;
     let record = match envelope.data {
         Some(data) => {
@@ -675,17 +728,32 @@ pub fn decode_metadata_record(line: &str) -> Result<RegistryRecord> {
         None => (None, None),
     };
 
-    let from_id = record
-        .id
-        .as_deref()
-        .map(|id| normalize_doi(id).with_context(|| format!("invalid DOI in id: {id:?}")))
-        .transpose()?;
-    let from_attributes = attribute_doi
-        .as_deref()
-        .map(|doi| {
-            normalize_doi(doi).with_context(|| format!("invalid DOI in attributes.doi: {doi:?}"))
-        })
-        .transpose()?;
+    // Validate each present identifier on its own before comparing them: an
+    // invalid value is a skip, never a fallback to the other field.
+    let mut from_id = None;
+    if let Some(id) = record.id.as_deref() {
+        match normalize_doi(id) {
+            Some(doi) => from_id = Some(doi),
+            None => {
+                return Ok(MetadataRecord::InvalidDoi {
+                    field: "id",
+                    value: id.to_string(),
+                })
+            }
+        }
+    }
+    let mut from_attributes = None;
+    if let Some(doi) = attribute_doi.as_deref() {
+        match normalize_doi(doi) {
+            Some(normalized) => from_attributes = Some(normalized),
+            None => {
+                return Ok(MetadataRecord::InvalidDoi {
+                    field: "attributes.doi",
+                    value: doi.to_string(),
+                })
+            }
+        }
+    }
     let doi = match (from_id, from_attributes) {
         (Some(id), Some(attribute)) => {
             ensure!(
@@ -708,10 +776,10 @@ pub fn decode_metadata_record(line: &str) -> Result<RegistryRecord> {
         },
     };
 
-    Ok(RegistryRecord {
+    Ok(MetadataRecord::Valid(RegistryRecord {
         doi,
         url,
         url_invalid,
         source: RecordSource::Metadata,
-    })
+    }))
 }

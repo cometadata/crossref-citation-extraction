@@ -1,7 +1,8 @@
 use std::fs;
 
 use crossref_citation_extraction::input::datacite_release::{
-    decode_metadata_record, MonthlyRelease, RecordSource, RegistryRecord, SourceStats,
+    decode_metadata_record, MetadataRecord, MonthlyRelease, RecordSource, RegistryRecord,
+    SourceStats,
 };
 use serde_json::json;
 
@@ -12,14 +13,34 @@ use support::{
     write_manifest_json, write_release, write_status, MONTH,
 };
 
+/// Decode a line that must yield a record with a valid DOI.
+fn decode_valid(line: &str) -> RegistryRecord {
+    match decode_metadata_record(line).unwrap() {
+        MetadataRecord::Valid(record) => record,
+        other => panic!("{line}: expected a valid record, got {other:?}"),
+    }
+}
+
+/// Decode a line that must be skipped for an invalid DOI; returns the
+/// offending field and its raw value.
+fn decode_invalid(line: &str) -> (&'static str, String) {
+    match decode_metadata_record(line).unwrap() {
+        MetadataRecord::InvalidDoi { field, value } => (field, value),
+        other => panic!("{line}: expected an invalid-DOI skip, got {other:?}"),
+    }
+}
+
 #[test]
 fn accepts_singleton_and_rejects_conflicting_dois() {
-    let row = decode_metadata_record(r#"{"data":{"id":"10.1234/A","attributes":{"doi":"10.1234/a","url":"https://example.org/a"}}}"#).unwrap();
+    let row = decode_valid(
+        r#"{"data":{"id":"10.1234/A","attributes":{"doi":"10.1234/a","url":"https://example.org/a"}}}"#,
+    );
     assert_eq!(row.doi, "10.1234/a");
     assert_eq!(row.url.as_deref(), Some("https://example.org/a"));
-    assert!(
-        decode_metadata_record(r#"{"id":"10.1234/a","attributes":{"doi":"10.1234/b"}}"#).is_err()
-    );
+    // Two valid identifiers that disagree after normalization stay fatal.
+    let err = decode_metadata_record(r#"{"id":"10.1234/a","attributes":{"doi":"10.1234/b"}}"#)
+        .unwrap_err();
+    assert!(error_text(&err).contains("conflicting"), "{err:#}");
 }
 
 #[test]
@@ -51,7 +72,7 @@ fn decodes_id_only_rows_with_missing_url() {
         r#"{"id":"10.1234/a","attributes":{"url":null}}"#,
         r#"{"data":{"id":"10.1234/a","attributes":{"doi":null,"url":null}}}"#,
     ] {
-        let row = decode_metadata_record(line).unwrap();
+        let row = decode_valid(line);
         assert_eq!(row.doi, "10.1234/a", "{line}");
         assert_eq!(row.url, None, "{line}");
         assert!(!row.url_invalid, "{line}");
@@ -67,7 +88,7 @@ fn flags_non_string_urls_without_dropping_the_doi() {
         r#"{"id":"10.1234/a","attributes":{"url":{"href":"https://example.org"}}}"#,
         r#"{"id":"10.1234/a","attributes":{"url":["https://example.org"]}}"#,
     ] {
-        let row = decode_metadata_record(line).unwrap();
+        let row = decode_valid(line);
         assert_eq!(row.doi, "10.1234/a", "{line}");
         assert_eq!(row.url, None, "{line}");
         assert!(row.url_invalid, "{line}");
@@ -76,36 +97,58 @@ fn flags_non_string_urls_without_dropping_the_doi() {
 
 #[test]
 fn keeps_url_strings_verbatim_and_decodes_json_escapes() {
-    let row = decode_metadata_record(
-        r#"{"id":"10.1234/a","attributes":{"url":" HTTPS://Example.org/A?b=1 "}}"#,
-    )
-    .unwrap();
+    let row =
+        decode_valid(r#"{"id":"10.1234/a","attributes":{"url":" HTTPS://Example.org/A?b=1 "}}"#);
     assert_eq!(row.url.as_deref(), Some(" HTTPS://Example.org/A?b=1 "));
 
-    let row = decode_metadata_record(
-        r#"{"id":"10.1234/café","attributes":{"url":"https:\/\/example.org\/café"}}"#,
-    )
-    .unwrap();
+    let row =
+        decode_valid(r#"{"id":"10.1234/café","attributes":{"url":"https:\/\/example.org\/café"}}"#);
     assert_eq!(row.doi, "10.1234/café");
     assert_eq!(row.url.as_deref(), Some("https://example.org/café"));
 }
 
 #[test]
-fn normalizes_record_dois_and_rejects_invalid_ones() {
-    let row = decode_metadata_record(
-        r#"{"id":"https://doi.org/10.1234/AbC","attributes":{"doi":"10.1234/abc"}}"#,
-    )
-    .unwrap();
+fn normalizes_record_dois_and_skips_invalid_ones() {
+    let row =
+        decode_valid(r#"{"id":"https://doi.org/10.1234/AbC","attributes":{"doi":"10.1234/abc"}}"#);
     assert_eq!(row.doi, "10.1234/abc");
-    let row = decode_metadata_record(r#"{"attributes":{"doi":"10.1234/attr-only"}}"#).unwrap();
+    let row = decode_valid(r#"{"attributes":{"doi":"10.1234/attr-only"}}"#);
     assert_eq!(row.doi, "10.1234/attr-only");
 
-    let err = decode_metadata_record(r#"{"id":"not a doi"}"#).unwrap_err();
-    assert!(format!("{err:#}").contains("not a doi"), "{err:#}");
+    // An invalid identifier is reported for skipping, never repaired and
+    // never replaced by the other field.
+    assert_eq!(
+        decode_invalid(r#"{"id":"not a doi"}"#),
+        ("id", "not a doi".to_string())
+    );
+    assert_eq!(decode_invalid(r#"{"id":""}"#), ("id", String::new()));
+    assert_eq!(
+        decode_invalid(r#"{"id":"10.1234/a","attributes":{"doi":"nope"}}"#),
+        ("attributes.doi", "nope".to_string())
+    );
+    assert_eq!(
+        decode_invalid(r#"{"id":"nope","attributes":{"doi":"10.1234/a"}}"#),
+        ("id", "nope".to_string())
+    );
+    // The real 2012-10 shape: whitespace inside the registered suffix in
+    // both fields, while the landing page spells the DOI without it.
+    assert_eq!(
+        decode_invalid(
+            r#"{"id":"10.3929/ethz-a- 000142255","attributes":{"doi":"10.3929/ethz-a- 000142255","url":"http://dx.doi.org/10.3929/ethz-a-000142255"}}"#
+        ),
+        ("id", "10.3929/ethz-a- 000142255".to_string())
+    );
+    assert_eq!(
+        decode_invalid(r#"{"data":{"attributes":{"doi":"10.18454/\u00a0pmi.2016.5.712"}}}"#),
+        (
+            "attributes.doi",
+            "10.18454/\u{a0}pmi.2016.5.712".to_string()
+        )
+    );
+
+    // Structural problems stay fatal: a non-string id, or no identifier.
     for line in [
-        r#"{"id":""}"#,
         r#"{"id":42}"#,
-        r#"{"id":"10.1234/a","attributes":{"doi":"nope"}}"#,
         r#"{"attributes":{"url":"https://example.org/no-doi"}}"#,
     ] {
         assert!(decode_metadata_record(line).is_err(), "{line}");
@@ -555,6 +598,7 @@ fn scan_counts_records_and_url_states() -> anyhow::Result<()> {
             csv_records: 2,
             missing_urls: 2,
             invalid_urls: 1,
+            invalid_dois: 0,
         }
     );
     // The state report sorts before the part, and its rows never carry URLs.
@@ -589,7 +633,7 @@ fn scan_counts_records_and_url_states() -> anyhow::Result<()> {
 }
 
 #[test]
-fn scan_reports_malformed_json_and_invalid_dois_with_path_and_line() -> anyhow::Result<()> {
+fn scan_reports_malformed_json_and_conflicting_dois_with_path_and_line() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let empty_csv = gzip(&state_csv(&[]));
     let jsonl = b"{\"id\":\"10.1234/a\"}\n\n{not json\n".to_vec();
@@ -604,7 +648,10 @@ fn scan_reports_malformed_json_and_invalid_dois_with_path_and_line() -> anyhow::
     let err = scan_all(&MonthlyRelease::open(tmp.path())?).unwrap_err();
     assert!(error_text(&err).contains("part_0000.jsonl.gz:3"), "{err:#}");
 
-    let jsonl = metadata_jsonl(&[json!({"id":"10.1234/a"}), json!({"id":"not a doi"})]);
+    let jsonl = metadata_jsonl(&[
+        json!({"id":"10.1234/a"}),
+        json!({"id":"10.1234/b","attributes":{"doi":"10.1234/c"}}),
+    ]);
     write_release(
         tmp.path(),
         MONTH,
@@ -616,14 +663,108 @@ fn scan_reports_malformed_json_and_invalid_dois_with_path_and_line() -> anyhow::
     let err = scan_all(&MonthlyRelease::open(tmp.path())?).unwrap_err();
     let text = error_text(&err);
     assert!(
-        text.contains("part_0000.jsonl.gz:2") && text.contains("not a doi"),
+        text.contains("part_0000.jsonl.gz:2") && text.contains("conflicting"),
         "{text}"
     );
     Ok(())
 }
 
 #[test]
-fn scan_rejects_unknown_csv_states_headers_and_dois() -> anyhow::Result<()> {
+fn scan_counts_and_skips_metadata_records_with_invalid_dois() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    make_release(
+        tmp.path(),
+        &[
+            json!({"id":"10.1234/a","attributes":{"url":"https://example.org/a"}}),
+            // Invalid `id`: skipped whole, landing page included.
+            json!({"id":"not a doi","attributes":{"url":"https://example.org/skipped"}}),
+            // Invalid `attributes.doi` beside a valid `id`: no fallback.
+            json!({"id":"10.1234/b","attributes":{"doi":"10.1234/has space","url":"https://example.org/b"}}),
+            // Invalid `attributes.doi` alone, with a non-string URL that
+            // must not reach the URL counters.
+            json!({"data":{"attributes":{"doi":"10.3929/ethz-a- 000142255","url":42}}}),
+            json!({"id":"10.1234/c"}),
+        ],
+        &[("10.1234/a", "findable")],
+    )?;
+    let (rows, stats) = scan_all(&MonthlyRelease::open(tmp.path())?)?;
+    assert_eq!(
+        stats,
+        SourceStats {
+            metadata_records: 2,
+            csv_records: 1,
+            missing_urls: 1,
+            invalid_urls: 0,
+            invalid_dois: 3,
+        }
+    );
+    let emitted: Vec<_> = rows
+        .iter()
+        .map(|row| (row.doi.as_str(), row.url.as_deref(), row.source))
+        .collect();
+    assert_eq!(
+        emitted,
+        vec![
+            ("10.1234/a", None, RecordSource::StateReport),
+            (
+                "10.1234/a",
+                Some("https://example.org/a"),
+                RecordSource::Metadata
+            ),
+            ("10.1234/c", None, RecordSource::Metadata),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn scan_counts_and_skips_csv_rows_with_invalid_dois() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    make_release(
+        tmp.path(),
+        &[json!({"id":"10.1234/a"})],
+        &[
+            ("10.1234/a", "findable"),
+            ("not a doi", "findable"),
+            ("10.1234/b", "registered"),
+            // Real state-report values: a space and a non-breaking space
+            // inside the suffix.
+            ("10.3929/ethz-a- 000142255", "findable"),
+            ("10.18454/\u{a0}pmi.2016.5.712", "registered"),
+        ],
+    )?;
+    let release = MonthlyRelease::open(tmp.path())?;
+    let (rows, stats) = scan_all(&release)?;
+    assert_eq!(
+        stats,
+        SourceStats {
+            metadata_records: 1,
+            csv_records: 2,
+            missing_urls: 1,
+            invalid_urls: 0,
+            invalid_dois: 3,
+        }
+    );
+    let csv_dois: Vec<_> = rows
+        .iter()
+        .filter(|row| row.source == RecordSource::StateReport)
+        .map(|row| row.doi.as_str())
+        .collect();
+    assert_eq!(csv_dois, vec!["10.1234/a", "10.1234/b"]);
+
+    // Skipping rows does not skip verification: the same-size MTIME
+    // corruption is still caught by the manifest digest at EOF.
+    let csv = tmp.path().join(csv_path(MONTH));
+    let mut bytes = fs::read(&csv)?;
+    bytes[4] ^= 0x01;
+    fs::write(&csv, &bytes)?;
+    let err = scan_all(&MonthlyRelease::open(tmp.path())?).unwrap_err();
+    assert!(error_text(&err).contains("SHA-256"), "{err:#}");
+    Ok(())
+}
+
+#[test]
+fn scan_rejects_unknown_csv_states_and_headers() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let empty_jsonl = gzip(&metadata_jsonl(&[]));
     let cases: [(&[u8], &str); 4] = [
@@ -639,9 +780,10 @@ fn scan_rejects_unknown_csv_states_headers_and_dois() -> anyhow::Result<()> {
             b"doi,state,client,updated\n10.1234/a,findable,c,u\n",
             "header",
         ),
+        // An unknown state is fatal even on a row whose DOI would be skipped.
         (
-            b"doi,state,client_id,updated\nnot a doi,findable,c,u\n",
-            "not a doi",
+            b"doi,state,client_id,updated\nnot a doi,draft,c,u\n",
+            "draft",
         ),
     ];
     for (csv, needle) in cases {

@@ -77,9 +77,14 @@ redirects, crawling, fuzzy title matching, or repository-specific URL
 rewrites. Production uses the complete release, CSV reports included, and
 fails rather than silently falling back to JSONL-only coverage when an
 expected input is missing; a missing or unreadable listed file, truncated
-gzip data, a malformed record, or conflicting DOI identifiers inside one
-record all fail the build. Null or invalid landing-page values are counted
-without discarding the DOI.
+gzip data, a malformed record, an unknown state-report state, or two valid
+but conflicting DOI identifiers inside one record all fail the build. Null
+or invalid landing-page values are counted without discarding the DOI. A
+state-report row or metadata record whose DOI is not syntactically valid
+(the registry spells a handful with whitespace inside the suffix, e.g.
+`10.3929/ethz-a- 000142255`) is counted as `invalid_dois` and skipped
+whole: it is never repaired into a guessed spelling, its landing page is
+not indexed, and it can never be matched.
 
 ### Build the index bundle
 
@@ -102,7 +107,7 @@ output that already holds a completed bundle). Its only other option is
 | `hosts.fst` | registered hosts, used to reject URL candidates cheaply before a full lookup |
 | `urls.fst` | normalized landing-page URL keys, each pointing into the sidecar |
 | `url-targets.bin` | memory-mapped sidecar with the sorted, distinct candidate DOIs per URL |
-| `_INDEX_COMPLETE.json` | manifest: release, source inventory digest, index format and normalization versions, per-file sizes and SHA-256 digests, counts of DOIs, URLs, missing/invalid URLs, and shared URLs; written last, only after every artifact is verified |
+| `_INDEX_COMPLETE.json` | manifest: release, source inventory digest, index format and normalization versions, per-file sizes and SHA-256 digests, counts of DOIs, URLs, missing/invalid URLs, skipped invalid DOIs, and shared URLs; written last, only after every artifact is verified |
 
 Candidates that share an authority and path across `http` and `https` keep
 the union of their DOI mappings, so a scheme-less reference cannot hide an

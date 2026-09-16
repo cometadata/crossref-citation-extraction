@@ -200,6 +200,7 @@ fn manifest_lists_every_artifact_and_defines_the_bundle_digest() -> anyhow::Resu
             ("csv_records", 1),
             ("dois", 3),
             ("hosts", 1),
+            ("invalid_dois", 0),
             ("invalid_urls", 0),
             ("metadata_records", 2),
             ("missing_urls", 0),
@@ -450,6 +451,77 @@ fn counts_missing_and_invalid_urls_without_dropping_dois() -> anyhow::Result<()>
     assert_eq!(counts["invalid_urls"], 4);
     assert_eq!(counts["urls"], 1);
     assert_eq!(counts["hosts"], 1);
+    Ok(())
+}
+
+#[test]
+fn counts_and_skips_invalid_dois_from_both_sources() -> anyhow::Result<()> {
+    // Identifiers copied from the real 2026-07 release: DataCite's own
+    // state reports and metadata spell 21 DOIs with whitespace inside the
+    // suffix (`csv-doi-scan.json`; `dois/updated_2012-10/` carries three of
+    // them in both the CSV and the JSONL `id`/`attributes.doi`).
+    let space = "10.3929/ethz-a- 000142255";
+    let space_two = "10.3929/ethz-a- 000109083";
+    let nbsp = "10.18454/\u{a0}pmi.2016.5.712";
+    let dot_space = "10.4230/oasics.wcet.2009. 2278";
+    let tmp = tempfile::tempdir()?;
+    let (_, bundle) = build_fixture(
+        tmp.path(),
+        &[
+            json!({"id": space, "attributes": {"doi": space, "url": "http://dx.doi.org/10.3929/ethz-a-000142255"}}),
+            json!({"id": space_two, "attributes": {"doi": space_two, "url": "http://dx.doi.org/10.3929/ethz-a-000109083"}}),
+            json!({"id": nbsp, "attributes": {"doi": nbsp, "url": "https://skipped.example.org/pmi"}}),
+            json!({"id": "10.6098/univ-nc-th-2011.5", "attributes": {"url": "https://example.org/valid"}}),
+        ],
+        &[
+            ("10.6098/univ-nc-th-2011.5", "registered"),
+            (space, "findable"),
+            (space_two, "findable"),
+            (dot_space, "findable"),
+            (nbsp, "findable"),
+            ("10.3205/escr.2012.p-401", "findable"),
+        ],
+    )?;
+    let index = DataciteIndex::load(&bundle)?;
+    assert!(index.contains_doi("10.6098/univ-nc-th-2011.5"));
+    assert!(index.contains_doi("10.3205/escr.2012.p-401"));
+    for doi in [space, space_two, nbsp, dot_space] {
+        assert!(!index.contains_doi(doi), "{doi:?}");
+        assert!(!index.contains_doi(&doi.to_ascii_lowercase()), "{doi:?}");
+    }
+    // Nothing repairs the whitespace into a guessed spelling.
+    for repaired in [
+        "10.3929/ethz-a-000142255",
+        "10.3929/ethz-a-000109083",
+        "10.18454/pmi.2016.5.712",
+        "10.4230/oasics.wcet.2009.2278",
+    ] {
+        assert!(!index.contains_doi(repaired), "{repaired}");
+    }
+    // A skipped record is skipped whole: its landing page is not indexed.
+    assert!(!index.contains_host("dx.doi.org"));
+    assert!(!index.contains_host("skipped.example.org"));
+    assert!(index
+        .url_dois("http://dx.doi.org/10.3929/ethz-a-000142255", 4096)?
+        .is_empty());
+    assert_eq!(
+        index.url_dois("https://example.org/valid", 4096)?,
+        ["10.6098/univ-nc-th-2011.5"]
+    );
+
+    let counts = &index.manifest().counts;
+    // Three JSONL records and four CSV rows were skipped.
+    assert_eq!(counts["invalid_dois"], 7);
+    assert_eq!(counts["metadata_records"], 1);
+    assert_eq!(counts["csv_records"], 2);
+    assert_eq!(counts["dois"], 2);
+    assert_eq!(counts["urls"], 1);
+    assert_eq!(counts["hosts"], 1);
+    assert_eq!(counts["missing_urls"], 0);
+    assert_eq!(counts["invalid_urls"], 0);
+
+    let marker = read_marker(&bundle)?;
+    assert_eq!(marker["counts"]["invalid_dois"], json!(7));
     Ok(())
 }
 

@@ -109,8 +109,8 @@ impl IndexFile {
 ///
 /// `files` lists every bundle file except the manifest itself. `counts`
 /// holds the build counters: `metadata_records`, `csv_records`, `dois`,
-/// `urls`, `hosts`, `url_pairs`, `missing_urls`, `invalid_urls`, and
-/// `shared_urls`.
+/// `urls`, `hosts`, `url_pairs`, `missing_urls`, `invalid_urls`,
+/// `invalid_dois`, and `shared_urls`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleManifest {

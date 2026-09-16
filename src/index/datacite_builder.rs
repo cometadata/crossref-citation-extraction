@@ -1,8 +1,10 @@
 //! Build the DataCite index bundle from a verified monthly release.
 //!
-//! The registry is scanned exactly once. Each record's canonical DOI, and
-//! for each usable landing page the normalized URL/DOI pair and the URL's
-//! host, are appended to three temporary text files as hex-encoded keys
+//! The registry is scanned exactly once. Each emitted record's canonical
+//! DOI (records the release spells with an invalid DOI are counted and
+//! skipped by the scan), and for each usable landing page the normalized
+//! URL/DOI pair and the URL's host, are appended to three temporary text
+//! files as hex-encoded keys
 //! (so no delimiter can occur inside a key, and hex lexical order equals
 //! byte order, which the FST builders require). Each file is then sorted
 //! and deduplicated by the system `sort` under `LC_ALL=C` with an explicit
@@ -175,9 +177,11 @@ fn build_into(
 
     let scan = scan_release(release, &temp)?;
     info!(
-        "Scanned release {} in {:.1}s; sorting keys with a {sort_memory_mb} MiB budget",
+        "Scanned release {} in {:.1}s ({} invalid DOIs skipped); \
+         sorting keys with a {sort_memory_mb} MiB budget",
         release.release,
-        started.elapsed().as_secs_f64()
+        started.elapsed().as_secs_f64(),
+        scan.stats.invalid_dois
     );
 
     let sorted = external_sort(&temp, "dois", sort_memory_mb)?;
@@ -225,6 +229,7 @@ fn build_into(
             "invalid_urls".to_string(),
             scan.stats.invalid_urls + scan.unnormalizable_urls,
         ),
+        ("invalid_dois".to_string(), scan.stats.invalid_dois),
     ]);
     let manifest = BundleManifest {
         kind: BUNDLE_KIND.to_string(),
