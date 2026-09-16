@@ -91,7 +91,12 @@ pub struct AggregationCheckpoint {
 }
 
 /// Serializable snapshot of aggregation stats.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Also the per-partition record inside a full-mode
+/// [`super::partition_commit::PartitionCommit`], where it describes one
+/// freshly computed partition. The path counters default so checkpoints
+/// written before they existed still load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregationStatsSnapshot {
     pub partitions_processed: usize,
     pub valid_count: usize,
@@ -100,6 +105,15 @@ pub struct AggregationStatsSnapshot {
     pub publisher_citations: usize,
     pub crossref_citations: usize,
     pub mined_citations: usize,
+    /// Partitions aggregated entirely in memory.
+    #[serde(default)]
+    pub in_memory_partitions: usize,
+    /// Partitions aggregated through sorted runs and merges.
+    #[serde(default)]
+    pub external_partitions: usize,
+    /// Partitions reused from verified commits instead of recomputed.
+    #[serde(default)]
+    pub reused_partitions: usize,
 }
 
 impl From<&AggregationStats> for AggregationStatsSnapshot {
@@ -112,6 +126,9 @@ impl From<&AggregationStats> for AggregationStatsSnapshot {
             publisher_citations: stats.publisher_citations,
             crossref_citations: stats.crossref_citations,
             mined_citations: stats.mined_citations,
+            in_memory_partitions: stats.in_memory_partitions,
+            external_partitions: stats.external_partitions,
+            reused_partitions: stats.reused_partitions,
         }
     }
 }
@@ -126,6 +143,9 @@ impl From<AggregationStatsSnapshot> for AggregationStats {
             publisher_citations: snapshot.publisher_citations,
             crossref_citations: snapshot.crossref_citations,
             mined_citations: snapshot.mined_citations,
+            in_memory_partitions: snapshot.in_memory_partitions,
+            external_partitions: snapshot.external_partitions,
+            reused_partitions: snapshot.reused_partitions,
         }
     }
 }
@@ -249,6 +269,7 @@ mod tests {
             publisher_citations: 400,
             crossref_citations: 300,
             mined_citations: 300,
+            ..AggregationStats::default()
         };
         let completed = vec!["10.1234".to_string(), "10.5678".to_string()];
 
@@ -261,6 +282,18 @@ mod tests {
         assert_eq!(loaded.stats.partitions_processed, 100);
         assert_eq!(loaded.stats.valid_count, 50);
         assert_eq!(loaded.stats.total_citations, 1000);
+    }
+
+    #[test]
+    fn test_snapshot_without_path_counters_still_loads() {
+        let text = r#"{"partitions_processed":3,"valid_count":1,"failed_count":0,
+            "total_citations":4,"publisher_citations":1,"crossref_citations":1,
+            "mined_citations":2}"#;
+        let snapshot: AggregationStatsSnapshot = serde_json::from_str(text).unwrap();
+        assert_eq!(snapshot.partitions_processed, 3);
+        assert_eq!(snapshot.in_memory_partitions, 0);
+        assert_eq!(snapshot.external_partitions, 0);
+        assert_eq!(snapshot.reused_partitions, 0);
     }
 
     #[test]

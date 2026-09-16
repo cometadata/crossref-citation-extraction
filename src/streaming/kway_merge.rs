@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use polars::prelude::*;
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -48,6 +48,68 @@ impl MergeRow {
             self.ref_index,
         )
     }
+
+    /// Whether both rows describe the same reference tuple.
+    pub fn same_key(&self, other: &MergeRow) -> bool {
+        self.ref_index == other.ref_index
+            && self.cited_id == other.cited_id
+            && self.citing_doi == other.citing_doi
+    }
+
+    /// Heap capacity of every string in the row.
+    pub fn heap_bytes(&self) -> usize {
+        self.cited_id.capacity()
+            + self.citing_doi.capacity()
+            + self.provenance.capacity()
+            + self.raw_match.capacity()
+            + self.ref_json.capacity()
+    }
+
+    /// Bytes this row is charged against an aggregation budget: its strings
+    /// plus the slot it occupies in a row vector.
+    pub fn accounted_bytes(&self) -> usize {
+        self.heap_bytes() + size_of::<MergeRow>()
+    }
+}
+
+/// Rank of a provenance for evidence selection: `publisher` is strongest,
+/// then `crossref`, then `mined`; anything else sorts last.
+pub fn provenance_rank(provenance: &str) -> u8 {
+    match provenance {
+        "publisher" => 0,
+        "crossref" => 1,
+        "mined" => 2,
+        _ => 3,
+    }
+}
+
+/// Rank of an evidence kind for selection: `doi`, then `arxiv`, then `url`.
+pub fn match_type_rank(match_type: MatchType) -> u8 {
+    match match_type {
+        MatchType::Doi => 0,
+        MatchType::Arxiv => 1,
+        MatchType::Url => 2,
+    }
+}
+
+/// Deterministic order among rows sharing a key: strongest provenance,
+/// then evidence kind, then the smaller `raw_match`, then the smaller
+/// `ref_json`. The first row in this order is the representative match.
+pub fn compare_evidence(a: &MergeRow, b: &MergeRow) -> Ordering {
+    provenance_rank(&a.provenance)
+        .cmp(&provenance_rank(&b.provenance))
+        .then_with(|| match_type_rank(a.match_type).cmp(&match_type_rank(b.match_type)))
+        .then_with(|| a.raw_match.cmp(&b.raw_match))
+        .then_with(|| a.ref_json.cmp(&b.ref_json))
+}
+
+/// Total order used for sorting runs: the key, then [`compare_evidence`].
+pub fn compare_rows(a: &MergeRow, b: &MergeRow) -> Ordering {
+    a.cited_id
+        .cmp(&b.cited_id)
+        .then_with(|| a.citing_doi.cmp(&b.citing_doi))
+        .then_with(|| a.ref_index.cmp(&b.ref_index))
+        .then_with(|| compare_evidence(a, b))
 }
 
 /// Get row count from parquet file metadata (reads only footer, not data).
@@ -127,7 +189,8 @@ impl SegmentCursor {
 /// Merge k sorted segment files into one globally-sorted emission stream.
 ///
 /// Each input file must be sorted by (cited_id, citing_doi, ref_index).
-/// Exact-duplicate keys (across or within segments) are emitted once.
+/// Duplicate keys (across or within segments) are emitted once, keeping the
+/// row [`compare_evidence`] ranks first, whichever segment holds it.
 /// `mode` decides how a segment without a `match_type` column is read:
 /// legacy segments default to arXiv evidence, hashed (full) mode rejects them.
 /// Returns the number of rows emitted after dedup.
@@ -165,7 +228,9 @@ where
         }
     }
 
-    let mut last_key: Option<RowKey> = None;
+    // Rows with equal keys pop consecutively, so one pending row per key
+    // is enough to pick the best evidence before emitting.
+    let mut pending: Option<MergeRow> = None;
     let mut emitted = 0u64;
 
     while let Some(Reverse((_, i))) = heap.pop() {
@@ -176,12 +241,23 @@ where
             heap.push(Reverse((next_key, i)));
         }
 
-        let key = row.key();
-        if last_key.as_ref() == Some(&key) {
-            continue; // exact duplicate of previous row
+        match pending.as_mut() {
+            Some(best) if best.same_key(&row) => {
+                if compare_evidence(&row, best) == Ordering::Less {
+                    *best = row;
+                }
+            }
+            _ => {
+                if let Some(done) = pending.take() {
+                    emit(done)?;
+                    emitted += 1;
+                }
+                pending = Some(row);
+            }
         }
-        last_key = Some(key);
-        emit(row)?;
+    }
+    if let Some(done) = pending {
+        emit(done)?;
         emitted += 1;
     }
 
@@ -206,6 +282,16 @@ mod tests {
     }
 
     fn write_segment_with_schema(path: &Path, rows: &[(&str, &str, u32)], with_match_type: bool) {
+        let provenances = vec!["mined"; rows.len()];
+        write_segment_with_provenance(path, rows, &provenances, with_match_type);
+    }
+
+    fn write_segment_with_provenance(
+        path: &Path,
+        rows: &[(&str, &str, u32)],
+        provenances: &[&str],
+        with_match_type: bool,
+    ) {
         let mut columns = vec![
             Column::new(
                 "citing_doi".into(),
@@ -221,7 +307,10 @@ mod tests {
             ),
             Column::new(
                 "provenance".into(),
-                rows.iter().map(|_| "mined".to_string()).collect::<Vec<_>>(),
+                provenances
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>(),
             ),
             Column::new(
                 "raw_match".into(),
@@ -414,6 +503,59 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("match_type"), "{message}");
         assert!(message.contains("old.parquet"), "{message}");
+    }
+
+    /// Duplicate keys keep the strongest evidence, whichever segment holds
+    /// it and whichever cursor the heap pops first.
+    #[test]
+    fn test_duplicate_keys_keep_best_evidence_regardless_of_segment_order() {
+        let dir = tempdir().unwrap();
+        let weak = dir.path().join("weak.parquet");
+        let strong = dir.path().join("strong.parquet");
+        write_segment_with_provenance(&weak, &[("id1", "citer", 0)], &["mined"], true);
+        write_segment_with_provenance(&strong, &[("id1", "citer", 0)], &["publisher"], true);
+
+        for order in [
+            vec![weak.clone(), strong.clone()],
+            vec![strong.clone(), weak.clone()],
+        ] {
+            let mut rows = Vec::new();
+            merge_sorted_segments(&order, 8, PartitionMode::Hashed { count: 1 }, |row| {
+                rows.push((row.cited_id, row.provenance));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(rows, vec![("id1".to_string(), "publisher".to_string())]);
+        }
+    }
+
+    #[test]
+    fn test_evidence_order_is_provenance_then_kind_then_text() {
+        let row = |provenance: &str, match_type, raw: &str, json: &str| MergeRow {
+            cited_id: "id".into(),
+            citing_doi: "c".into(),
+            ref_index: 0,
+            provenance: provenance.into(),
+            match_type,
+            raw_match: raw.into(),
+            ref_json: json.into(),
+        };
+        let ranked = [
+            row("publisher", MatchType::Url, "z", "z"),
+            row("crossref", MatchType::Doi, "z", "z"),
+            row("mined", MatchType::Doi, "a", "z"),
+            row("mined", MatchType::Doi, "b", "a"),
+            row("mined", MatchType::Doi, "b", "b"),
+            row("mined", MatchType::Arxiv, "a", "a"),
+            row("mined", MatchType::Url, "a", "a"),
+            row("unknown", MatchType::Doi, "a", "a"),
+        ];
+        for pair in ranked.windows(2) {
+            assert_eq!(compare_evidence(&pair[0], &pair[1]), Ordering::Less);
+            assert_eq!(compare_rows(&pair[0], &pair[1]), Ordering::Less);
+        }
+        assert!(ranked[0].same_key(&ranked[7]));
+        assert!(ranked[0].accounted_bytes() > ranked[0].heap_bytes());
     }
 
     #[test]
