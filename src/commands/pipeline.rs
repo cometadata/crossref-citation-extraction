@@ -239,7 +239,7 @@ fn run_scalable_pipeline(args: &PipelineArgs) -> Result<()> {
         arxiv_fst.as_ref(),
         &outputs,
         args.resume,
-        args.checkpoint_interval,
+        args.legacy_checkpoint_interval(),
     )?;
 
     info!("Pipeline complete:");
@@ -617,7 +617,7 @@ mod tests {
             temp_dir: None,
             batch_size: 5000000,
             resume: false,
-            checkpoint_interval: 1,
+            checkpoint_interval: None,
             datacite_index: None,
             run_identity: None,
             partitions: 256,

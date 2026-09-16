@@ -144,11 +144,14 @@ pub struct PipelineArgs {
     #[arg(long, default_value = "false")]
     pub resume: bool,
 
-    /// Checkpoint interval: save progress every N partitions during aggregation.
-    /// Values > 1 widen the window in which a crash duplicates already-written
-    /// partitions on resume; 0 disables checkpointing.
-    #[arg(long, default_value = "1")]
-    pub checkpoint_interval: usize,
+    /// Checkpoint interval. arXiv mode: save aggregation progress every N
+    /// partitions (default 1; values > 1 widen the window in which a crash
+    /// duplicates already-written partitions on resume; 0 disables it).
+    /// DataCite mode: also commit extraction once N members are pending
+    /// (default 2000) in addition to the buffered-byte trigger; must be
+    /// positive.
+    #[arg(long)]
+    pub checkpoint_interval: Option<usize>,
 
     /// DataCite index bundle directory (full DOI and landing-page mining).
     /// Selects DataCite mode; cannot be combined with --arxiv-fst or
@@ -237,7 +240,18 @@ pub struct PipelineArgs {
     pub max_entry_mb: usize,
 }
 
+/// Aggregation checkpoint interval of the arXiv pipeline when
+/// `--checkpoint-interval` is not given.
+pub const LEGACY_CHECKPOINT_INTERVAL: usize = 1;
+
 impl PipelineArgs {
+    /// The arXiv-mode aggregation checkpoint interval: the explicit value,
+    /// else [`LEGACY_CHECKPOINT_INTERVAL`].
+    pub fn legacy_checkpoint_interval(&self) -> usize {
+        self.checkpoint_interval
+            .unwrap_or(LEGACY_CHECKPOINT_INTERVAL)
+    }
+
     /// Parse outputs into a HashSet. Supports the "all" alias; empty means all.
     pub fn parse_outputs(&self) -> Result<HashSet<OutputType>, String> {
         let all = [
@@ -310,7 +324,7 @@ mod tests {
             temp_dir: None,
             batch_size: 5000000,
             resume: false,
-            checkpoint_interval: 1,
+            checkpoint_interval: None,
             datacite_index: None,
             run_identity: None,
             partitions: 256,
@@ -395,6 +409,14 @@ mod tests {
     fn test_checkpoint_interval_defaults_to_one() {
         use clap::Parser;
         let args = PipelineArgs::parse_from(["prog", "--input", "x.tar.gz"]);
-        assert_eq!(args.checkpoint_interval, 1);
+        assert_eq!(args.checkpoint_interval, None);
+        assert_eq!(args.legacy_checkpoint_interval(), 1);
+        let explicit =
+            PipelineArgs::parse_from(["prog", "--input", "x.tar.gz", "--checkpoint-interval", "5"]);
+        assert_eq!(explicit.checkpoint_interval, Some(5));
+        assert_eq!(explicit.legacy_checkpoint_interval(), 5);
+        let disabled =
+            PipelineArgs::parse_from(["prog", "--input", "x.tar.gz", "--checkpoint-interval", "0"]);
+        assert_eq!(disabled.legacy_checkpoint_interval(), 0);
     }
 }

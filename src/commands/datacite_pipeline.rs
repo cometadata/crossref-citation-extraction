@@ -10,6 +10,15 @@
 //! durable the partitions and ambiguity segments are aggregated and
 //! `extraction-report.json` is written.
 //!
+//! Durability is committed in batches: every buffered partition row and the
+//! open ambiguity segment are synced, then the members completed since the
+//! last commit are recorded. A commit is triggered when the writer holds at
+//! least half of `--writer-memory-mb` (so each commit writes segments worth
+//! about half the budget spread over the partitions) or, secondarily, when
+//! `--checkpoint-interval` members are pending (2000 unless given). After a
+//! crash, `--resume` replays at most one commit's worth of members; the
+//! aggregators deduplicate replayed rows by their stable keys.
+//!
 //! Failure rules: an unreadable or oversized member, invalid top-level
 //! JSON, a lookup over the candidate budget, or a row over the batch or
 //! writer budget aborts the run with no report; malformed references and
@@ -73,8 +82,9 @@ const MIB: usize = 1024 * 1024;
 const ENTRY_QUEUE_DEPTH: usize = 4;
 /// Per-partition row cap; the byte budget flushes long before this.
 const SEGMENT_ROWS: usize = 1_000_000;
-/// Members completed between durable checkpoint commits.
-const CHECKPOINT_MEMBER_INTERVAL: usize = 100;
+/// Pending members that force a commit when `--checkpoint-interval` is not
+/// given; the buffered-byte trigger normally fires first.
+const DEFAULT_CHECKPOINT_MEMBERS: usize = 2000;
 /// Members between progress events.
 const PROGRESS_MEMBER_INTERVAL: u64 = 100;
 /// Fixed charge per ambiguity row on top of its string content.
@@ -167,6 +177,10 @@ struct FullModeConfig {
     sort_workers: usize,
     lookup_bytes: usize,
     max_entry_bytes: usize,
+    /// Buffered partition bytes at which pending members are committed.
+    commit_bytes: usize,
+    /// Pending members at which they are committed regardless of bytes.
+    checkpoint_members: usize,
     outputs: HashSet<OutputType>,
     /// Lowercase, sorted, distinct; empty means every provenance.
     provenance_filter: Vec<String>,
@@ -429,6 +443,13 @@ fn validate_full_mode_args(args: &PipelineArgs) -> Result<FullModeConfig> {
     }
     provenance_filter.sort();
     provenance_filter.dedup();
+    let checkpoint_members = args
+        .checkpoint_interval
+        .unwrap_or(DEFAULT_CHECKPOINT_MEMBERS);
+    ensure!(
+        checkpoint_members > 0,
+        "--checkpoint-interval must be positive in DataCite mode"
+    );
     Ok(FullModeConfig {
         partitions: args.partitions,
         writer_memory_bytes,
@@ -439,6 +460,8 @@ fn validate_full_mode_args(args: &PipelineArgs) -> Result<FullModeConfig> {
         sort_workers: args.sort_workers,
         lookup_bytes,
         max_entry_bytes,
+        commit_bytes: (writer_memory_bytes / 2).max(1),
+        checkpoint_members,
         outputs,
         provenance_filter,
     })
@@ -1106,14 +1129,18 @@ struct WriterState<'a> {
     rows_received: u64,
     ambiguity_rows_received: u64,
     started: Instant,
+    commit_bytes: usize,
+    checkpoint_members: usize,
 }
 
 /// Make everything durable in order, then record the pending members:
 /// partition segments, the ambiguity segment, the checkpoint lines.
-fn commit_pending(state: &mut WriterState<'_>) -> Result<()> {
+/// `trigger` names what caused the commit, for the checkpoint event.
+fn commit_pending(state: &mut WriterState<'_>, trigger: &str) -> Result<()> {
     if state.pending.is_empty() {
         return Ok(());
     }
+    let flushed_bytes = state.partitions.buffered_bytes();
     state.partitions.flush_all()?;
     state.ambiguities.commit()?;
     let count = state.pending.len();
@@ -1121,11 +1148,30 @@ fn commit_pending(state: &mut WriterState<'_>) -> Result<()> {
         state.checkpoint.append_member(&filename, stats)?;
     }
     state.checkpoint.sync()?;
-    debug!(
-        "event=checkpoint members_committed={count} members_total={}",
-        state.checkpoint.members().len()
+    info!(
+        "event=checkpoint trigger={trigger} members_committed={count} members_total={} \
+         flushed_bytes={flushed_bytes} rows_written={}",
+        state.checkpoint.members().len(),
+        state.partitions.total_rows_written()
     );
     Ok(())
+}
+
+/// Commit once the writer holds at least half its budget, so segments stay
+/// large, or once enough members are pending, which bounds what a crash
+/// replays. Nothing is committed while no member is complete: the writer's
+/// own budget still bounds memory by flushing its largest buffers.
+fn maybe_commit(state: &mut WriterState<'_>) -> Result<()> {
+    if state.pending.is_empty() {
+        return Ok(());
+    }
+    if state.pending.len() >= state.checkpoint_members {
+        commit_pending(state, "members")
+    } else if state.partitions.buffered_bytes() >= state.commit_bytes {
+        commit_pending(state, "bytes")
+    } else {
+        Ok(())
+    }
 }
 
 fn stats_fields(stats: &FileStats) -> String {
@@ -1184,6 +1230,7 @@ fn handle_event(state: &mut WriterState<'_>, event: WorkerEvent) -> Result<()> {
             for row in batch {
                 state.partitions.write(row)?;
             }
+            maybe_commit(state)?;
         }
         WorkerEvent::Ambiguous(batch) => {
             state.ambiguity_rows_received += batch.len() as u64;
@@ -1196,9 +1243,7 @@ fn handle_event(state: &mut WriterState<'_>, event: WorkerEvent) -> Result<()> {
             if state.members.is_multiple_of(PROGRESS_MEMBER_INTERVAL) {
                 log_progress(state);
             }
-            if state.pending.len() >= CHECKPOINT_MEMBER_INTERVAL {
-                commit_pending(state)?;
-            }
+            maybe_commit(state)?;
         }
         WorkerEvent::Failed(error) => return Err(error),
     }
@@ -1227,15 +1272,19 @@ fn run_extraction(
     let n_workers = num_cpus::get().saturating_sub(2).max(1);
 
     // Peak estimate: raw members queued or in flight, queued batches, each
-    // worker's two open batches, and the writer's buffers.
+    // worker's two open batches, and the writer's buffers. The writer's
+    // budget is the hard cap; commits normally fire at `commit_bytes`, so
+    // the buffers usually hold that plus at most one batch.
     let entry_queue_bytes = (ENTRY_QUEUE_DEPTH + n_workers + 1).saturating_mul(cfg.max_entry_bytes);
     let result_queue_bytes = cfg.queue_batches.saturating_mul(cfg.result_batch_bytes);
     let worker_local_bytes = n_workers.saturating_mul(2 * cfg.result_batch_bytes);
     info!(
         "event=resource_estimate workers={n_workers} entry_queue_bytes={entry_queue_bytes} \
          result_queue_bytes={result_queue_bytes} worker_local_bytes={worker_local_bytes} \
-         writer_bytes={} total_bytes={}",
+         writer_bytes={} commit_bytes={} checkpoint_members={} total_bytes={}",
         cfg.writer_memory_bytes,
+        cfg.commit_bytes,
+        cfg.checkpoint_members,
         entry_queue_bytes
             .saturating_add(result_queue_bytes)
             .saturating_add(worker_local_bytes)
@@ -1243,11 +1292,14 @@ fn run_extraction(
     );
     info!(
         "event=phase phase=extraction status=started workers={n_workers} \
-         members_already_completed={} partitions={} result_batch_bytes={} queue_batches={}",
+         members_already_completed={} partitions={} result_batch_bytes={} queue_batches={} \
+         commit_bytes={} checkpoint_members={}",
         completed.len(),
         cfg.partitions,
         cfg.result_batch_bytes,
-        cfg.queue_batches
+        cfg.queue_batches,
+        cfg.commit_bytes,
+        cfg.checkpoint_members
     );
 
     let (entry_tx, entry_rx) = crossbeam_channel::bounded::<CrossrefEntry>(ENTRY_QUEUE_DEPTH);
@@ -1268,6 +1320,8 @@ fn run_extraction(
         rows_received: 0,
         ambiguity_rows_received: 0,
         started: Instant::now(),
+        commit_bytes: cfg.commit_bytes,
+        checkpoint_members: cfg.checkpoint_members,
     };
     let max_entry_bytes = cfg.max_entry_bytes;
 
@@ -1318,7 +1372,7 @@ fn run_extraction(
     // Members the writer completed are durable progress even when the
     // source or a worker failed afterwards; record them so a resume does
     // not replay them, but let the failure itself be what is reported.
-    let progress = commit_pending(&mut state);
+    let progress = commit_pending(&mut state, "final");
     let skipped = reader_result.context("reading the Crossref source failed")?;
     for result in worker_results {
         result.context("extraction worker failed")?;

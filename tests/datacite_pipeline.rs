@@ -433,6 +433,151 @@ fn many_matches_in_one_member_flow_through_bounded_batches() -> Result<()> {
     Ok(())
 }
 
+/// `(trigger, members_committed)` of every checkpoint commit in a log.
+fn checkpoint_events(log: &str) -> Vec<(String, u64)> {
+    log.lines()
+        .filter_map(|line| {
+            let fields: BTreeMap<&str, &str> = line
+                .split_once("event=checkpoint ")?
+                .1
+                .split(' ')
+                .filter_map(|pair| pair.split_once('='))
+                .collect();
+            Some((
+                fields.get("trigger")?.to_string(),
+                fields.get("members_committed")?.parse().ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Members whose rows are about 0.6 MiB each (before capacity rounding),
+/// so a 1 MiB commit trigger fires every one or two members.
+fn heavy_members(dir: &Path, count: usize) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    for i in 0..count {
+        let padding = "lorem ipsum ".repeat(80);
+        let works: Vec<(String, Vec<Value>)> = (0..600)
+            .map(|j| {
+                (
+                    format!("10.9999/citer-{i}-{j:03}"),
+                    vec![json!({"DOI": "10.1234/a", "unstructured": padding})],
+                )
+            })
+            .collect();
+        let borrowed: Vec<(&str, Vec<Value>)> = works
+            .iter()
+            .map(|(doi, refs)| (doi.as_str(), refs.clone()))
+            .collect();
+        fs::write(dir.join(format!("{i}.json")), member(&borrowed))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn small_writer_budget_commits_by_bytes_before_the_member_interval() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let bundle = build_bundle(tmp.path(), &[("10.1234/a", None)])?;
+    let input = tmp.path().join("crossref");
+    heavy_members(&input, 4)?;
+    let parts = tmp.path().join("parts");
+    let run = Run::new(&input, &bundle, &tmp.path().join("out"), &parts).args(&[
+        "--writer-memory-mb",
+        "2",
+        "--checkpoint-interval",
+        "1000",
+        "--partitions",
+        "1",
+        "--keep-intermediates",
+    ]);
+    let output = run.output()?;
+    let log = transcript(&output);
+    ensure!(output.status.success(), "{log}");
+    let events = checkpoint_events(&log);
+    let by_bytes = events.iter().filter(|(t, _)| t == "bytes").count();
+    ensure!(by_bytes >= 1, "no byte-triggered commit in:\n{log}");
+    ensure!(
+        events.iter().all(|(t, _)| t != "members"),
+        "the 1000-member interval must not fire for 4 members:\n{log}"
+    );
+    ensure!(
+        events.iter().map(|(_, n)| n).sum::<u64>() == 4,
+        "every member is committed exactly once:\n{log}"
+    );
+    ensure!(
+        events.iter().all(|(_, n)| *n < 4),
+        "commits happened before the end of the run:\n{log}"
+    );
+    assert!(
+        count_files(&parts.join("partitions").join("h0000"), ".parquet") >= 2,
+        "each commit writes its own segment"
+    );
+    let report = read_json(&run.report_path())?;
+    assert_eq!(report["files_processed"], 4);
+    assert_eq!(stat(&report, "confirmed_matches"), 2400);
+    assert_eq!(report["aggregation"]["total_citations"], 2400);
+    Ok(())
+}
+
+#[test]
+fn explicit_checkpoint_interval_commits_by_member_count() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let bundle = build_bundle(tmp.path(), &[("10.1234/a", None)])?;
+    let input = tmp.path().join("crossref");
+    fs::create_dir_all(&input)?;
+    for i in 0..5 {
+        let citer = format!("10.9999/citer-{i}");
+        fs::write(
+            input.join(format!("{i}.json")),
+            member(&[(citer.as_str(), vec![json!({"DOI": "10.1234/a"})])]),
+        )?;
+    }
+    let parts = tmp.path().join("parts");
+    let run = Run::new(&input, &bundle, &tmp.path().join("out"), &parts).args(&[
+        "--writer-memory-mb",
+        "64",
+        "--checkpoint-interval",
+        "2",
+        "--partitions",
+        "1",
+        "--keep-intermediates",
+    ]);
+    let output = run.output()?;
+    let log = transcript(&output);
+    ensure!(output.status.success(), "{log}");
+    let mut events = checkpoint_events(&log);
+    events.sort();
+    assert_eq!(
+        events,
+        vec![
+            ("final".to_string(), 1),
+            ("members".to_string(), 2),
+            ("members".to_string(), 2),
+        ],
+        "two interval commits and the final one:\n{log}"
+    );
+    assert_eq!(
+        count_files(&parts.join("partitions").join("h0000"), ".parquet"),
+        3,
+        "one segment per commit with a budget nothing approaches"
+    );
+    ensure!(
+        log.contains("commit_bytes=33554432 checkpoint_members=2 "),
+        "{log}"
+    );
+    // Zero would never commit by count; it is only meaningful in arXiv mode.
+    Run::new(
+        &input,
+        &bundle,
+        &tmp.path().join("out0"),
+        &tmp.path().join("parts0"),
+    )
+    .args(&["--checkpoint-interval", "0"])
+    .fail_with("--checkpoint-interval must be positive in DataCite mode")?;
+    assert!(!tmp.path().join("parts0").exists());
+    Ok(())
+}
+
 #[test]
 fn counters_cover_ambiguity_failed_arxiv_self_citations_and_unmatched() -> Result<()> {
     let tmp = tempfile::tempdir()?;
