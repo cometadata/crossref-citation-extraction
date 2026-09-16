@@ -322,16 +322,25 @@ def _registry_state_report() -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def _gzip_member(payload: bytes) -> bytes:
+    """Gzip `payload` as one member with the same header discipline as the
+    Crossref archive: zero mtime and the fixed OS byte `GzipFile` writes.
+    `gzip.compress(mtime=0)` hands the header to zlib, which stamps the host
+    OS (0x13 on macOS, 0x03 on Linux) and makes the release inventory, and so
+    the smoke identity, differ between platforms."""
+    buffer = io.BytesIO()
+    with gzip.GzipFile(filename="", fileobj=buffer, mode="wb", mtime=0) as member:
+        member.write(payload)
+    return buffer.getvalue()
+
+
 def _write_datacite_release(root: Path) -> None:
     month_dir = f"dois/updated_{SMOKE_RELEASE}"
     files = (
-        (
-            f"{month_dir}/part_0000.jsonl.gz",
-            gzip.compress(_registry_metadata(), mtime=0),
-        ),
+        (f"{month_dir}/part_0000.jsonl.gz", _gzip_member(_registry_metadata())),
         (
             f"{month_dir}/{SMOKE_RELEASE}.csv.gz",
-            gzip.compress(_registry_state_report(), mtime=0),
+            _gzip_member(_registry_state_report()),
         ),
     )
     entries = []
