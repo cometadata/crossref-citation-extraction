@@ -17,15 +17,18 @@ from typing import Any
 
 from .paths import (
     ARXIV_PUBLISH_SCHEMA_VERSION,
+    DATACITE_DATASET_REPO,
     DATACITE_EXTRACTION_VERSION,
     DATACITE_INDEX_VERSION,
     DATACITE_MARKER_VERSION,
     DATACITE_PUBLISH_SCHEMA_VERSION,
+    DATASET_REPO,
     NORMALIZATION_VERSION,
     PARTITION_ALGORITHM,
 )
 from .state import (
     StateError,
+    _commit,
     _generation,
     _mapping,
     _provenance,
@@ -38,6 +41,11 @@ from .state import (
 
 FULL_EXTRACTION_KIND = "datacite-extraction"
 FULL_EXTRACTION_MODE = "datacite"
+FULL_PIPELINE_KIND = "datacite-pipeline"
+# The two destinations of a paired publication, in publication order, and the
+# repository each one owns. A pipeline marker must carry exactly these.
+PUBLICATION_KINDS = ("datacite", "arxiv")
+PUBLICATION_REPOS = {"datacite": DATACITE_DATASET_REPO, "arxiv": DATASET_REPO}
 
 _MIB = 1024 * 1024
 _MAX_BYTES = 2**63 - 1
@@ -282,5 +290,105 @@ class FullExtractionMarker:
             ),
             files=_file_metas(payload["files"], "files"),
             counts=dict(_mapping(payload["counts"], "counts")),
+            completed_at=_string(payload["completed_at"], "completed_at"),
+        )
+
+
+@dataclass(frozen=True)
+class PublicationReceipt:
+    """A verified dataset commit: the repository, the commit that was verified,
+    its URL, and the digest of the artifact manifest that commit publishes."""
+
+    repo_id: str
+    commit_sha: str
+    commit_url: str
+    artifact_digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> PublicationReceipt:
+        _require_keys(
+            payload,
+            {"repo_id", "commit_sha", "commit_url", "artifact_digest"},
+            "publication receipt",
+        )
+        return cls(
+            repo_id=_string(payload["repo_id"], "repo_id"),
+            commit_sha=_commit(payload["commit_sha"], "commit_sha"),
+            commit_url=_string(payload["commit_url"], "commit_url"),
+            artifact_digest=_sha256(payload["artifact_digest"], "artifact_digest"),
+        )
+
+
+def _publications(value: Any, name: str) -> dict[str, PublicationReceipt]:
+    _require_keys(value, set(PUBLICATION_KINDS), name)
+    publications: dict[str, PublicationReceipt] = {}
+    for kind in PUBLICATION_KINDS:
+        receipt = PublicationReceipt.from_dict(value[kind])
+        if receipt.repo_id != PUBLICATION_REPOS[kind]:
+            raise StateError(
+                f"{name}[{kind}].repo_id must be {PUBLICATION_REPOS[kind]!r}"
+            )
+        publications[kind] = receipt
+    return publications
+
+
+@dataclass(frozen=True)
+class FullPipelineMarker:
+    """`_PIPELINE_COMPLETE.json` for a full run: written only after both
+    publications were verified, and the authority for the paired publication."""
+
+    kind: str
+    schema_version: int
+    identity: RunIdentity
+    snapshot_id: str
+    derived_prefix: str
+    publications: dict[str, PublicationReceipt]
+    completed_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "schema_version": self.schema_version,
+            "identity": self.identity.to_dict(),
+            "snapshot_id": self.snapshot_id,
+            "derived_prefix": self.derived_prefix,
+            "publications": {
+                kind: receipt.to_dict() for kind, receipt in self.publications.items()
+            },
+            "completed_at": self.completed_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> FullPipelineMarker:
+        _require_keys(
+            payload,
+            {
+                "kind",
+                "schema_version",
+                "identity",
+                "snapshot_id",
+                "derived_prefix",
+                "publications",
+                "completed_at",
+            },
+            "pipeline marker",
+        )
+        kind = _string(payload["kind"], "kind")
+        if kind != FULL_PIPELINE_KIND:
+            raise StateError(f"kind must be {FULL_PIPELINE_KIND!r}")
+        return cls(
+            kind=kind,
+            schema_version=_version(
+                payload["schema_version"], DATACITE_MARKER_VERSION, "schema_version"
+            ),
+            identity=RunIdentity.from_dict(payload["identity"]),
+            snapshot_id=_release(payload["snapshot_id"], "snapshot_id"),
+            derived_prefix=_generation(
+                payload["derived_prefix"], "derived-generations", "derived_prefix"
+            ),
+            publications=_publications(payload["publications"], "publications"),
             completed_at=_string(payload["completed_at"], "completed_at"),
         )
