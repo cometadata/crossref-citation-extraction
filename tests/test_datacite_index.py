@@ -48,6 +48,17 @@ MONTH = FULL_RELEASE_MONTH
 # Pinned by the Rust test `inventory_digest_matches_the_cross_language_fixture`
 # in tests/datacite_release.rs: part_0000.jsonl.gz = b"x", 2026-07.csv.gz = b"yz".
 RUST_FIXTURE_INVENTORY = "eece7282f43778a37b55e1481455c501c7eb72adb5a4bba7f6dbfff2d701621b"
+# Pinned by the same Rust test: the fixture above plus a folder dated after the
+# release month, part_0000.jsonl.gz = b"later", 2026-08.csv.gz = b"rows".
+LATER_FOLDER_FIXTURE_INVENTORY = (
+    "f4ce7500bce908603e88efe1e7285ccff4d2ebf628553c86654179bcf26bcb01"
+)
+LATER_FOLDER_FILES = [
+    (part_path(MONTH, 0), b"x"),
+    (csv_path(MONTH), b"yz"),
+    (part_path("2026-08", 0), b"later"),
+    (csv_path("2026-08"), b"rows"),
+]
 
 
 # --- inventory --------------------------------------------------------------
@@ -91,12 +102,42 @@ def test_inventory_ignores_non_input_entries_and_manifest_order(tmp_path: Path) 
     assert release_inventory_sha256(root, MONTH) == RUST_FIXTURE_INVENTORY
 
 
+def test_inventory_includes_folders_dated_after_the_release_month(tmp_path: Path) -> None:
+    # The real 2026-07 data file, generated on 1 August, lists
+    # `dois/updated_2026-08/` for the DOIs updated before the snapshot. The
+    # folder is an ordinary input and the digest agrees with the Rust reader.
+    root = tmp_path / "release"
+    write_full_datacite_release(root, MONTH, LATER_FOLDER_FILES)
+    rows = [
+        [path, len(data), hashlib.sha256(data).hexdigest()]
+        for path, data in sorted(LATER_FOLDER_FILES)
+    ]
+    expected = hashlib.sha256(
+        json.dumps(rows, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    assert (
+        release_inventory_sha256(root, MONTH)
+        == expected
+        == LATER_FOLDER_FIXTURE_INVENTORY
+    )
+    # The inventory depends only on the manifest, never on the release month.
+    assert release_inventory_sha256(root, "2026-06") == LATER_FOLDER_FIXTURE_INVENTORY
+    assert release_inventory_sha256(root, "2026-08") == LATER_FOLDER_FIXTURE_INVENTORY
+
+
 @pytest.mark.parametrize(
     ("files", "message"),
     [
         ([(part_path(MONTH, 0), b"x")], "csv"),
         ([(part_path("2026-06", 0), b"x")], "csv"),
-        ([(part_path("2026-08", 0), b"x"), (csv_path("2026-08"), b"yz")], "later"),
+        (
+            [
+                (part_path(MONTH, 0), b"x"),
+                (csv_path(MONTH), b"yz"),
+                (part_path("2026-08", 0), b"later"),
+            ],
+            "updated_2026-08 lists JSONL",
+        ),
         ([(f"dois/updated_{MONTH}/nested/part.jsonl.gz", b"x")], "updated_"),
         ([(f"other/updated_{MONTH}/{MONTH}.csv.gz", b"yz")], "dois"),
         ([("dois/updated_2026-13/2026-13.csv.gz", b"yz")], "updated_"),
@@ -208,6 +249,20 @@ def test_discover_release_fails_without_csv_state_report(tmp_path: Path) -> None
     write_full_datacite_release(_mirror(mount, MONTH), MONTH, [(part_path(MONTH, 0), b"x")])
     with pytest.raises(DataciteIndexError, match="csv"):
         discover_release(mount)
+
+
+def test_discover_release_accepts_a_folder_dated_after_the_release_month(
+    tmp_path: Path,
+) -> None:
+    # The real layout: a 2026-07 mirror entry whose manifest lists both
+    # `updated_2026-07/` and `updated_2026-08/`, each with JSONL and CSV.
+    mount = tmp_path / "mnt"
+    write_full_datacite_release(_mirror(mount, MONTH), MONTH, LATER_FOLDER_FILES)
+    assert discover_release(mount) == DataciteRelease(
+        release=MONTH,
+        root=_mirror(mount, MONTH),
+        inventory_sha256=LATER_FOLDER_FIXTURE_INVENTORY,
+    )
 
 
 # --- paths ------------------------------------------------------------------

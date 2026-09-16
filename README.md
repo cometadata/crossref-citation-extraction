@@ -55,6 +55,9 @@ release (for example `datacite-monthly-data-file-2026-07/`), holding:
   `dois/updated_YYYY-MM/*.csv.gz` entry is an expected input and is verified
   against its digest.
 - `STATUS.json` — must report `"status": "Complete"` for the release month.
+  Folder months are not checked against it: the 2026-07 release, generated
+  on 1 August, also lists `dois/updated_2026-08/` for the DOIs updated
+  before the snapshot, and that folder is an input like any other.
 - `dois/updated_YYYY-MM/part_NNNN.jsonl.gz` — DOI metadata records. Both
   unwrapped `{"id", "attributes": {...}}` records and API-style
   `{"data": {...}}` singletons are accepted; the registered landing page is

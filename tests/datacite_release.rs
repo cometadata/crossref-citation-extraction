@@ -202,6 +202,27 @@ fn inventory_digest_matches_the_cross_language_fixture() -> anyhow::Result<()> {
         release.inventory_sha256,
         "eece7282f43778a37b55e1481455c501c7eb72adb5a4bba7f6dbfff2d701621b"
     );
+
+    // A folder dated after the release month is an ordinary input: the real
+    // 2026-07 data file, generated on 1 August, lists `dois/updated_2026-08/`
+    // for the DOIs updated before the snapshot. Python pins this digest too.
+    let tmp = tempfile::tempdir()?;
+    write_release(
+        tmp.path(),
+        MONTH,
+        &[
+            (&part_path(MONTH, 0), b"x".to_vec()),
+            (&csv_path(MONTH), b"yz".to_vec()),
+            (&part_path("2026-08", 0), b"later".to_vec()),
+            (&csv_path("2026-08"), b"rows".to_vec()),
+        ],
+    )?;
+    let release = MonthlyRelease::open(tmp.path())?;
+    assert_eq!(release.files.len(), 4);
+    assert_eq!(
+        release.inventory_sha256,
+        "f4ce7500bce908603e88efe1e7285ccff4d2ebf628553c86654179bcf26bcb01"
+    );
     Ok(())
 }
 
@@ -285,7 +306,6 @@ fn open_rejects_unexpected_duplicate_and_traversing_paths() -> anyhow::Result<()
         ("dois/part_0000.jsonl.gz", "dois/part_0000"),
         ("other/updated_2026-07/part_0000.jsonl.gz", "other/"),
         ("dois/updated_2026-13/part_0000.jsonl.gz", "2026-13"),
-        ("dois/updated_2026-08/part_0000.jsonl.gz", "later than"),
         (
             "dois\\updated_2026-07\\part_0000.jsonl.gz",
             "updated_2026-07",
@@ -312,10 +332,11 @@ fn open_rejects_unexpected_duplicate_and_traversing_paths() -> anyhow::Result<()
 }
 
 #[test]
-fn open_requires_complete_status_and_accepts_earlier_month_folders() -> anyhow::Result<()> {
+fn open_requires_complete_status_and_accepts_folders_of_any_month() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     // The real data file is cumulative: folders for earlier months sit next
-    // to the release month's own folder.
+    // to the release month's own folder, and a release generated on the 1st
+    // also carries the next month's folder.
     write_release(
         tmp.path(),
         "2026-07",
@@ -356,10 +377,13 @@ fn open_requires_complete_status_and_accepts_earlier_month_folders() -> anyhow::
         assert!(error_text(&err).contains(status), "{err:#}");
     }
 
-    // A folder later than the release month means the status is stale.
+    // A folder dated after the release month is accepted and inventoried;
+    // the inventory depends only on the manifest, never on the STATUS month.
     write_status(tmp.path(), "2026-06", "Complete")?;
-    let err = MonthlyRelease::open(tmp.path()).unwrap_err();
-    assert!(error_text(&err).contains("later than"), "{err:#}");
+    let later = MonthlyRelease::open(tmp.path())?;
+    assert_eq!(later.release, "2026-06");
+    assert_eq!(later.files, release.files);
+    assert_eq!(later.inventory_sha256, release.inventory_sha256);
 
     write_status(tmp.path(), "2026/07", "Complete")?;
     let err = MonthlyRelease::open(tmp.path()).unwrap_err();
@@ -368,6 +392,94 @@ fn open_requires_complete_status_and_accepts_earlier_month_folders() -> anyhow::
     fs::remove_file(tmp.path().join("STATUS.json"))?;
     let err = MonthlyRelease::open(tmp.path()).unwrap_err();
     assert!(error_text(&err).contains("STATUS.json"), "{err:#}");
+    Ok(())
+}
+
+#[test]
+fn open_scans_a_folder_dated_after_the_release_month() -> anyhow::Result<()> {
+    // Mirrors the real 2026-07 data file: `STATUS.json` says 2026-07, and
+    // the manifest lists `dois/updated_2026-08/` (one part, one state
+    // report) for the DOIs updated on 1 August before the snapshot.
+    let tmp = tempfile::tempdir()?;
+    write_release(
+        tmp.path(),
+        "2026-07",
+        &[
+            (
+                &part_path("2026-07", 0),
+                gzip(&metadata_jsonl(&[json!({"id":"10.1234/july"})])),
+            ),
+            (
+                &csv_path("2026-07"),
+                gzip(&state_csv(&[("10.1234/july", "findable")])),
+            ),
+            (
+                &part_path("2026-08", 0),
+                gzip(&metadata_jsonl(&[json!({"id":"10.1234/august"})])),
+            ),
+            (
+                &csv_path("2026-08"),
+                gzip(&state_csv(&[
+                    ("10.1234/august", "findable"),
+                    ("10.1234/august-registered", "registered"),
+                ])),
+            ),
+        ],
+    )?;
+    let release = MonthlyRelease::open(tmp.path())?;
+    assert_eq!(release.release, "2026-07");
+    let paths: Vec<_> = release
+        .files
+        .iter()
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            csv_path("2026-07"),
+            part_path("2026-07", 0),
+            csv_path("2026-08"),
+            part_path("2026-08", 0),
+        ]
+    );
+    let (rows, stats) = scan_all(&release)?;
+    assert_eq!((stats.metadata_records, stats.csv_records), (2, 3));
+    let dois: std::collections::BTreeSet<_> = rows.into_iter().map(|row| row.doi).collect();
+    assert_eq!(
+        dois.into_iter().collect::<Vec<_>>(),
+        vec![
+            "10.1234/august",
+            "10.1234/august-registered",
+            "10.1234/july"
+        ]
+    );
+
+    // The later folder is held to the same rule as every other: JSONL
+    // metadata without a state report is refused.
+    let tmp = tempfile::tempdir()?;
+    write_release(
+        tmp.path(),
+        "2026-07",
+        &[
+            (
+                &part_path("2026-07", 0),
+                gzip(&metadata_jsonl(&[json!({"id":"10.1234/july"})])),
+            ),
+            (
+                &csv_path("2026-07"),
+                gzip(&state_csv(&[("10.1234/july", "findable")])),
+            ),
+            (
+                &part_path("2026-08", 0),
+                gzip(&metadata_jsonl(&[json!({"id":"10.1234/august"})])),
+            ),
+        ],
+    )?;
+    let err = MonthlyRelease::open(tmp.path()).unwrap_err();
+    assert!(
+        error_text(&err).contains("updated_2026-08 lists JSONL"),
+        "{err:#}"
+    );
     Ok(())
 }
 

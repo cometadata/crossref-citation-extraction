@@ -147,8 +147,12 @@ def _source_kind(filename: str) -> str | None:
     return None
 
 
-def _listed_month(filename: str) -> tuple[str, tuple[int, int]]:
-    """Validate `dois/updated_YYYY-MM/<file>` and return the folder month."""
+def _listed_month(filename: str) -> str:
+    """Validate `dois/updated_YYYY-MM/<file>` and return the folder month.
+
+    The month is never compared with the release month: a release generated
+    on the 1st lists the next month's folder for the DOIs updated before the
+    snapshot, and that folder is an input like any other."""
     parts = filename.split("/")
     if len(parts) != 3:
         raise DataciteIndexError(
@@ -160,12 +164,11 @@ def _listed_month(filename: str) -> tuple[str, tuple[int, int]]:
             f"expected the first path component to be {_DOIS_DIR!r}, found {top!r}"
         )
     month = folder.removeprefix(_MONTH_DIR_PREFIX)
-    key = _parse_month(month) if folder.startswith(_MONTH_DIR_PREFIX) else None
-    if key is None:
+    if not folder.startswith(_MONTH_DIR_PREFIX) or _parse_month(month) is None:
         raise DataciteIndexError(f"folder {folder!r} is not {_MONTH_DIR_PREFIX}YYYY-MM")
     if basename in {"", ".", ".."} or "\\" in basename:
         raise DataciteIndexError(f"invalid file name {basename!r}")
-    return month, key
+    return month
 
 
 def _decode_manifest_digest(encoded: Any) -> str:
@@ -206,13 +209,12 @@ def release_inventory_sha256(root: Path, release: str) -> str:
     """Digest of the release's listed inputs, computed from `MANIFEST.json`.
 
     Inputs are the manifest entries ending in `.jsonl.gz` or `.csv.gz` at
-    exactly `dois/updated_YYYY-MM/<file>` with a month no later than
-    `release`. A month folder listing JSONL metadata without a CSV state
+    exactly `dois/updated_YYYY-MM/<file>`, whatever the folder month relative
+    to `release`. A month folder listing JSONL metadata without a CSV state
     report is invalid: there is no JSONL-only fallback. File bytes are not
     read here; the Rust builder verifies them against the manifest.
     """
-    release_month = _parse_month(release)
-    if release_month is None:
+    if _parse_month(release) is None:
         raise DataciteIndexError(f"release {release!r} is not YYYY-MM")
     manifest_path, entries = _read_manifest(root)
     listed: dict[str, tuple[int, str]] = {}
@@ -228,11 +230,7 @@ def release_inventory_sha256(root: Path, release: str) -> str:
             continue
         context = f"{manifest_path}: entry {filename!r}"
         try:
-            month, month_key = _listed_month(filename)
-            if month_key > release_month:
-                raise DataciteIndexError(
-                    f"folder month {month} is later than release {release}"
-                )
+            month = _listed_month(filename)
             size = entry.get("size")
             if isinstance(size, bool) or not isinstance(size, int) or size < 0:
                 raise DataciteIndexError("size must be a non-negative integer")

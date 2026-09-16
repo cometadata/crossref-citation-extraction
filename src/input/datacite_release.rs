@@ -3,10 +3,12 @@
 //! A monthly data file is cumulative: `dois/updated_YYYY-MM/` folders for
 //! every month since the registry began, each holding `part_NNNN.jsonl.gz`
 //! metadata records and a `<YYYY-MM>.csv.gz` state report listing the
-//! Findable and Registered DOIs updated that month. `MANIFEST.json` (or the
-//! whitespace-separated text `MANIFEST`) lists every file with its size and
-//! base64 SHA-256; `STATUS.json` records the release month and whether
-//! generation is `Complete`.
+//! Findable and Registered DOIs updated that month. A release generated on
+//! the 1st also carries the next month's folder for the DOIs updated before
+//! the snapshot; every listed folder is an input whatever its month.
+//! `MANIFEST.json` (or the whitespace-separated text `MANIFEST`) lists every
+//! file with its size and base64 SHA-256; `STATUS.json` records the release
+//! month and whether generation is `Complete`.
 //!
 //! [`MonthlyRelease::open`] validates the manifest against the on-disk
 //! layout without decoding any data; [`MonthlyRelease::scan`] streams every
@@ -107,14 +109,13 @@ impl MonthlyRelease {
     ///
     /// Requires a `Complete` `STATUS.json`; a manifest (`MANIFEST.json`, or
     /// the text `MANIFEST` only when the JSON form is absent); that every
-    /// listed JSONL/CSV input sits at `dois/updated_YYYY-MM/<file>` with its
-    /// manifest size; that no folder month is later than the release month;
-    /// that every folder listing metadata parts also lists a state report;
-    /// and that no unlisted JSONL/CSV file exists under `dois/`. Listed
-    /// entries that are not JSONL/CSV inputs are ignored.
+    /// listed JSONL/CSV input sits at `dois/updated_YYYY-MM/<file>` (any
+    /// calendar month, before or after the release month) with its manifest
+    /// size; that every folder listing metadata parts also lists a state
+    /// report; and that no unlisted JSONL/CSV file exists under `dois/`.
+    /// Listed entries that are not JSONL/CSV inputs are ignored.
     pub fn open(root: &Path) -> Result<Self> {
         let release = read_status(root)?;
-        let release_month = parse_month(&release).expect("read_status validates the month");
         let (manifest_path, entries) = read_manifest(root)?;
 
         let mut listed: BTreeMap<String, SourceFile> = BTreeMap::new();
@@ -124,12 +125,7 @@ impl MonthlyRelease {
                 continue;
             };
             let context = || format!("{}: entry {:?}", manifest_path.display(), entry.filename);
-            let (month, month_key) = listed_month(&entry.filename).with_context(context)?;
-            ensure!(
-                month_key <= release_month,
-                "{}: folder month {month} is later than release {release}",
-                context()
-            );
+            let month = listed_month(&entry.filename).with_context(context)?;
             let sha256 = decode_manifest_digest(&entry.sha256).with_context(context)?;
             ensure!(
                 !listed.contains_key(&entry.filename),
@@ -264,7 +260,8 @@ fn read_status(root: &Path) -> Result<String> {
     Ok(status.month)
 }
 
-/// Parse `YYYY-MM` into a comparable `(year, month)` pair.
+/// Parse `YYYY-MM` into its `(year, month)` pair; `None` unless the month
+/// is a calendar month.
 fn parse_month(text: &str) -> Option<(u16, u8)> {
     let (year, month) = text.split_once('-')?;
     if year.len() != 4
@@ -367,10 +364,10 @@ struct FolderContents {
     state_report: bool,
 }
 
-/// Validate `dois/updated_YYYY-MM/<file>` and return the folder month with
-/// its comparable key. Anything else (absolute paths, `..`, extra depth,
-/// backslashes, malformed months) is rejected.
-fn listed_month(filename: &str) -> Result<(&str, (u16, u8))> {
+/// Validate `dois/updated_YYYY-MM/<file>` and return the folder month.
+/// Anything else (absolute paths, `..`, extra depth, backslashes, malformed
+/// months) is rejected; the month is never compared with the release month.
+fn listed_month(filename: &str) -> Result<&str> {
     let mut parts = filename.split('/');
     let (Some(top), Some(folder), Some(basename), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -385,12 +382,12 @@ fn listed_month(filename: &str) -> Result<(&str, (u16, u8))> {
     let month = folder
         .strip_prefix(MONTH_DIR_PREFIX)
         .ok_or_else(not_a_month)?;
-    let key = parse_month(month).ok_or_else(not_a_month)?;
+    parse_month(month).ok_or_else(not_a_month)?;
     ensure!(
         !basename.is_empty() && basename != "." && basename != ".." && !basename.contains('\\'),
         "invalid file name {basename:?}"
     );
-    Ok((month, key))
+    Ok(month)
 }
 
 /// Decode a manifest's base64 SHA-256 into lowercase hex.
