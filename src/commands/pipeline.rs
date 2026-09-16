@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use super::datacite_pipeline::run_datacite_pipeline;
 use crate::cli::{should_include_provenance_filter, PipelineArgs};
 use crate::common::{extract_input_stem, setup_logging, MatchType, OutputPaths};
 use crate::extract::{extract_arxiv_matches_from_text, Provenance};
@@ -144,6 +145,12 @@ fn determine_provenance(reference: &RefFields<'_>, extracted_doi: &str) -> Prove
 
 pub fn run_pipeline(args: PipelineArgs) -> Result<()> {
     setup_logging(&args.log_level)?;
+
+    // `--datacite-index` selects full DataCite mode; everything below stays
+    // the arXiv-only pipeline, so legacy invocations are unaffected.
+    if args.datacite_index.is_some() {
+        return run_datacite_pipeline(&args);
+    }
 
     info!("Starting arXiv citation extraction pipeline");
     info!("Input: {}", args.input);
@@ -611,6 +618,17 @@ mod tests {
             batch_size: 5000000,
             resume: false,
             checkpoint_interval: 1,
+            datacite_index: None,
+            run_identity: None,
+            partitions: 256,
+            writer_memory_mb: 4096,
+            result_batch_mb: 16,
+            queue_batches: 8,
+            aggregation_memory_mb: 16384,
+            merge_fan_in: 32,
+            sort_workers: 4,
+            lookup_memory_mb: 64,
+            max_entry_mb: 512,
         }
     }
 

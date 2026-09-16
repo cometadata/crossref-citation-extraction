@@ -5,6 +5,6 @@ mod datacite;
 pub mod datacite_release;
 mod detection;
 
-pub use crossref::{visit_crossref_entries, CrossrefEntry};
+pub use crossref::{visit_crossref_entries, visit_crossref_entries_limited, CrossrefEntry};
 pub use datacite::open_datacite_source;
 pub use detection::{detect_crossref_input, detect_datacite_input, CrossrefInput, DataciteInput};

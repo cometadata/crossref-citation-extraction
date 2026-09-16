@@ -149,6 +149,92 @@ pub struct PipelineArgs {
     /// partitions on resume; 0 disables checkpointing.
     #[arg(long, default_value = "1")]
     pub checkpoint_interval: usize,
+
+    /// DataCite index bundle directory (full DOI and landing-page mining).
+    /// Selects DataCite mode; cannot be combined with --arxiv-fst or
+    /// --arxiv-records.
+    #[arg(long)]
+    pub datacite_index: Option<String>,
+
+    /// JSON file holding the run identity object (DataCite mode). Its
+    /// canonical digest names every resumable artifact; without it a
+    /// derived identity is used for local runs.
+    #[arg(long)]
+    pub run_identity: Option<String>,
+
+    /// Hashed partition count in DataCite mode (a positive power of two)
+    #[arg(
+        long,
+        default_value_t = 256,
+        value_parser = clap::builder::RangedU64ValueParser::<u32>::new().range(1..)
+    )]
+    pub partitions: u32,
+
+    /// Partition writer buffer budget in MiB (DataCite mode)
+    #[arg(
+        long,
+        default_value_t = 4096,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub writer_memory_mb: usize,
+
+    /// Largest worker result batch in MiB (DataCite mode)
+    #[arg(
+        long,
+        default_value_t = 16,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub result_batch_mb: usize,
+
+    /// Result batches buffered between workers and the writer (DataCite mode)
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub queue_batches: usize,
+
+    /// Aggregation memory budget in MiB (DataCite mode); at least
+    /// --writer-memory-mb
+    #[arg(
+        long,
+        default_value_t = 16384,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub aggregation_memory_mb: usize,
+
+    /// Most sorted runs merged in one pass during aggregation (DataCite mode)
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(2..)
+    )]
+    pub merge_fan_in: usize,
+
+    /// Threads sorting segments concurrently during aggregation (DataCite mode)
+    #[arg(
+        long,
+        default_value_t = 4,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub sort_workers: usize,
+
+    /// Budget for one landing-page candidate lookup in MiB (DataCite mode)
+    #[arg(
+        long,
+        default_value_t = 64,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub lookup_memory_mb: usize,
+
+    /// Largest Crossref member accepted in MiB (DataCite mode); a larger
+    /// member is a fatal source error
+    #[arg(
+        long,
+        default_value_t = 512,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
+    )]
+    pub max_entry_mb: usize,
 }
 
 impl PipelineArgs {
@@ -225,7 +311,52 @@ mod tests {
             batch_size: 5000000,
             resume: false,
             checkpoint_interval: 1,
+            datacite_index: None,
+            run_identity: None,
+            partitions: 256,
+            writer_memory_mb: 4096,
+            result_batch_mb: 16,
+            queue_batches: 8,
+            aggregation_memory_mb: 16384,
+            merge_fan_in: 32,
+            sort_workers: 4,
+            lookup_memory_mb: 64,
+            max_entry_mb: 512,
         }
+    }
+
+    #[test]
+    fn test_datacite_mode_flags_default_and_reject_zero() {
+        use clap::Parser;
+        let args = PipelineArgs::parse_from(["prog", "--input", "x.tar.gz"]);
+        assert!(args.datacite_index.is_none());
+        assert_eq!(args.partitions, 256);
+        assert_eq!(args.writer_memory_mb, 4096);
+        assert_eq!(args.result_batch_mb, 16);
+        assert_eq!(args.queue_batches, 8);
+        assert_eq!(args.aggregation_memory_mb, 16384);
+        assert_eq!(args.merge_fan_in, 32);
+        assert_eq!(args.sort_workers, 4);
+        assert_eq!(args.lookup_memory_mb, 64);
+        assert_eq!(args.max_entry_mb, 512);
+        for flag in [
+            "--partitions",
+            "--writer-memory-mb",
+            "--result-batch-mb",
+            "--queue-batches",
+            "--aggregation-memory-mb",
+            "--sort-workers",
+            "--lookup-memory-mb",
+            "--max-entry-mb",
+        ] {
+            assert!(
+                PipelineArgs::try_parse_from(["prog", "--input", "x", flag, "0"]).is_err(),
+                "{flag} must reject zero"
+            );
+        }
+        assert!(
+            PipelineArgs::try_parse_from(["prog", "--input", "x", "--merge-fan-in", "1"]).is_err()
+        );
     }
 
     #[test]
