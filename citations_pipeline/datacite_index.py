@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -83,6 +84,11 @@ _MANIFEST_KEYS = {
     "files",
     "counts",
 }
+# A transient read error while copying a cached bundle file off the mount is
+# retried after each delay (three attempts in total) before the cache is
+# declared invalid, which would otherwise cost a full index rebuild.
+COPY_RETRY_DELAYS = (2.0, 8.0)
+_sleep = time.sleep
 
 
 class DataciteIndexError(RuntimeError):
@@ -408,6 +414,35 @@ def _promote(staging: Path, destination: Path) -> Path:
     return destination
 
 
+def _copy_cached_file(source: Path, target: Path, name: str, events: Any) -> None:
+    """Copy one cached bundle file, retrying a transient `OSError` (an I/O
+    error or timeout on the mount) after each of `COPY_RETRY_DELAYS`; the
+    last failure is a `DataciteIndexError`. A missing file is an incomplete
+    cache, not a transient error, and is not retried."""
+    for attempt in range(len(COPY_RETRY_DELAYS) + 1):
+        try:
+            shutil.copyfile(source, target)
+            return
+        except FileNotFoundError as error:
+            raise DataciteIndexError(
+                f"cannot copy cached bundle file {name}: {error}"
+            ) from error
+        except OSError as error:
+            if attempt == len(COPY_RETRY_DELAYS):
+                raise DataciteIndexError(
+                    f"cannot copy cached bundle file {name} after {attempt + 1} "
+                    f"attempts: {error}"
+                ) from error
+            events.emit(
+                "bundle_cache_copy_retry",
+                file=name,
+                attempt=attempt + 1,
+                delay_seconds=COPY_RETRY_DELAYS[attempt],
+                reason=str(error),
+            )
+            _sleep(COPY_RETRY_DELAYS[attempt])
+
+
 def _reuse_cached_bundle(
     cache_root: Path,
     local_root: Path,
@@ -430,12 +465,7 @@ def _reuse_cached_bundle(
                 )
             staging.mkdir(parents=True)
             for name in [*manifest["files"], BUNDLE_MARKER_NAME]:
-                try:
-                    shutil.copyfile(generation / name, staging / name)
-                except OSError as error:
-                    raise DataciteIndexError(
-                        f"cannot copy cached bundle file {name}: {error}"
-                    ) from error
+                _copy_cached_file(generation / name, staging / name, name, events)
             _verify_files(staging, manifest)
             if sha256_file(staging / BUNDLE_MARKER_NAME) != digest:
                 raise DataciteIndexError(

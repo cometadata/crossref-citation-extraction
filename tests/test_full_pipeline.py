@@ -45,6 +45,7 @@ from citations_pipeline.full_state import (
 from citations_pipeline.mirror import MirrorError, ResolvedSnapshot
 from citations_pipeline.paired_publish import (
     MANIFEST_PATH,
+    PublicationTransportError,
     prepare_dataset,
     publish_pair,
 )
@@ -1134,6 +1135,43 @@ def test_noop_requires_both_current_publications_to_verify(
         run_full_pipeline(case.config, case.dependencies())
     assert case.publication_calls == Counter({"datacite": 1, "arxiv": 1})
     assert case.paths.pipeline_marker.read_bytes() == marker_before
+
+
+@pytest.mark.parametrize(
+    "error",
+    [ConnectionError("hub unreachable"), PublicationTransportError("cannot resolve HEAD: timeout")],
+)
+def test_noop_transport_errors_propagate_unchanged(
+    full_pipeline_case: FullPipelineCase, error: Exception
+) -> None:
+    case = full_pipeline_case
+    run_full_pipeline(case.config, case.dependencies())
+    marker_before = case.paths.pipeline_marker.read_bytes()
+
+    def failing_verify(**kwargs: Any) -> None:
+        raise error
+
+    deps = replace(case.dependencies(), verify_current=failing_verify)
+    with pytest.raises(type(error)) as excinfo:
+        run_full_pipeline(case.config, deps)
+    assert excinfo.value is error
+    assert "concurrent change" not in str(excinfo.value)
+    assert case.paths.pipeline_marker.read_bytes() == marker_before
+
+
+def test_noop_verification_errors_report_a_concurrent_change(
+    full_pipeline_case: FullPipelineCase,
+) -> None:
+    case = full_pipeline_case
+    run_full_pipeline(case.config, case.dependencies())
+
+    def mismatched(**kwargs: Any) -> None:
+        raise PublishError("managed files differ from the manifest")
+
+    deps = replace(case.dependencies(), verify_current=mismatched)
+    with pytest.raises(PipelineError, match="concurrent change: the datacite dataset") as excinfo:
+        run_full_pipeline(case.config, deps)
+    assert isinstance(excinfo.value.__cause__, PublishError)
 
 
 def test_noop_verifies_the_persisted_datasets_by_digest(

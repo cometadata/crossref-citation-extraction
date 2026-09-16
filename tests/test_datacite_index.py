@@ -515,6 +515,82 @@ def test_ensure_bundle_reuses_a_verified_cache_without_calling_the_builder(
     assert "bundle_built" not in case.names()
 
 
+class FlakyCopy:
+    """`shutil.copyfile` that raises a transient `OSError` for `name` read
+    from the bucket cache (under `cache`) the first `failures` times."""
+
+    def __init__(self, real: Callable[..., Any], name: str, failures: int, cache: Path) -> None:
+        self.real = real
+        self.name = name
+        self.failures = failures
+        self.cache = cache
+        self.attempts = 0
+
+    def __call__(self, source: Any, target: Any, *args: Any, **kwargs: Any) -> Any:
+        if Path(source).name == self.name and Path(source).is_relative_to(self.cache):
+            self.attempts += 1
+            if self.attempts <= self.failures:
+                raise OSError(5, "Input/output error", str(source))
+        return self.real(source, target, *args, **kwargs)
+
+
+def test_a_transient_copy_error_is_retried_before_the_cache_is_rejected(
+    case: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import citations_pipeline.datacite_index as datacite_index
+
+    first = case.ensure(Builder(case.release))
+    flaky = FlakyCopy(
+        datacite_index.shutil.copyfile, "url-targets.bin", failures=1, cache=case.cache_root
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(datacite_index.shutil, "copyfile", flaky)
+    monkeypatch.setattr(datacite_index, "_sleep", sleeps.append)
+    second = case.ensure(fail_build)
+    assert second.reused is True
+    assert second.manifest_sha256 == first.manifest_sha256
+    assert flaky.attempts == 2
+    assert sleeps == [datacite_index.COPY_RETRY_DELAYS[0]]
+    [retry] = case.emitted("bundle_cache_copy_retry")
+    assert retry["file"] == "url-targets.bin" and retry["attempt"] == 1
+    assert "bundle_cache_invalid" not in case.names()
+
+
+def test_a_persistent_copy_error_falls_through_to_a_rebuild_after_bounded_retries(
+    case: Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import citations_pipeline.datacite_index as datacite_index
+
+    case.ensure(Builder(case.release))
+    flaky = FlakyCopy(
+        datacite_index.shutil.copyfile, "dois.fst", failures=10**6, cache=case.cache_root
+    )
+    sleeps: list[float] = []
+    monkeypatch.setattr(datacite_index.shutil, "copyfile", flaky)
+    monkeypatch.setattr(datacite_index, "_sleep", sleeps.append)
+    builder = Builder(case.release)
+    result = case.ensure(builder)
+    assert result.reused is False
+    assert len(builder.calls) == 1
+    assert flaky.attempts == len(datacite_index.COPY_RETRY_DELAYS) + 1 == 3
+    assert sleeps == list(datacite_index.COPY_RETRY_DELAYS)
+    [invalid] = case.emitted("bundle_cache_invalid")
+    assert "dois.fst" in invalid["reason"]
+
+
+def test_a_missing_cached_file_is_not_retried(case: Case, monkeypatch: pytest.MonkeyPatch) -> None:
+    import citations_pipeline.datacite_index as datacite_index
+
+    generation = seed_cache(case)
+    (generation / "hosts.fst").unlink()
+    sleeps: list[float] = []
+    monkeypatch.setattr(datacite_index, "_sleep", sleeps.append)
+    result = case.ensure(Builder(case.release))
+    assert result.reused is False
+    assert sleeps == []
+    assert "bundle_cache_copy_retry" not in case.names()
+
+
 def test_same_size_sidecar_mutation_forces_a_rebuild_and_keeps_the_old_generation(
     case: Case,
 ) -> None:

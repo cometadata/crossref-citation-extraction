@@ -86,6 +86,12 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
+class PublicationTransportError(PublishError):
+    """Reading the Hub failed (resolving HEAD, listing files, downloading a
+    file): the repository's state is unknown, which is not evidence of a
+    concurrent change."""
+
+
 @dataclass(frozen=True)
 class PreparedDataset:
     repo_id: str
@@ -618,7 +624,9 @@ def _head_sha(api: Any, token: str | None, repo_id: str) -> str:
     try:
         sha = api.dataset_info(repo_id, token=token).sha
     except Exception as error:
-        raise PublishError(f"cannot resolve HEAD of {repo_id}: {error}") from error
+        raise PublicationTransportError(
+            f"cannot resolve HEAD of {repo_id}: {error}"
+        ) from error
     if not isinstance(sha, str) or not _COMMIT_RE.fullmatch(sha):
         raise PublishError(f"{repo_id}: HEAD is not a commit hash: {sha!r}")
     return sha
@@ -633,7 +641,9 @@ def _list_files(api: Any, token: str | None, repo_id: str, revision: str) -> dic
             )
         )
     except Exception as error:
-        raise PublishError(f"cannot list {repo_id} at {revision}: {error}") from error
+        raise PublicationTransportError(
+            f"cannot list {repo_id} at {revision}: {error}"
+        ) from error
     tree: dict[str, Any] = {}
     for entry in entries:
         if hasattr(entry, "tree_id"):
@@ -663,7 +673,7 @@ def _download(
             cache_dir=cache_dir,
         )
     except Exception as error:
-        raise PublishError(
+        raise PublicationTransportError(
             f"cannot download {path} from {repo_id} at {revision}: {error}"
         ) from error
     return Path(local)
@@ -850,8 +860,10 @@ def verify_current(
 
 
 def _check_prepared(prepared: PreparedDataset) -> dict[str, Any]:
-    """Cheap local consistency: the manifest is ours, and the prepared files
-    exist with the manifest's names and sizes. Digests are verified remotely."""
+    """Local consistency before anything touches the Hub: the manifest is
+    ours, and every prepared file exists with the manifest's name, size and
+    SHA-256, so a file changed after preparation is never committed. The
+    remote copies are verified again after the commit."""
     repo_id = prepared.repo_id
     for name, path in prepared.files.items():
         _relative_path(name, f"{repo_id} prepared files")
@@ -877,11 +889,17 @@ def _check_prepared(prepared: PreparedDataset) -> dict[str, Any]:
         )
     if set(files) != set(prepared.files) - {MANIFEST_PATH}:
         raise PublishError(f"{repo_id}: prepared files differ from the manifest's files")
-    for name, meta in files.items():
+    for name, meta in sorted(files.items()):
         size = prepared.files[name].stat().st_size
         if size != meta.size:
             raise PublishError(
                 f"{repo_id}: prepared file {name} is {size} bytes, manifest expects {meta.size}"
+            )
+        digest = sha256_file(prepared.files[name])
+        if digest != meta.sha256:
+            raise PublishError(
+                f"{repo_id}: prepared file {name} digest {digest} does not match "
+                f"manifest digest {meta.sha256}"
             )
     return manifest
 

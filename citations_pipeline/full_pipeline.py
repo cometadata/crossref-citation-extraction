@@ -78,6 +78,7 @@ from .mirror import MirrorError, ResolvedSnapshot, resolve_mirror_snapshot
 from .paired_publish import (
     MANIFEST_PATH,
     PreparedDataset,
+    PublicationTransportError,
     prepare_dataset,
     publish_pair,
     publish_prepared,
@@ -971,7 +972,12 @@ def verify_active_publication(
     identity: RunIdentity,
 ) -> dict[str, Any]:
     """An activated run with this identity is a no-op only if both
-    repositories still publish exactly the persisted artifacts."""
+    repositories still publish exactly the persisted artifacts.
+
+    A publication verification error means the repository no longer
+    publishes the activated artifact and is reported as a concurrent change;
+    a failure to read the Hub (`PublicationTransportError`, or any other
+    exception) propagates unchanged, since the repository state is unknown."""
     events = deps.events
     derived = paths.derived_generation(active.derived_prefix)
     fetched = fetch_prepared_datasets(
@@ -992,7 +998,9 @@ def verify_active_publication(
                     prepared=fetched.prepared[kind],
                     receipt=active.publications[kind],
                 )
-            except Exception as error:
+            except PublicationTransportError:
+                raise
+            except PublishError as error:
                 raise PipelineError(
                     f"concurrent change: the {kind} dataset no longer publishes "
                     f"the activated artifact: {error}"

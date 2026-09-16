@@ -36,6 +36,7 @@ from citations_pipeline.paired_publish import (
     MANIFEST_PATH,
     MANIFEST_VERSION,
     PreparedDataset,
+    PublicationTransportError,
     canonical_manifest_bytes,
     prepare_dataset,
     publish_pair,
@@ -1199,6 +1200,44 @@ def test_publish_prepared_rejects_prepared_datasets_that_do_not_match_their_mani
             api=api, token=TOKEN, prepared=prepared, events=collect_events()[0], download=api.download
         )
     assert api.commit_calls == []
+
+
+def test_same_size_local_mutation_is_caught_before_any_commit(tmp_path: Path) -> None:
+    api = FakeHubApi()
+    prepared = prepare(tmp_path, "datacite")
+    shard = prepared.files["data/all/part-00000.parquet"]
+    data = shard.read_bytes()
+    shard.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+    with pytest.raises(PublishError, match="data/all/part-00000.parquet.*digest"):
+        publish_prepared(
+            api=api, token=TOKEN, prepared=prepared, events=collect_events()[0], download=api.download
+        )
+    assert api.create_repo_calls == []
+    assert api.commit_calls == []
+
+
+def test_read_failures_during_verification_are_transport_errors(tmp_path: Path) -> None:
+    api = FakeHubApi()
+    prepared = prepare(tmp_path, "datacite")
+    receipt = publish_prepared(
+        api=api, token=TOKEN, prepared=prepared, events=collect_events()[0], download=api.download
+    )
+
+    def unreachable(*args: Any, **kwargs: Any) -> Any:
+        raise ConnectionError("hub unreachable")
+
+    api.dataset_info = unreachable
+    with pytest.raises(PublicationTransportError, match="hub unreachable"):
+        verify_current(api=api, token=TOKEN, prepared=prepared, receipt=receipt, download=api.download)
+    # A real difference is a plain verification error, never a transport one.
+    api = FakeHubApi()
+    receipt = publish_prepared(
+        api=api, token=TOKEN, prepared=prepared, events=collect_events()[0], download=api.download
+    )
+    api.external_commit(DATACITE_REPO, {"data/all/part-00000.parquet": b"changed"})
+    with pytest.raises(PublishError) as excinfo:
+        verify_current(api=api, token=TOKEN, prepared=prepared, receipt=receipt, download=api.download)
+    assert not isinstance(excinfo.value, PublicationTransportError)
 
 
 def test_unparseable_remote_manifest_is_superseded_by_a_guarded_commit(
