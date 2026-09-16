@@ -592,8 +592,9 @@ def check_flat_references(
     con: duckdb.DuckDBPyConnection, flat_dir: Path
 ) -> dict[str, int]:
     """Enforce the confirmed-match contract on the flat table: unique
-    `(target, citer, ref_index)` tuples, no self-citations, and a nonempty
-    scope for every destination. Returns the row count per destination."""
+    `(target, citer, ref_index)` tuples and no self-citations. Returns the
+    row count per destination; an empty destination scope is legitimate and
+    yields schema-bearing empty configurations."""
     flat = _hive_source(flat_dir)
     duplicates, self_citations, rows, arxiv_rows = con.execute(
         f"""
@@ -613,11 +614,7 @@ def check_flat_references(
         )
     if self_citations:
         raise PublishError(f"{self_citations} self-citations in confirmed matches")
-    counts = {DATACITE_DESTINATION: int(rows), ARXIV_DESTINATION: int(arxiv_rows)}
-    for destination, count in counts.items():
-        if count == 0:
-            raise PublishError(f"no confirmed citations to publish for {destination}")
-    return counts
+    return {DATACITE_DESTINATION: int(rows), ARXIV_DESTINATION: int(arxiv_rows)}
 
 
 # --- queries --------------------------------------------------------------------

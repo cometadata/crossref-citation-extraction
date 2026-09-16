@@ -569,11 +569,82 @@ def test_malformed_jsonl_names_the_line(tmp_path):
         )
 
 
-def test_empty_or_arxiv_free_input_is_rejected(tmp_path):
+def test_empty_input_is_rejected(tmp_path):
     with pytest.raises(PublishError, match="no confirmed citations to publish"):
         run_transform(tmp_path, [])
-    with pytest.raises(PublishError, match="no confirmed citations to publish for arxiv"):
-        run_transform(tmp_path, [mixed_records()[0]], name="general-only")
+
+
+def assert_empty_legacy_arxiv_configuration(arxiv: DatasetTransform, config: str, keys):
+    name = f"data/{config}.parquet"
+    assert arxiv.config_files[config] == (name,)
+    assert arxiv.stats[config] == ConfigStats(works=0, citations=0, references=0)
+    table = pq.read_table(arxiv.files[name])
+    assert table.num_rows == 0
+    assert table.schema.names == [
+        "arxiv_doi", "arxiv_id", "citation_count", "cited_by", "reference_count"
+    ]
+    citer = table.schema.field("cited_by").type.value_type
+    assert struct_names(citer) == ["doi", "matches", "provenance"]
+    match = citer.field("matches").type.value_type
+    assert struct_names(match) == ["provenance", "raw_match", "reference"]
+    assert struct_names(match.field("reference").type) == list(keys)
+    assert arxiv.reference_keys[config] == tuple(keys)
+    assert arxiv.sizes[name] == arxiv.files[name].stat().st_size > 0
+
+
+def test_arxiv_free_input_yields_empty_arxiv_configurations(tmp_path):
+    lines: list[str] = []
+    result = run_transform(
+        tmp_path, [mixed_records()[0]], mixed_ambiguity_rows(), events=quiet_events(lines)
+    )
+    general, arxiv = result["datacite"], result["arxiv"]
+    assert general.stats["all"] == ConfigStats(works=1, citations=3, references=5)
+    assert general.ambiguity_rows == 3
+    # The arXiv projection is legitimately empty: its files still carry the
+    # legacy schema with the reference struct borrowed from the general scope.
+    for config in ("all", "asserted", "mined"):
+        assert_empty_legacy_arxiv_configuration(arxiv, config, general.reference_keys["all"])
+    assert arxiv.dropped_reference_keys == ()
+    assert arxiv.ambiguity_rows == 0
+    events = [json.loads(line.removeprefix("PIPELINE_EVENT=")) for line in lines]
+    final = next(e for e in events if e["event"] == "transform_completed")
+    assert final["arxiv_rows"] == 0 and final["arxiv_all_works"] == 0
+
+
+def test_empty_mined_configurations_keep_schemas(tmp_path):
+    records = [
+        {"doi": "10.1234/a", "cited_by": [
+            entry("10.9999/w1", 0, "publisher", "doi",
+                  {"DOI": "10.1234/a", "doi-asserted-by": "publisher"}),
+            entry("10.9999/w2", 4, "crossref", "doi",
+                  {"DOI": "10.1234/a", "doi-asserted-by": "crossref", "key": "r4"})]},
+        {"doi": ARXIV_B, "cited_by": [
+            entry("10.9999/w3", 1, "crossref", "doi",
+                  {"DOI": "10.48550/arXiv.2403.03542", "doi-asserted-by": "crossref"})]},
+    ]
+    result = run_transform(tmp_path, records)
+    general, arxiv = result["datacite"], result["arxiv"]
+    assert general.stats == {
+        "all": ConfigStats(works=2, citations=3, references=3),
+        "asserted": ConfigStats(works=2, citations=3, references=3),
+        "mined": ConfigStats(works=0, citations=0, references=0),
+    }
+    assert general.config_files["mined"] == ("data/mined/part-00000.parquet",)
+    mined = pq.read_table(general.files["data/mined/part-00000.parquet"])
+    assert mined.num_rows == 0
+    assert mined.schema.equals(pq.read_schema(general.files["data/all/part-00000.parquet"]))
+    assert general.reference_keys["mined"] == general.reference_keys["all"] == (
+        "DOI", "doi-asserted-by", "key"
+    )
+    assert general.sizes["data/mined/part-00000.parquet"] > 0
+    assert arxiv.stats["all"] == arxiv.stats["asserted"] == ConfigStats(
+        works=1, citations=1, references=1
+    )
+    assert_empty_legacy_arxiv_configuration(arxiv, "mined", arxiv.reference_keys["all"])
+    assert arxiv.reference_keys["all"] == ("DOI", "doi-asserted-by")
+    assert pq.read_schema(arxiv.files["data/mined.parquet"]).equals(
+        pq.read_schema(arxiv.files["data/all.parquet"])
+    )
 
 
 def test_duplicate_tuples_and_self_citations_are_rejected(tmp_path):
