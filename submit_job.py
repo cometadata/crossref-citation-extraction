@@ -5,10 +5,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -295,6 +297,16 @@ def submit(
     hf_token = services.get_token()
     if not hf_token:
         raise RuntimeError("Run `hf auth login` before submitting")
+    # huggingface_hub narrates the volume sync and the script upload on
+    # stdout; route that to stderr so stdout carries only the submission JSON
+    # that `main` prints.
+    with contextlib.redirect_stdout(sys.stderr):
+        return _submit_with_token(config, services, hf_token)
+
+
+def _submit_with_token(
+    config: SubmissionConfig, services: SubmissionServices, hf_token: str
+) -> JobInfo:
     api = services.api_factory(token=hf_token)
     needs_bucket = config.mode != "smoke"
     crossref_token = os.environ.get("CROSSREF_API_TOKEN")

@@ -706,6 +706,56 @@ def test_main_prints_submission_json(tmp_path: Path, monkeypatch, capsys) -> Non
     assert value_after(api.run_kwargs["script_args"], "--snapshot-id") == "2026-07"
 
 
+def test_main_keeps_stdout_to_the_submission_json(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # huggingface_hub narrates the volume sync and the script upload on
+    # stdout; the submitter must leave stdout parseable as one JSON document,
+    # which is how `json.loads(Path(...).read_text())` inspects it.
+    monkeypatch.delenv("CROSSREF_API_TOKEN", raising=False)
+    root = make_source_root(tmp_path)
+    monkeypatch.setattr(submit_job, "PROJECT_ROOT", root)
+
+    class ChattyApi(FakeApi):
+        def run_uv_job(self, script, **kwargs):
+            print("Your script and Job artifacts will be saved in this bucket: hf://x")
+            return super().run_uv_job(script, **kwargs)
+
+    api = ChattyApi(bucket_files=[])
+    quiet = make_services(api)
+
+    def chatty_sync_job_volume(staging_root, mount_path, **kwargs):
+        print("Sync plan: staging -> hf://buckets/cometadata/jobs-artifacts/runtime")
+        print("Sync completed.")
+        return quiet.sync_job_volume(staging_root, mount_path, **kwargs)
+
+    services = SubmissionServices(
+        get_token=quiet.get_token,
+        sync_job_volume=chatty_sync_job_volume,
+        volume_factory=quiet.volume_factory,
+        api_factory=quiet.api_factory,
+    )
+    submit_job.main(["--smoke"], services=services)
+    captured = capsys.readouterr()
+
+    job = SimpleNamespace(
+        id="job-1",
+        url="https://huggingface.co/jobs/cometadata/job-1",
+        status=SimpleNamespace(stage="PENDING"),
+    )
+    expected = submit_job.submission_summary(
+        job,
+        build_config(parse_args(["--smoke"]), None, source_root=root),
+        runtime_source_digest(root),
+        None,
+    )
+    assert json.loads(captured.out) == expected
+    assert captured.out == json.dumps(expected, sort_keys=True) + "\n"
+    assert "Sync plan" in captured.err and "Sync completed." in captured.err
+    assert "artifacts will be saved" in captured.err
+    assert api.run_kwargs is not None
+
+
 def test_main_without_settings_reports_null_report_digest(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
