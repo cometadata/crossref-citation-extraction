@@ -30,6 +30,13 @@ class PipelineError(RuntimeError):
     pass
 
 
+class UploadNotVisibleError(PipelineError):
+    """A listed file reads back missing or with the wrong size after an
+    upload, which the bucket mount can show for a while after the bucket API
+    accepted the write. A digest mismatch at the right size is corruption
+    and is never this error."""
+
+
 def count_lines(path: Path) -> int:
     with path.open("rb") as handle:
         return sum(1 for _line in handle)
@@ -153,14 +160,15 @@ def verify_file_metadata(
     root: Path, files: dict[str, FileMeta], *, label: str
 ) -> None:
     """Read every listed file back from `root` (the bucket mount) and hash it;
-    fail on the first missing file or size/digest mismatch, naming it."""
+    fail on the first missing file or size/digest mismatch, naming it. A
+    missing or wrong-sized file raises `UploadNotVisibleError`."""
     for name, expected in sorted(files.items()):
         candidate = root / name
         if not candidate.is_file():
-            raise PipelineError(f"{label}: {name} is missing after upload")
+            raise UploadNotVisibleError(f"{label}: {name} is missing after upload")
         size = candidate.stat().st_size
         if size != expected.size:
-            raise PipelineError(
+            raise UploadNotVisibleError(
                 f"{label}: {name} is {size} bytes after upload, expected {expected.size}"
             )
         digest = sha256_file(candidate)
@@ -169,3 +177,47 @@ def verify_file_metadata(
                 f"{label}: {name} digest {digest} after upload does not match "
                 f"{expected.sha256}"
             )
+
+
+def verify_uploaded_files(
+    root: Path,
+    files: dict[str, FileMeta],
+    *,
+    label: str,
+    events: Any,
+    delays: tuple[float, ...],
+    sleep: Callable[[float], None],
+) -> None:
+    """`verify_file_metadata` with bounded patience for mount propagation.
+
+    Files that read back missing or with the wrong size are checked again
+    after each of `delays` (an `upload_verification_retry` event names the
+    attempt, the pending count and the first pending file); files that
+    already verified are not read again. Once the delays are spent the last
+    visibility error is raised. A digest mismatch fails immediately."""
+    pending = dict(files)
+    for attempt in range(len(delays) + 1):
+        not_visible: dict[str, FileMeta] = {}
+        first_error: UploadNotVisibleError | None = None
+        for name, expected in sorted(pending.items()):
+            try:
+                verify_file_metadata(root, {name: expected}, label=label)
+            except UploadNotVisibleError as error:
+                not_visible[name] = expected
+                if first_error is None:
+                    first_error = error
+        if first_error is None:
+            return
+        if attempt == len(delays):
+            raise first_error
+        events.emit(
+            "upload_verification_retry",
+            label=label,
+            attempt=attempt + 1,
+            pending=len(not_visible),
+            first_pending=min(not_visible),
+            reason=str(first_error),
+            delay_seconds=delays[attempt],
+        )
+        sleep(delays[attempt])
+        pending = not_visible

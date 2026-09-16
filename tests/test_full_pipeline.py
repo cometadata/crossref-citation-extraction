@@ -29,6 +29,7 @@ from citations_pipeline.datacite_index import (
 from citations_pipeline.datacite_publish import transform_datacite_outputs
 from citations_pipeline.extractor import ExtractorBinary, FullExtractionOutputs
 from citations_pipeline.full_pipeline import (
+    UPLOAD_VERIFY_DELAYS,
     FullDependencies,
     default_full_dependencies,
     run_full_pipeline,
@@ -224,6 +225,8 @@ class RecordingStore(LocalBucketStore):
         self.case.uploaded_trees.append(destination)
         if self.case.corrupt_upload is not None:
             flip_last_byte(destination / self.case.corrupt_upload)
+        if self.case.lagging_upload is not None:
+            self.case.start_lag(destination / self.case.lagging_upload)
 
     def delete_tree(self, destination: Path) -> None:
         super().delete_tree(destination)
@@ -264,6 +267,14 @@ class FullPipelineCase:
         self.bundle_error: Exception | None = None
         self.fail_json_name: str | None = None
         self.corrupt_upload: str | None = None
+        # Mount propagation lag: the named upload reads back missing (or
+        # truncated) until `lag_sleeps` retry sleeps have passed; None keeps
+        # it that way forever.
+        self.lagging_upload: str | None = None
+        self.lag_mode = "missing"
+        self.lag_sleeps: int | None = None
+        self.lagged: tuple[Path, bytes] | None = None
+        self.sleeps: list[float] = []
         self.records = fixture_records()
         self.ambiguity_rows = fixture_ambiguity_rows()
 
@@ -322,6 +333,20 @@ class FullPipelineCase:
         return read_json(self.derived_root() / "_PUBLICATIONS.json")
 
     # -- fakes ----------------------------------------------------------------
+
+    def start_lag(self, path: Path) -> None:
+        self.lagged = (path, path.read_bytes())
+        if self.lag_mode == "missing":
+            path.unlink()
+        else:
+            path.write_bytes(path.read_bytes()[:-1])
+
+    def _sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        if self.lagged is not None and self.lag_sleeps is not None and len(self.sleeps) >= self.lag_sleeps:
+            path, data = self.lagged
+            path.write_bytes(data)
+            self.lagged = None
 
     def _resolve_mirror(self, bucket_root: Path) -> ResolvedSnapshot:
         self.calls.append("resolve_mirror")
@@ -497,6 +522,7 @@ class FullPipelineCase:
             publish_pair=publish_pair,
             verify_current=self._verify_current,
             publish_prepared=self._publish_prepared,
+            sleep=self._sleep,
         )
 
 
@@ -824,6 +850,131 @@ def test_upload_corruption_prevents_the_extraction_marker(
     assert case.uploaded_trees, "the generation was uploaded before verification"
     assert case.persisted_marker_kinds == []
     assert case.publication_calls == Counter()
+    # A digest mismatch at the right size is corruption, not lag: no retry.
+    assert case.sleeps == []
+
+
+@pytest.mark.parametrize("mode", ["missing", "truncated"])
+def test_upload_verification_waits_for_a_lagging_mount(
+    full_pipeline_case: FullPipelineCase, mode: str
+) -> None:
+    case = full_pipeline_case
+    case.lagging_upload = "datacite/data/all/part-00000.parquet"
+    case.lag_mode = mode
+    case.lag_sleeps = 2
+    result = run_full_pipeline(case.config, case.dependencies())
+    assert result["status"] == "completed"
+    assert case.sleeps == list(UPLOAD_VERIFY_DELAYS[:2])
+    retries = [event for event in case.events() if event["event"] == "upload_verification_retry"]
+    assert [event["attempt"] for event in retries] == [1, 2]
+    assert all(event["pending"] == 1 for event in retries)
+    assert all(event["first_pending"] == case.lagging_upload for event in retries)
+    assert case.persisted_marker_kinds == [FULL_EXTRACTION_KIND, FULL_PIPELINE_KIND]
+
+
+@pytest.mark.parametrize("mode", ["missing", "truncated"])
+def test_upload_verification_gives_up_after_bounded_retries(
+    full_pipeline_case: FullPipelineCase, mode: str
+) -> None:
+    case = full_pipeline_case
+    case.lagging_upload = "arxiv/data/mined.parquet"
+    case.lag_mode = mode
+    case.lag_sleeps = None
+    with pytest.raises(PipelineError, match="arxiv/data/mined.parquet"):
+        run_full_pipeline(case.config, case.dependencies())
+    assert case.sleeps == list(UPLOAD_VERIFY_DELAYS)
+    assert 240 <= sum(UPLOAD_VERIFY_DELAYS) <= 300
+    assert case.persisted_marker_kinds == []
+    assert case.publication_calls == Counter()
+
+
+def crash_before_the_root_marker(case: FullPipelineCase) -> Path:
+    """Upload a verified generation, then fail the root marker upload, the
+    way a job dies between `put_tree` and the marker."""
+    case.fail_json_name = "_EXTRACTION_COMPLETE.json"
+    with pytest.raises(BucketPersistenceError):
+        run_full_pipeline(case.config, case.dependencies())
+    case.fail_json_name = None
+    (generation,) = case.uploaded_trees
+    assert (generation / "_EXTRACTION_COMPLETE.json").is_file()
+    assert not case.paths.extraction_marker.exists()
+    case.config = replace(case.config, run_id="a" * 32)
+    return generation
+
+
+def test_an_uploaded_generation_is_adopted_after_a_crash_before_the_root_marker(
+    full_pipeline_case: FullPipelineCase,
+) -> None:
+    case = full_pipeline_case
+    older = case.paths.prefix / f"derived-generations/2026-06-{OLD_RUN}"
+    older.mkdir(parents=True)
+    (older / "extraction-report.json").write_text("{}")
+    generation = crash_before_the_root_marker(case)
+    assert case.extraction_calls == 1
+
+    result = run_full_pipeline(case.config, case.dependencies())
+    assert result["status"] == "completed"
+    assert case.extraction_calls == 1, "adopted, not re-extracted"
+    assert result["extraction_reused"] is True
+    assert result["derived_prefix"] == f"derived-generations/{generation.name}"
+    assert case.extraction_marker().derived_prefix == result["derived_prefix"]
+    assert case.extraction_marker().to_dict() == read_json(generation / "_EXTRACTION_COMPLETE.json")
+    assert case.pipeline_marker().derived_prefix == result["derived_prefix"]
+    names = case.event_names()
+    assert "extraction_generation_adopted" in names
+    assert names.index("extraction_generation_adopted") < names.index("pipeline_activated")
+    # Cleanup keeps the adopted generation and removes only the prior one.
+    assert generation.is_dir()
+    assert not older.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate"),
+    [
+        ("datacite/data/all/part-00000.parquet", flip_last_byte),
+        ("outputs/valid.jsonl.zst", flip_last_byte),
+        ("arxiv/data/all.parquet", Path.unlink),
+        ("_EXTRACTION_COMPLETE.json", lambda path: path.write_text("{")),
+    ],
+)
+def test_a_corrupt_or_partial_uploaded_generation_is_never_adopted(
+    full_pipeline_case: FullPipelineCase, name: str, mutate
+) -> None:
+    case = full_pipeline_case
+    generation = crash_before_the_root_marker(case)
+    mutate(generation / name)
+    result = run_full_pipeline(case.config, case.dependencies())
+    assert case.extraction_calls == 2
+    assert result["extraction_reused"] is False
+    assert result["derived_prefix"] == "derived-generations/2026-07-" + "a" * 32
+    rejected = [e for e in case.events() if e["event"] == "extraction_generation_rejected"]
+    assert [e["derived_prefix"] for e in rejected] == [f"derived-generations/{generation.name}"]
+    assert "extraction_generation_adopted" not in case.event_names()
+    assert not generation.exists(), "the rejected generation is cleaned up after activation"
+
+
+def test_a_generation_of_another_identity_is_never_adopted(
+    full_pipeline_case: FullPipelineCase,
+) -> None:
+    case = full_pipeline_case
+    generation = crash_before_the_root_marker(case)
+    marker_path = generation / "_EXTRACTION_COMPLETE.json"
+    payload = read_json(marker_path)
+    payload["identity"]["archive_sha256"] = "0" * 64
+    marker_path.write_text(json.dumps(payload))
+    result = run_full_pipeline(case.config, case.dependencies())
+    assert case.extraction_calls == 2
+    assert result["extraction_reused"] is False
+    assert "extraction_generation_adopted" not in case.event_names()
+
+
+def test_force_never_adopts_an_uploaded_generation(full_pipeline_case: FullPipelineCase) -> None:
+    case = full_pipeline_case
+    crash_before_the_root_marker(case)
+    case.config = replace(case.config, force=True)
+    result = run_full_pipeline(case.config, case.dependencies())
+    assert case.extraction_calls == 2
+    assert result["extraction_reused"] is False
 
 
 @pytest.mark.parametrize(
@@ -857,15 +1008,36 @@ def test_stale_extraction_marker_is_recomputed(full_pipeline_case: FullPipelineC
     case = full_pipeline_case
     run_full_pipeline(case.config, case.dependencies())
     case.paths.pipeline_marker.unlink()
-    payload = read_json(case.paths.extraction_marker)
-    payload["identity"]["archive_sha256"] = "0" * 64
-    case.paths.extraction_marker.write_text(json.dumps(payload))
+    # Both the root marker and the generation's own copy name another run,
+    # so nothing under this prefix can be reused or adopted.
+    for marker_path in (case.paths.extraction_marker, case.derived_root() / "_EXTRACTION_COMPLETE.json"):
+        payload = read_json(marker_path)
+        payload["identity"]["archive_sha256"] = "0" * 64
+        marker_path.write_text(json.dumps(payload))
     case.config = replace(case.config, run_id="a" * 32)
     result = run_full_pipeline(case.config, case.dependencies())
     assert case.extraction_calls == 2
     assert result["extraction_reused"] is False
     assert result["derived_prefix"] == "derived-generations/2026-07-" + "a" * 32
     assert "extraction_marker_stale" in case.event_names()
+    assert "extraction_generation_adopted" not in case.event_names()
+
+
+def test_a_stale_root_marker_does_not_hide_an_uploaded_generation_of_this_identity(
+    full_pipeline_case: FullPipelineCase,
+) -> None:
+    case = full_pipeline_case
+    first = run_full_pipeline(case.config, case.dependencies())
+    case.paths.pipeline_marker.unlink()
+    payload = read_json(case.paths.extraction_marker)
+    payload["identity"]["archive_sha256"] = "0" * 64
+    case.paths.extraction_marker.write_text(json.dumps(payload))
+    case.config = replace(case.config, run_id="a" * 32)
+    result = run_full_pipeline(case.config, case.dependencies())
+    assert case.extraction_calls == 1
+    assert result["extraction_reused"] is True
+    assert result["derived_prefix"] == first["derived_prefix"]
+    assert case.extraction_marker().identity.archive_sha256 != "0" * 64
 
 
 def test_force_recomputes_and_still_verifies(full_pipeline_case: FullPipelineCase) -> None:

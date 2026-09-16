@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -105,6 +106,7 @@ from .pipeline_io import (
     stage_snapshot,
     tree_file_metadata,
     verify_file_metadata,
+    verify_uploaded_files,
 )
 from .publish import PublishError
 from .state import StateError, read_json, utc_now, write_atomic_json
@@ -123,6 +125,10 @@ DATASET_URLS = {
     kind: f"https://huggingface.co/datasets/{repo}" for kind, repo in PUBLICATION_REPOS.items()
 }
 GENERATION_ROOTS = ("derived-generations", "raw-generations")
+# Backoff between read-back attempts of an uploaded generation whose files
+# are not yet visible through the mount (missing, or the wrong size): about
+# five minutes in total before the upload is declared failed.
+UPLOAD_VERIFY_DELAYS = (5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0, 45.0)
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,7 @@ class FullDependencies:
     publish_pair: Callable[..., Any]
     verify_current: Callable[..., Any]
     publish_prepared: Callable[..., Any]
+    sleep: Callable[[float], None] = time.sleep
 
 
 def default_full_dependencies() -> FullDependencies:
@@ -528,9 +535,15 @@ def persist_generation(
     identity: RunIdentity,
     resolved: ResolvedSnapshot,
     events: Any,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> FullExtractionMarker:
     """Upload the generation, read every listed file back through the mount
-    and hash it, and only then publish the root extraction marker."""
+    and hash it (waiting up to `UPLOAD_VERIFY_DELAYS` for files the mount
+    does not show yet), and only then publish the root extraction marker.
+
+    The generation carries its own copy of the marker, so a job that dies
+    between the upload and the root marker leaves a generation the next run
+    with the same identity can verify and adopt."""
     marker = FullExtractionMarker(
         kind=FULL_EXTRACTION_KIND,
         schema_version=DATACITE_MARKER_VERSION,
@@ -550,7 +563,14 @@ def persist_generation(
     with events.phase("persist_derived"):
         store.put_tree(generation.local, derived.root, progress=report)
     with events.phase("verify_derived"):
-        verify_file_metadata(derived.root, generation.files, label=derived.relative_prefix)
+        verify_uploaded_files(
+            derived.root,
+            generation.files,
+            label=derived.relative_prefix,
+            events=events,
+            delays=UPLOAD_VERIFY_DELAYS,
+            sleep=sleep,
+        )
     with events.phase("persist_extraction_marker"):
         store.put_json(marker.to_dict(), paths.extraction_marker)
     events.emit(
@@ -596,6 +616,78 @@ def reusable_extraction(
         )
         return None
     return marker
+
+
+def find_uploaded_generation(
+    paths: PipelinePaths,
+    identity: RunIdentity,
+    resolved: ResolvedSnapshot,
+    events: Any,
+) -> FullExtractionMarker | None:
+    """A derived generation uploaded for exactly this run identity whose root
+    marker was never written (the job died, or the marker upload failed,
+    after `put_tree`).
+
+    Each `derived-generations/*` entry's own `_EXTRACTION_COMPLETE.json` is
+    read; generations of other identities are ignored. A candidate must name
+    its own prefix and the resolved snapshot, list every required raw output,
+    and have every listed file present with its recorded size and SHA-256.
+    Anything partial, corrupt or mismatched is reported as
+    `extraction_generation_rejected` and never adopted. The newest candidate
+    that verifies is returned; nothing is written here."""
+    root = paths.prefix / "derived-generations"
+    if not root.is_dir():
+        return None
+    candidates: list[FullExtractionMarker] = []
+    for entry in sorted(root.iterdir()):
+        marker_path = entry / EXTRACTION_MARKER_NAME
+        if not entry.is_dir() or not marker_path.is_file():
+            continue
+        relative = f"derived-generations/{entry.name}"
+        try:
+            marker = FullExtractionMarker.from_dict(read_json(marker_path))
+        except StateError as error:
+            events.emit(
+                "extraction_generation_rejected", derived_prefix=relative, reason=str(error)
+            )
+            continue
+        if marker.identity != identity:
+            continue
+        reason: str | None = None
+        if marker.derived_prefix != relative:
+            reason = f"marker names {marker.derived_prefix}"
+        elif marker.snapshot_id != resolved.snapshot_id:
+            reason = (
+                f"marker snapshot {marker.snapshot_id} differs from the resolved "
+                f"snapshot {resolved.snapshot_id}"
+            )
+        else:
+            try:
+                marker.require_files(REQUIRED_RAW_FILES)
+            except StateError as error:
+                reason = str(error)
+        if reason is not None:
+            events.emit("extraction_generation_rejected", derived_prefix=relative, reason=reason)
+            continue
+        candidates.append(marker)
+    for marker in sorted(candidates, key=lambda item: item.completed_at, reverse=True):
+        derived = paths.derived_generation(marker.derived_prefix)
+        try:
+            verify_file_metadata(derived.root, marker.files, label=marker.derived_prefix)
+        except PipelineError as error:
+            events.emit(
+                "extraction_generation_rejected",
+                derived_prefix=marker.derived_prefix,
+                reason=str(error),
+            )
+            continue
+        events.emit(
+            "extraction_generation_verified",
+            derived_prefix=marker.derived_prefix,
+            files=len(marker.files),
+        )
+        return marker
+    return None
 
 
 def fetch_prepared_datasets(
@@ -954,6 +1046,11 @@ def run_full_pipeline(
         )
 
     marker = reusable_extraction(paths, identity, events, force=config.force)
+    adopted = False
+    if marker is None and not config.force:
+        with events.phase("find_uploaded_generation"):
+            marker = find_uploaded_generation(paths, identity, resolved, events)
+        adopted = marker is not None
     if marker is not None:
         if marker.snapshot_id != resolved.snapshot_id:
             raise PipelineError(
@@ -972,6 +1069,16 @@ def run_full_pipeline(
         if fetched.counts != marker.counts:
             raise PipelineError(
                 "extraction marker counts disagree with the persisted manifests"
+            )
+        if adopted:
+            # Only a generation that passed every reuse check becomes the
+            # root marker; cleanup keeps it because it is this run's prefix.
+            with events.phase("adopt_extraction_marker"):
+                store.put_json(marker.to_dict(), paths.extraction_marker)
+            events.emit(
+                "extraction_generation_adopted",
+                derived_prefix=marker.derived_prefix,
+                identity_sha256=identity.fingerprint(),
             )
         prepared = fetched.prepared
         counts = fetched.counts
@@ -1004,6 +1111,7 @@ def run_full_pipeline(
             identity=identity,
             resolved=resolved,
             events=events,
+            sleep=deps.sleep,
         )
         release_scratch(paths, events)
         prepared = generation.prepared
