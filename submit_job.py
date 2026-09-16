@@ -298,10 +298,11 @@ def submit(
     api = services.api_factory(token=hf_token)
     needs_bucket = config.mode != "smoke"
     crossref_token = os.environ.get("CROSSREF_API_TOKEN")
-    mirror_available = True
-    if needs_bucket:
-        mirror_available = mirror_probably_available(api, hf_token)
-        if not mirror_available and not crossref_token:
+    if needs_bucket and not mirror_probably_available(api, hf_token):
+        # The token is required only when the mirror cannot be used; it is
+        # forwarded whenever available so a mirror that disappears between
+        # submission and runtime still has the authenticated fallback.
+        if not crossref_token:
             raise RuntimeError(
                 "affiliations mirror not found in the bucket and "
                 "CROSSREF_API_TOKEN is not set for the fallback download"
@@ -342,9 +343,7 @@ def submit(
     secrets: dict[str, str] = {}
     if needs_bucket:
         secrets["HF_TOKEN"] = hf_token
-        # The job needs the Crossref token only for the authenticated
-        # fallback download, i.e. when the mirror is not there to use.
-        if not mirror_available and crossref_token:
+        if crossref_token:
             secrets["CROSSREF_API_TOKEN"] = crossref_token
     return api.run_uv_job(
         str(JOB_SCRIPT),

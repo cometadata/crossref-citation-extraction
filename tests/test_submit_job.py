@@ -324,14 +324,19 @@ def test_production_without_mirror_uses_fallback_token(
     }
 
 
-def test_crossref_token_withheld_when_mirror_available(
+def test_crossref_token_forwarded_when_mirror_available(
     tmp_path: Path, monkeypatch
 ) -> None:
+    # A mirror present at submission may be gone at runtime; the job keeps
+    # the authenticated fallback whenever the submitter has the token.
     monkeypatch.setenv("CROSSREF_API_TOKEN", "crossref-secret")
     api = FakeApi(bucket_files=MIRROR_FILES)
     config = make_config(make_source_root(tmp_path))
     submit(config, make_services(api))
-    assert api.run_kwargs["secrets"] == {"HF_TOKEN": "hf-token"}
+    assert api.run_kwargs["secrets"] == {
+        "HF_TOKEN": "hf-token",
+        "CROSSREF_API_TOKEN": "crossref-secret",
+    }
     assert api.list_calls == [
         {"bucket_id": "cometadata/shared-storage", "prefix": "crossref-affiliations-latest"}
     ]
