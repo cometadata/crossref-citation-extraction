@@ -433,8 +433,35 @@ fn many_matches_in_one_member_flow_through_bounded_batches() -> Result<()> {
     Ok(())
 }
 
-/// `(trigger, members_committed)` of every checkpoint commit in a log.
-fn checkpoint_events(log: &str) -> Vec<(String, u64)> {
+/// One `event=checkpoint` log line.
+///
+/// Full mode parses members on `num_cpus - 2` workers in parallel, and a
+/// worker's `Rows` batches and its `FileComplete` are separate channel
+/// sends, so rows of members that have not completed yet can land before
+/// the `FileComplete` that triggers a commit. Which commit flushes which
+/// rows therefore varies between runs, and a commit that finds nothing
+/// buffered records its members without writing a segment. The checkpoint
+/// tests assert what does not vary: the trigger multiset, the per-member
+/// accounting, and one segment per commit that had rows to flush.
+#[derive(Debug)]
+struct Checkpoint {
+    trigger: String,
+    members_committed: u64,
+    /// Writer bytes buffered when the commit flushed.
+    flushed_bytes: u64,
+    /// Rows written to partition segments so far, cumulative.
+    rows_written: u64,
+}
+
+impl Checkpoint {
+    /// A commit writes a partition segment only when it had rows buffered.
+    fn wrote_segment(&self) -> bool {
+        self.flushed_bytes > 0
+    }
+}
+
+/// Every checkpoint commit in a log, in commit order.
+fn checkpoint_events(log: &str) -> Vec<Checkpoint> {
     log.lines()
         .filter_map(|line| {
             let fields: BTreeMap<&str, &str> = line
@@ -443,16 +470,47 @@ fn checkpoint_events(log: &str) -> Vec<(String, u64)> {
                 .split(' ')
                 .filter_map(|pair| pair.split_once('='))
                 .collect();
-            Some((
-                fields.get("trigger")?.to_string(),
-                fields.get("members_committed")?.parse().ok()?,
-            ))
+            let count = |name: &str| -> Option<u64> { fields.get(name)?.parse().ok() };
+            Some(Checkpoint {
+                trigger: fields.get("trigger")?.to_string(),
+                members_committed: count("members_committed")?,
+                flushed_bytes: count("flushed_bytes")?,
+                rows_written: count("rows_written")?,
+            })
         })
         .collect()
 }
 
-/// Members whose rows are about 0.6 MiB each (before capacity rounding),
-/// so a 1 MiB commit trigger fires every one or two members.
+/// Sorted `(trigger, members_committed)` pairs: the commit multiset, which
+/// does not depend on the order the workers finished in.
+fn triggers(events: &[Checkpoint]) -> Vec<(&str, u64)> {
+    let mut pairs: Vec<(&str, u64)> = events
+        .iter()
+        .map(|event| (event.trigger.as_str(), event.members_committed))
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// Member filenames recorded in `<temp_dir>/datacite-extraction.checkpoint`,
+/// sorted because parallel workers complete members in any order.
+fn checkpoint_member_files(temp_dir: &Path) -> Result<Vec<String>> {
+    let mut names: Vec<String> = read_jsonl(&temp_dir.join("datacite-extraction.checkpoint"))?
+        .into_iter()
+        .filter(|record| record["record"] == "member")
+        .map(|record| {
+            record["filename"]
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("member record without a filename: {record}"))
+        })
+        .collect::<Result<_>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// Members of 600 rows each, about 0.75 MiB apiece as the writer accounts
+/// them (string capacities plus column slots); four together are 2.9 MiB.
 fn heavy_members(dir: &Path, count: usize) -> Result<()> {
     fs::create_dir_all(dir)?;
     for i in 0..count {
@@ -481,9 +539,16 @@ fn small_writer_budget_commits_by_bytes_before_the_member_interval() -> Result<(
     let input = tmp.path().join("crossref");
     heavy_members(&input, 4)?;
     let parts = tmp.path().join("parts");
+    // A 4 MiB budget commits at 2 MiB. The four members together are 2.9 MiB
+    // as the writer accounts them: past the threshold, so a `bytes` commit is
+    // certain once any member is complete, yet under the budget, so the
+    // writer's own eviction (which empties the partition without a
+    // checkpoint) can never pre-empt it. With a budget the rows exceed, an
+    // ordering that delivers every `Rows` batch before any `FileComplete`
+    // evicts instead, and only the final commit is ever observed.
     let run = Run::new(&input, &bundle, &tmp.path().join("out"), &parts).args(&[
         "--writer-memory-mb",
-        "2",
+        "4",
         "--checkpoint-interval",
         "1000",
         "--partitions",
@@ -493,24 +558,48 @@ fn small_writer_budget_commits_by_bytes_before_the_member_interval() -> Result<(
     let output = run.output()?;
     let log = transcript(&output);
     ensure!(output.status.success(), "{log}");
-    let events = checkpoint_events(&log);
-    let by_bytes = events.iter().filter(|(t, _)| t == "bytes").count();
-    ensure!(by_bytes >= 1, "no byte-triggered commit in:\n{log}");
     ensure!(
-        events.iter().all(|(t, _)| t != "members"),
+        log.contains("commit_bytes=2097152 checkpoint_members=1000 "),
+        "{log}"
+    );
+    let events = checkpoint_events(&log);
+    let by_bytes: Vec<&Checkpoint> = events.iter().filter(|e| e.trigger == "bytes").collect();
+    ensure!(!by_bytes.is_empty(), "no byte-triggered commit in:\n{log}");
+    ensure!(
+        by_bytes.iter().all(|e| e.flushed_bytes >= 2 * 1024 * 1024),
+        "a bytes commit flushes at least the commit threshold:\n{log}"
+    );
+    ensure!(
+        events.iter().all(|e| e.trigger != "members"),
         "the 1000-member interval must not fire for 4 members:\n{log}"
     );
     ensure!(
-        events.iter().map(|(_, n)| n).sum::<u64>() == 4,
+        events.iter().map(|e| e.members_committed).sum::<u64>() == 4,
         "every member is committed exactly once:\n{log}"
     );
+    // No commit records all four members: a worker's rows precede its
+    // `FileComplete`, so every row is buffered before the last one arrives
+    // and the threshold was crossed at an earlier event with at least one
+    // member pending, which committed then.
     ensure!(
-        events.iter().all(|(_, n)| *n < 4),
+        events.iter().all(|e| e.members_committed < 4),
         "commits happened before the end of the run:\n{log}"
     );
-    assert!(
-        count_files(&parts.join("partitions").join("h0000"), ".parquet") >= 2,
-        "each commit writes its own segment"
+    ensure!(
+        events.last().is_some_and(|e| e.rows_written == 2400),
+        "every row is durable by the final commit:\n{log}"
+    );
+    // One segment per commit that had rows to flush. When every row arrived
+    // before the bytes commit, the final commit finds nothing buffered and
+    // writes none, so the count is one or two rather than fixed.
+    let segments = count_files(&parts.join("partitions").join("h0000"), ".parquet");
+    ensure!(
+        segments == events.iter().filter(|e| e.wrote_segment()).count() && segments >= 1,
+        "segments={segments} for commits:\n{log}"
+    );
+    assert_eq!(
+        checkpoint_member_files(&parts)?,
+        ["0.json", "1.json", "2.json", "3.json"]
     );
     let report = read_json(&run.report_path())?;
     assert_eq!(report["files_processed"], 4);
@@ -545,21 +634,34 @@ fn explicit_checkpoint_interval_commits_by_member_count() -> Result<()> {
     let output = run.output()?;
     let log = transcript(&output);
     ensure!(output.status.success(), "{log}");
-    let mut events = checkpoint_events(&log);
-    events.sort();
+    let events = checkpoint_events(&log);
+    // The commit multiset is fixed: every second `FileComplete` commits by
+    // count, and the fifth member is committed at the end.
     assert_eq!(
-        events,
-        vec![
-            ("final".to_string(), 1),
-            ("members".to_string(), 2),
-            ("members".to_string(), 2),
-        ],
+        triggers(&events),
+        vec![("final", 1), ("members", 2), ("members", 2)],
         "two interval commits and the final one:\n{log}"
     );
+    // The segment count is not fixed: `Rows` batches of members that have
+    // not completed yet may land before the `FileComplete` that commits, so
+    // one commit can flush the rows of several members and a later commit
+    // finds nothing to write. Nothing approaches the 64 MiB budget, so no
+    // segment comes from eviction: the segments are exactly the commits that
+    // had rows buffered, between one (every row arrived before the first
+    // commit) and three.
+    let segments = count_files(&parts.join("partitions").join("h0000"), ".parquet");
+    ensure!(
+        segments == events.iter().filter(|e| e.wrote_segment()).count()
+            && (1..=3).contains(&segments),
+        "segments={segments} for commits:\n{log}"
+    );
+    ensure!(
+        events.last().is_some_and(|e| e.rows_written == 5),
+        "every row is durable by the final commit:\n{log}"
+    );
     assert_eq!(
-        count_files(&parts.join("partitions").join("h0000"), ".parquet"),
-        3,
-        "one segment per commit with a budget nothing approaches"
+        checkpoint_member_files(&parts)?,
+        ["0.json", "1.json", "2.json", "3.json", "4.json"]
     );
     ensure!(
         log.contains("commit_bytes=33554432 checkpoint_members=2 "),
