@@ -44,8 +44,11 @@ CONFIG_PROVENANCES = {
 }
 CONFIG_NAMES = tuple(CONFIG_PROVENANCES)
 DATACITE_PREFIX_RE = re.compile(r"^datacite-monthly-data-file-(\d{4}-\d{2})$")
+# Every runtime Python file lives under `jobs/` or `citations_pipeline/`;
+# settings JSON, tests and the submitter are deliberately not inputs, so a
+# settings file cannot change the digest it was measured against.
 RUNTIME_SOURCE_PATTERNS = (
-    "jobs/pipeline.py",
+    "jobs/**/*.py",
     "citations_pipeline/**/*.py",
     "Cargo.toml",
     "Cargo.lock",

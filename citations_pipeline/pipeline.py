@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import shutil
-import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -526,21 +525,4 @@ def _run_production(
         dataset_commit_url=publication.commit_url,
         counts={name: asdict(stat) for name, stat in stats.items()},
         extraction_reused=extraction_reused,
-    )
-
-
-def config_from_args(args: Any) -> PipelineConfig:
-    import os
-
-    return PipelineConfig(
-        source_root=Path(args.source_root),
-        source_digest=args.source_digest,
-        work_root=Path(args.work_root),
-        bucket_root=Path(args.bucket_root) if args.bucket_root else None,
-        smoke=bool(args.smoke),
-        force=bool(args.force),
-        datacite_release=args.datacite_release,
-        hf_token=os.environ.get("HF_TOKEN"),
-        crossref_token=os.environ.get("CROSSREF_API_TOKEN"),
-        run_id=uuid.uuid4().hex,
     )

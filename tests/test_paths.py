@@ -70,3 +70,56 @@ def test_runtime_source_digest_tracks_content(tmp_path: Path) -> None:
     before = paths.runtime_source_digest(tmp_path)
     (tmp_path / "src" / "main.rs").write_text("fn main() { }\n")
     assert paths.runtime_source_digest(tmp_path) != before
+
+
+def _runtime_tree(root: Path) -> None:
+    (root / "jobs").mkdir()
+    (root / "jobs" / "pipeline.py").write_text("print(1)\n")
+    (root / "citations_pipeline").mkdir()
+    (root / "citations_pipeline" / "__init__.py").write_text("")
+    (root / "citations_pipeline" / "pipeline.py").write_text("X = 1\n")
+    (root / "src").mkdir()
+    (root / "src" / "main.rs").write_text("fn main() {}\n")
+    (root / "Cargo.toml").write_text("[package]\n")
+    (root / "Cargo.lock").write_text("# lock\n")
+
+
+def test_runtime_source_digest_changes_with_new_runtime_module(tmp_path: Path) -> None:
+    _runtime_tree(tmp_path)
+    before = paths.runtime_source_digest(tmp_path)
+
+    new_module = tmp_path / "citations_pipeline" / "benchmark.py"
+    new_module.write_text("BENCHMARK_MODE = 'benchmark'\n")
+    assert new_module in paths.runtime_source_files(tmp_path)
+    after_module = paths.runtime_source_digest(tmp_path)
+    assert after_module != before
+
+    job_helper = tmp_path / "jobs" / "helpers.py"
+    job_helper.write_text("def helper(): ...\n")
+    assert job_helper in paths.runtime_source_files(tmp_path)
+    after_job = paths.runtime_source_digest(tmp_path)
+    assert after_job != after_module
+
+    (tmp_path / "citations_pipeline" / "pipeline.py").write_text("X = 2\n")
+    after_edit = paths.runtime_source_digest(tmp_path)
+    assert after_edit != after_job
+
+    (tmp_path / "jobs" / "pipeline.py").write_text("print(2)\n")
+    assert paths.runtime_source_digest(tmp_path) != after_edit
+
+
+def test_settings_and_non_runtime_files_do_not_affect_digest(tmp_path: Path) -> None:
+    _runtime_tree(tmp_path)
+    before = paths.runtime_source_digest(tmp_path)
+    files_before = paths.runtime_source_files(tmp_path)
+    (tmp_path / "production-settings.json").write_text('{"flavor": "cpu-xl"}')
+    (tmp_path / "citations_pipeline" / "production-settings.json").write_text("{}")
+    (tmp_path / "jobs" / "settings.json").write_text("{}")
+    (tmp_path / "benchmarks" / "run").mkdir(parents=True)
+    (tmp_path / "benchmarks" / "run" / "production-settings.json").write_text("{}")
+    (tmp_path / "submit_job.py").write_text("# submitter\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_paths.py").write_text("# test\n")
+    (tmp_path / "README.md").write_text("# readme\n")
+    assert paths.runtime_source_digest(tmp_path) == before
+    assert paths.runtime_source_files(tmp_path) == files_before
