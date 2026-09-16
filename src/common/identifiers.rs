@@ -11,7 +11,7 @@
 
 use std::borrow::Cow;
 
-use url::Url;
+use url::{Host, Url};
 
 /// Normalize a complete DOI value to its canonical lowercase
 /// `10.<registrant>/<suffix>` form.
@@ -94,6 +94,49 @@ pub fn url_lookup_keys(value: &str) -> Vec<String> {
         .into_iter()
         .filter_map(|scheme| normalize_landing_url(&format!("{scheme}{raw}")))
         .collect()
+}
+
+/// Whether a normalized landing-page URL (a key from
+/// [`normalize_landing_url`] or [`url_lookup_keys`]) is too unspecific to
+/// be landing-page evidence. Such a key is never looked up, so a DOI
+/// registered with it cannot be matched by URL, only by DOI.
+///
+/// A key is degenerate when any of these holds:
+///
+/// - its host is a DOI resolver (`doi.org`, `dx.doi.org`, `www.doi.org`),
+///   whatever the path: a resolver URL is DOI evidence, read by
+///   [`normalize_doi`], never a landing page;
+/// - it is a bare site root: the path is exactly `/` with no query and no
+///   fragment (normalization has already dropped an empty `?` or `#` and
+///   turned an empty path into `/`); the port is not considered;
+/// - its host is a domain name without a `.`, such as `www` or
+///   `localhost`.
+///
+/// IP-address hosts are not domain names, so only the bare-root rule
+/// applies to them: `http://127.0.0.1/` is degenerate, while
+/// `http://127.0.0.1/data` and `http://[::1]/data` are not. Hosts are
+/// compared in the form `Url` gives them (lowercase, internationalized
+/// names in punycode), so `https://bücher.example/a` is an ordinary host.
+/// The resolver hosts are matched exactly, as [`normalize_doi`] matches
+/// them. A value that does not parse as a URL is not judged here and
+/// yields `false`; normalized keys always parse.
+///
+/// Without this rule a record registered with `https://doi.org/` or
+/// `http://www/` would be matched by every reference that merely mentions a
+/// bare resolver address or a broken `http://www .example.com`.
+pub fn is_degenerate_landing_url(normalized: &str) -> bool {
+    Url::parse(normalized).is_ok_and(|url| is_degenerate_landing(&url))
+}
+
+/// [`is_degenerate_landing_url`] for an already parsed normalized key, so
+/// a caller that also needs the host parses the key once.
+pub fn is_degenerate_landing(url: &Url) -> bool {
+    let unspecific_host = match url.host() {
+        Some(Host::Domain(domain)) => RESOLVER_HOSTS.contains(&domain) || !domain.contains('.'),
+        Some(Host::Ipv4(_) | Host::Ipv6(_)) | None => false,
+    };
+    let bare_root = url.path() == "/" && url.query().is_none() && url.fragment().is_none();
+    unspecific_host || bare_root
 }
 
 /// Hosts of the DOI resolver proxy, matched after `Url` lowercases the host.

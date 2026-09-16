@@ -12,6 +12,8 @@
 //! with evidence sliced from the original. Direct DOI and arXiv targets
 //! are validated before any landing page is resolved, so a shared URL can
 //! only be settled by evidence that identifies one of its own DOIs.
+//! Degenerate landing-page keys (see [`is_degenerate_landing_url`]) are
+//! skipped before any lookup and only counted.
 
 use std::cmp::Reverse;
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
@@ -21,7 +23,9 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::common::identifiers::{normalize_doi, url_lookup_keys};
+#[cfg(doc)]
+use crate::common::identifiers::is_degenerate_landing_url;
+use crate::common::identifiers::{is_degenerate_landing, normalize_doi, url_lookup_keys};
 use crate::common::{ArxivMatch, MatchType};
 use crate::extract::arxiv::extract_arxiv_matches_from_text;
 use crate::extract::reference::{
@@ -74,6 +78,10 @@ pub struct ReferenceMatches {
     pub unmatched_dois: u64,
     /// Distinct URL candidates with no registered landing page.
     pub unmatched_urls: u64,
+    /// Distinct URL candidates whose lookup keys are degenerate (see
+    /// [`is_degenerate_landing_url`]) and were never looked up. Counted
+    /// like `unmatched_urls`, and never also counted there.
+    pub degenerate_urls: u64,
     /// Searchable fields present with a non-string value.
     pub malformed_fields: u64,
 }
@@ -164,6 +172,8 @@ struct Candidate {
 enum Miss {
     Doi(String),
     Url(String),
+    /// A URL whose lookup keys were all degenerate, by its first key.
+    DegenerateUrl(String),
 }
 
 /// What evaluating a URL-shaped token found.
@@ -210,20 +220,18 @@ impl LookupCache<'_> {
         hit
     }
 
-    /// Whether the host of the normalized URL `key` has any registered
-    /// landing page, derived exactly as the index builder derives hosts.
-    fn contains_host_of(&mut self, key: &str) -> bool {
-        let Some(host) = Url::parse(key)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-        else {
+    /// Whether the host of the parsed normalized URL `key` has any
+    /// registered landing page, derived exactly as the index builder
+    /// derives hosts.
+    fn contains_host_of(&mut self, key: &Url) -> bool {
+        let Some(host) = key.host_str() else {
             return false;
         };
-        if let Some(&hit) = self.hosts.get(&host) {
+        if let Some(&hit) = self.hosts.get(host) {
             return hit;
         }
-        let hit = self.index.contains_host(&host);
-        self.hosts.insert(host, hit);
+        let hit = self.index.contains_host(host);
+        self.hosts.insert(host.to_owned(), hit);
         hit
     }
 
@@ -247,6 +255,7 @@ struct Matcher<'a> {
     failed_arxiv_dois: BTreeSet<String>,
     unmatched_dois: BTreeSet<String>,
     unmatched_urls: BTreeSet<String>,
+    degenerate_urls: BTreeSet<String>,
 }
 
 impl<'a> Matcher<'a> {
@@ -265,6 +274,7 @@ impl<'a> Matcher<'a> {
             failed_arxiv_dois: BTreeSet::new(),
             unmatched_dois: BTreeSet::new(),
             unmatched_urls: BTreeSet::new(),
+            degenerate_urls: BTreeSet::new(),
         }
     }
 
@@ -278,10 +288,10 @@ impl<'a> Matcher<'a> {
     /// likewise a resolver URL owns the DOI it carries, which the URL
     /// reading percent-decodes and a bare reading would not.
     ///
-    /// Only token scans feed the unmatched counters: a structured value
-    /// that fails as a whole is scanned as a token of the same field,
-    /// which counts it once if no variant matches, and not at all if one
-    /// does.
+    /// Only token scans feed the unmatched and degenerate counters: a
+    /// structured value that fails as a whole is scanned as a token of the
+    /// same field, which counts it once if no variant matches, and not at
+    /// all if one does.
     fn mine_field(
         &mut self,
         field: &FieldText<'_>,
@@ -396,10 +406,13 @@ impl<'a> Matcher<'a> {
 
     /// Try the variants of a URL-shaped token, longest first. A resolver
     /// URL is checked as a DOI; any other URL is checked against every
-    /// lookup key whose host is registered, and the candidates of all keys
-    /// are unioned. The first variant with a registered DOI or at least
-    /// one landing-page candidate wins. Reports whether the token was a
-    /// resolver URL and the miss to count when nothing matched.
+    /// lookup key that is not degenerate and whose host is registered, and
+    /// the candidates of all keys are unioned. A degenerate key is skipped
+    /// before any lookup. The first variant with a registered DOI or at
+    /// least one landing-page candidate wins. Reports whether the token was
+    /// a resolver URL and the miss to count when nothing matched: a
+    /// shortest normalizable variant whose keys are all degenerate is a
+    /// degenerate miss rather than an unmatched one.
     fn evaluate_url<'t>(
         &mut self,
         field: usize,
@@ -432,11 +445,16 @@ impl<'a> Matcher<'a> {
             let Some(first) = keys.first() else {
                 continue;
             };
-            primary_url = Some(first.clone());
+            let mut primary = None;
             let mut url = None;
             let mut candidates = Vec::new();
             for key in &keys {
-                if !self.cache.contains_host_of(key) {
+                let parsed = Url::parse(key).ok();
+                if parsed.as_ref().is_some_and(is_degenerate_landing) {
+                    continue;
+                }
+                primary.get_or_insert(key);
+                if !parsed.is_some_and(|parsed| self.cache.contains_host_of(&parsed)) {
                     continue;
                 }
                 let dois = self.cache.url_dois(key)?;
@@ -445,6 +463,10 @@ impl<'a> Matcher<'a> {
                     candidates.extend(dois.iter().cloned());
                 }
             }
+            primary_url = Some(match primary {
+                Some(key) => Miss::Url(key.clone()),
+                None => Miss::DegenerateUrl(first.clone()),
+            });
             if let Some(url) = url {
                 candidates.sort();
                 candidates.dedup();
@@ -457,7 +479,7 @@ impl<'a> Matcher<'a> {
         }
         Ok(UrlOutcome {
             resolver: primary_doi.is_some(),
-            miss: primary_doi.map(Miss::Doi).or(primary_url.map(Miss::Url)),
+            miss: primary_doi.map(Miss::Doi).or(primary_url),
         })
     }
 
@@ -472,6 +494,9 @@ impl<'a> Matcher<'a> {
             }
             Some(Miss::Url(key)) => {
                 self.unmatched_urls.insert(key);
+            }
+            Some(Miss::DegenerateUrl(key)) => {
+                self.degenerate_urls.insert(key);
             }
             None => {}
         }
@@ -600,6 +625,7 @@ impl<'a> Matcher<'a> {
             failed_arxiv: self.failed_arxiv,
             unmatched_dois: self.unmatched_dois.len() as u64,
             unmatched_urls: self.unmatched_urls.len() as u64,
+            degenerate_urls: self.degenerate_urls.len() as u64,
             malformed_fields,
         }
     }

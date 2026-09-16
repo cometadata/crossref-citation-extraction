@@ -1,5 +1,5 @@
 use crossref_citation_extraction::common::identifiers::{
-    normalize_doi, normalize_landing_url, url_lookup_keys,
+    is_degenerate_landing_url, normalize_doi, normalize_landing_url, url_lookup_keys,
 };
 
 #[test]
@@ -414,4 +414,85 @@ fn lookup_keys_are_empty_for_unusable_candidates() {
     assert!(url_lookup_keys("").is_empty());
     assert!(url_lookup_keys("https://").is_empty());
     assert!(url_lookup_keys("exa\tmple.org/A").is_empty());
+}
+
+/// The normalized form of `value`, which must be a landing-page URL.
+fn landing(value: &str) -> String {
+    normalize_landing_url(value).unwrap_or_else(|| panic!("{value} normalizes"))
+}
+
+#[test]
+fn resolver_hosts_are_never_landing_pages_whatever_the_path() {
+    for url in [
+        "https://doi.org/",
+        "http://dx.doi.org/",
+        "https://www.doi.org/",
+        "https://doi.org/10.1234/x",
+        "http://dx.doi.org/10.1234/x?locatt=mode:legacy",
+        "https://doi.org/abc#frag",
+    ] {
+        assert!(is_degenerate_landing_url(&landing(url)), "{url}");
+    }
+    // Only the exact resolver hosts: look-alikes and other proxies are ordinary hosts.
+    for url in [
+        "https://sub.doi.org/10.1234/x",
+        "https://doi.org.example/10.1234/x",
+        "https://notdoi.org/10.1234/x",
+        "https://hdl.handle.net/10.1234/x",
+    ] {
+        assert!(!is_degenerate_landing_url(&landing(url)), "{url}");
+    }
+}
+
+#[test]
+fn bare_site_roots_are_degenerate_but_any_path_query_or_fragment_is_not() {
+    for url in [
+        "https://example.org/",
+        "https://Example.org:443",
+        "https://example.org?",
+        "https://example.org/#",
+        "http://www.google.com/",
+        "https://example.org:8443/",
+    ] {
+        assert!(is_degenerate_landing_url(&landing(url)), "{url}");
+    }
+    for url in [
+        "https://example.org/a",
+        "https://example.org/a/",
+        "https://example.org/?q=1",
+        "https://example.org/#frag",
+        "https://example.org//",
+    ] {
+        assert!(!is_degenerate_landing_url(&landing(url)), "{url}");
+    }
+}
+
+#[test]
+fn dotless_hosts_are_degenerate_and_ip_literals_and_idn_hosts_follow_the_other_rules() {
+    for url in [
+        "http://www/",
+        "http://www",
+        "http://www/page",
+        "http://localhost:8080/data/1",
+        "https://bücher/a",
+    ] {
+        assert!(is_degenerate_landing_url(&landing(url)), "{url}");
+    }
+    // IP addresses are not domain names: only the bare-root rule applies to them.
+    assert!(is_degenerate_landing_url(&landing("http://127.0.0.1/")));
+    assert!(is_degenerate_landing_url(&landing("http://[::1]/")));
+    assert!(!is_degenerate_landing_url(&landing(
+        "http://127.0.0.1/data"
+    )));
+    assert!(!is_degenerate_landing_url(&landing("http://[::1]/data")));
+    // An internationalized host with a dot is an ordinary host.
+    assert_eq!(
+        landing("https://Bücher.example/a"),
+        "https://xn--bcher-kva.example/a"
+    );
+    assert!(!is_degenerate_landing_url(&landing(
+        "https://Bücher.example/a"
+    )));
+    // The predicate judges URLs only.
+    assert!(!is_degenerate_landing_url("not a url"));
 }

@@ -10,6 +10,7 @@ from citations_pipeline.extractor import (
     ExtractorError,
     FullExtractionOutputs,
     build_extractor,
+    load_extraction_report,
     run_build_index,
     run_datacite_extraction,
     run_extraction,
@@ -331,6 +332,23 @@ def test_run_datacite_extraction_tolerates_unknown_integer_counters(
         case.identity_sha256, stats={**STATS, "future_counter": 7}
     )
     case.run()
+
+
+def test_extraction_report_keeps_the_degenerate_urls_counter(tmp_path: Path) -> None:
+    identity = canonical_sha256(IDENTITY)
+    path = tmp_path / "extraction-report.json"
+    path.write_text(
+        json.dumps(report_payload(identity, stats={**STATS, "degenerate_urls": 5}))
+    )
+    report = load_extraction_report(path, identity_sha256=identity)
+    assert report.stats["degenerate_urls"] == 5
+    assert report.stats["unmatched_urls"] == STATS["unmatched_urls"]
+
+    path.write_text(
+        json.dumps(report_payload(identity, stats={**STATS, "degenerate_urls": -1}))
+    )
+    with pytest.raises(ExtractorError, match="degenerate_urls"):
+        load_extraction_report(path, identity_sha256=identity)
 
 
 def test_run_datacite_extraction_fails_on_nonzero(tmp_path: Path) -> None:

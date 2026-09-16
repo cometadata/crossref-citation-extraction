@@ -313,6 +313,9 @@ registered by several records are recorded as ambiguous evidence instead.
 - Landing-page matching uses the URLs registered in the DataCite release
   `{datacite_release}`; earlier or historical URLs of a record are not
   matched.
+- Registered landing pages on DOI resolver hosts (`doi.org`, `dx.doi.org`,
+  `www.doi.org`), bare site roots, and hosts without a dot are ignored for
+  URL matching, so records registered with such a URL are matched only by DOI.
 - The dataset reflects one Crossref snapshot and one DataCite release; each
   publication replaces the previous contents rather than accumulating them.
 - References whose URL is registered by several DataCite records appear only

@@ -231,7 +231,7 @@ Ambiguity rows:
     "items": 1, "references": 3, "confirmed_matches": 3,
     "doi_matches": 1, "url_matches": 1, "arxiv_matches": 1,
     "ambiguous_urls": 0, "invalid_arxiv": 0,
-    "unmatched_dois": 0, "unmatched_urls": 0,
+    "unmatched_dois": 0, "unmatched_urls": 0, "degenerate_urls": 0,
     "malformed_references": 0, "malformed_fields": 0,
     "filtered_self_citations": 0, "filtered_provenance": 0
   },
@@ -302,6 +302,22 @@ ambiguous when the two registrations differ. Surrounding citation
 punctuation is removed only through the same bounded variants, validated
 against the URL index.
 
+**Degenerate landing pages.** Some records register a landing page that
+identifies nothing, such as `https://doi.org/`, `http://dx.doi.org/`, or
+`http://www`. A normalized lookup key is skipped (never looked up, so it
+yields neither a match nor an ambiguity row) when (a) its host is a DOI
+resolver (`doi.org`, `dx.doi.org`, `www.doi.org`), whatever the path; (b) it
+is a bare site root: path exactly `/` with no query and no fragment; or (c)
+its host is a domain name without a dot (`www`, `localhost`). IP-address
+hosts are subject only to (b). The rule applies at match time to every key,
+including both keys of a scheme-less reference. The index bundle is
+unchanged, and a record registered with such a URL can still be matched by
+DOI; a resolver URL with a DOI path, like `https://doi.org/10.1234/a`, is DOI
+evidence as before. Skipped candidates are counted in `degenerate_urls`
+(once per distinct URL per reference, like `unmatched_urls`) and never in
+`unmatched_urls`. The predicate is `is_degenerate_landing_url` in
+`src/common/identifiers.rs`.
+
 **arXiv identifiers.** The legacy recognizers are kept unchanged (see
 [arXiv ID patterns](#arxiv-id-patterns)); their results are converted to the
 canonical `10.48550/arxiv.<id>` DOI before deduplication, and must be in the
@@ -325,7 +341,8 @@ ambiguous. Unresolved evidence is written to `<stem>_ambiguous_urls.jsonl`
 `candidate_dois` sorted) and published as the dataset's `ambiguous_urls`
 configuration. It contributes to no citation count. Candidates absent from
 the release only increment the `unmatched_dois` / `unmatched_urls`
-diagnostics; they are never written out.
+diagnostics, and degenerate landing-page candidates the `degenerate_urls`
+diagnostic; they are never written out.
 
 ### Counting: reference count versus citation count
 

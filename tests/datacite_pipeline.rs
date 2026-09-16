@@ -795,6 +795,78 @@ fn counters_cover_ambiguity_failed_arxiv_self_citations_and_unmatched() -> Resul
 }
 
 #[test]
+fn degenerate_registered_landing_pages_are_counted_and_never_matched() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let bundle = build_bundle(
+        tmp.path(),
+        &[
+            ("10.26091/9prt-kt79", Some("https://doi.org/")),
+            ("10.4233/uuid:vervallen", Some("http://dx.doi.org/")),
+            ("10.25768/a", Some("http://www")),
+            ("10.25768/b", Some("http://www")),
+            ("10.1234/root", Some("https://example.org/")),
+            ("10.1234/a", Some("https://example.org/a")),
+            ("10.1234/b", None),
+        ],
+    )?;
+    let input = tmp.path().join("crossref.json");
+    fs::write(
+        &input,
+        member(&[(
+            "10.9999/citer",
+            vec![
+                // https://doi.org/ (1); 10.1016/… is an unmatched DOI.
+                json!({"unstructured": "J. Mater. https://doi.org/ 10.1016/j.msec.2015.01.054."}),
+                // http://dx.doi.org/ from both fields, and scheme-less doi.org/ (2).
+                json!({"URL": "http://dx.doi.org/", "unstructured": "doi.org/ and http://dx.doi.org/"}),
+                // http://www/ (1): no ambiguity row.
+                json!({"unstructured": "Quotes. http://www .quotesandpoem.com/quotes"}),
+                // https://example.org/ (1).
+                json!({"URL": "https://example.org/"}),
+                // Ordinary evidence on the same hosts still matches.
+                json!({"URL": "https://example.org/a"}),
+                json!({"unstructured": "https://doi.org/10.1234/B."}),
+            ],
+        )]),
+    )?;
+    let output_dir = tmp.path().join("out");
+    let run = Run::new(&input, &bundle, &output_dir, &tmp.path().join("parts"))
+        .args(&["--partitions", "1"]);
+    let output = run.output()?;
+    let log = transcript(&output);
+    ensure!(output.status.success(), "pipeline failed: {log}");
+    let report = read_json(&run.report_path())?;
+    assert_eq!(stat(&report, "references"), 6);
+    assert_eq!(stat(&report, "degenerate_urls"), 5);
+    assert_eq!(stat(&report, "unmatched_urls"), 0);
+    assert_eq!(
+        stat(&report, "unmatched_dois"),
+        1,
+        "10.1016/j.msec.2015.01.054"
+    );
+    assert_eq!(stat(&report, "ambiguous_urls"), 0);
+    assert_eq!(stat(&report, "confirmed_matches"), 2);
+    assert_eq!(stat(&report, "url_matches"), 1);
+    assert_eq!(stat(&report, "doi_matches"), 1);
+
+    let valid = grouped(&output_dir.join("crossref_valid.jsonl"))?;
+    assert_eq!(
+        valid.keys().collect::<Vec<_>>(),
+        vec!["10.1234/a", "10.1234/b"]
+    );
+    assert_eq!(valid["10.1234/a"][0]["ref_index"], 4);
+    assert_eq!(
+        valid["10.1234/b"][0]["raw_match"],
+        "https://doi.org/10.1234/B"
+    );
+    assert!(read_jsonl(&output_dir.join("crossref_ambiguous_urls.jsonl"))?.is_empty());
+
+    // The counter is reported with the others on the progress line.
+    ensure!(log.contains(" degenerate_urls=5 "), "{log}");
+    Ok(())
+}
+
+#[test]
 fn provenance_filter_drops_rows_and_is_recorded() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let bundle = build_bundle(tmp.path(), &[("10.1234/a", None), ("10.1234/b", None)])?;

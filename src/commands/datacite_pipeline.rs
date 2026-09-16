@@ -99,7 +99,8 @@ const PART_SUFFIX: &str = ".part";
 /// self-citation and provenance filters; `doi_matches + url_matches +
 /// arxiv_matches` equals it. `filtered_self_citations` and
 /// `filtered_provenance` count confirmed or failed-arXiv rows dropped by
-/// those filters.
+/// those filters. `degenerate_urls` counts URL candidates whose landing-page
+/// keys were degenerate and never looked up; they are not `unmatched_urls`.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStats {
     pub items: u64,
@@ -112,6 +113,7 @@ pub struct FileStats {
     pub invalid_arxiv: u64,
     pub unmatched_dois: u64,
     pub unmatched_urls: u64,
+    pub degenerate_urls: u64,
     pub malformed_references: u64,
     pub malformed_fields: u64,
     pub filtered_self_citations: u64,
@@ -131,6 +133,7 @@ impl FileStats {
         self.invalid_arxiv += other.invalid_arxiv;
         self.unmatched_dois += other.unmatched_dois;
         self.unmatched_urls += other.unmatched_urls;
+        self.degenerate_urls += other.degenerate_urls;
         self.malformed_references += other.malformed_references;
         self.malformed_fields += other.malformed_fields;
         self.filtered_self_citations += other.filtered_self_citations;
@@ -959,6 +962,7 @@ fn mine_reference(
     stats.invalid_arxiv += matches.failed_arxiv.len() as u64;
     stats.unmatched_dois += matches.unmatched_dois;
     stats.unmatched_urls += matches.unmatched_urls;
+    stats.degenerate_urls += matches.degenerate_urls;
     stats.malformed_fields += matches.malformed_fields;
 
     let failed = matches
@@ -1182,8 +1186,8 @@ fn maybe_commit(state: &mut WriterState<'_>) -> Result<()> {
 fn stats_fields(stats: &FileStats) -> String {
     format!(
         "items={} references={} confirmed={} doi={} url={} arxiv={} ambiguous={} \
-         invalid_arxiv={} unmatched_dois={} unmatched_urls={} malformed_references={} \
-         malformed_fields={} self_citations={} filtered_provenance={}",
+         invalid_arxiv={} unmatched_dois={} unmatched_urls={} degenerate_urls={} \
+         malformed_references={} malformed_fields={} self_citations={} filtered_provenance={}",
         stats.items,
         stats.references,
         stats.confirmed_matches,
@@ -1194,6 +1198,7 @@ fn stats_fields(stats: &FileStats) -> String {
         stats.invalid_arxiv,
         stats.unmatched_dois,
         stats.unmatched_urls,
+        stats.degenerate_urls,
         stats.malformed_references,
         stats.malformed_fields,
         stats.filtered_self_citations,

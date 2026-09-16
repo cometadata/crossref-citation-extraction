@@ -81,10 +81,21 @@ fn a_doi_disambiguates_only_its_own_shared_url() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delegates to a `MemoryIndex` while counting landing-page lookups.
+/// Delegates to a `MemoryIndex` while counting landing-page and host lookups.
 struct CountingIndex<'a> {
     inner: &'a MemoryIndex,
     url_lookups: AtomicUsize,
+    host_lookups: AtomicUsize,
+}
+
+impl<'a> CountingIndex<'a> {
+    fn new(inner: &'a MemoryIndex) -> Self {
+        Self {
+            inner,
+            url_lookups: AtomicUsize::new(0),
+            host_lookups: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl TargetLookup for CountingIndex<'_> {
@@ -93,6 +104,7 @@ impl TargetLookup for CountingIndex<'_> {
     }
 
     fn contains_host(&self, host: &str) -> bool {
+        self.host_lookups.fetch_add(1, Ordering::SeqCst);
         self.inner.contains_host(host)
     }
 
@@ -318,7 +330,6 @@ fn path_prefixes_and_suffix_shortening_never_match() {
         "https://example.org/data/12",
         "https://example.org/data/1/",
         "https://example.org/data",
-        "https://example.org/",
         "https://other.org/data/1",
         "http://example.org/data/1",
     ] {
@@ -326,7 +337,14 @@ fn path_prefixes_and_suffix_shortening_never_match() {
         assert!(matches.confirmed.is_empty(), "{url}");
         assert!(matches.ambiguous.is_empty(), "{url}");
         assert_eq!(counters(&matches), (0, 1, 0, 0), "{url}");
+        assert_eq!(matches.degenerate_urls, 0, "{url}");
     }
+    // The bare site root is never landing-page evidence: it is counted as
+    // degenerate rather than unmatched.
+    let root = run(&index, json!({"URL": "https://example.org/"}));
+    assert!(root.confirmed.is_empty() && root.ambiguous.is_empty());
+    assert_eq!(counters(&root), (0, 0, 0, 0));
+    assert_eq!(root.degenerate_urls, 1);
     for doi in ["10.1234/abc", "10.1234/ab2", "10.1234/a", "10.12345/ab"] {
         let matches = run(
             &index,
@@ -502,10 +520,7 @@ fn repeated_url_evidence_is_reported_once_and_looked_up_once() {
             ("https://example.org/c", &["10.1234/c"]),
         ],
     );
-    let index = CountingIndex {
-        inner: &inner,
-        url_lookups: AtomicUsize::new(0),
-    };
+    let index = CountingIndex::new(&inner);
     let matches = run(
         &index,
         json!({
@@ -963,4 +978,185 @@ fn an_asserted_structured_doi_outside_the_registry_emits_no_asserted_match() {
         vec![("10.1234/a", Provenance::Mined, MatchType::Doi, "10.1234/a")]
     );
     assert_eq!(counters(&with_text), (1, 0, 0, 0));
+}
+
+#[test]
+fn registered_resolver_roots_are_never_landing_page_evidence() {
+    for resolver in ["https://doi.org/", "http://dx.doi.org/"] {
+        let scheme_less = resolver.split_once("://").unwrap().1;
+        let inner = index(
+            &["10.26091/9prt-kt79", "10.1234/a"],
+            &[(resolver, &["10.26091/9prt-kt79"])],
+        );
+        for reference in [
+            json!({"URL": resolver}),
+            json!({"URL": resolver.trim_end_matches('/')}),
+            json!({"unstructured": format!("Data archive. {resolver} ")}),
+            json!({"unstructured": format!("({resolver}).")}),
+            json!({"unstructured": format!("Available: {scheme_less} and again {resolver}")}),
+        ] {
+            let counting = CountingIndex::new(&inner);
+            let matches = run(&counting, reference.clone());
+            assert!(matches.confirmed.is_empty(), "{reference}");
+            assert!(matches.ambiguous.is_empty(), "{reference}");
+            assert_eq!(counters(&matches), (0, 0, 0, 0), "{reference}");
+            assert!(matches.degenerate_urls >= 1, "{reference}");
+            // Skipped before any index lookup.
+            assert_eq!(
+                counting.url_lookups.load(Ordering::SeqCst),
+                0,
+                "{reference}"
+            );
+            assert_eq!(
+                counting.host_lookups.load(Ordering::SeqCst),
+                0,
+                "{reference}"
+            );
+        }
+
+        // A space separating the resolver from a Crossref DOI: the DOI is
+        // its own unmatched candidate, the bare resolver is degenerate.
+        let split = run(
+            &inner,
+            json!({"unstructured": format!("J. Mater. {resolver} 10.1016/j.msec.2015.01.054.")}),
+        );
+        assert!(split.confirmed.is_empty());
+        assert_eq!(counters(&split), (1, 0, 0, 0));
+        assert_eq!(split.degenerate_urls, 1);
+
+        // A resolver URL with a DOI path is still DOI evidence.
+        let doi = run(
+            &inner,
+            json!({"unstructured": format!("see {resolver}10.1234/A.")}),
+        );
+        let raw = format!("{resolver}10.1234/A");
+        assert_eq!(
+            confirmed(&doi),
+            vec![("10.1234/a", Provenance::Mined, MatchType::Doi, raw.as_str())]
+        );
+        assert_eq!(counters(&doi), (0, 0, 0, 0));
+        assert_eq!(doi.degenerate_urls, 0);
+    }
+}
+
+#[test]
+fn degenerate_urls_count_once_per_distinct_url_per_reference() {
+    let inner = index(
+        &["10.26091/9prt-kt79"],
+        &[("https://doi.org/", &["10.26091/9prt-kt79"])],
+    );
+    // Trailing punctuation and repeated sightings do not multiply the count;
+    // a scheme-less sighting counts under its `http://` key.
+    let matches = run(
+        &inner,
+        json!({
+            "URL": "https://doi.org/",
+            "unstructured": "https://doi.org/, https://doi.org/. doi.org/ http://doi.org/"
+        }),
+    );
+    assert!(matches.confirmed.is_empty());
+    assert_eq!(counters(&matches), (0, 0, 0, 0));
+    assert_eq!(
+        matches.degenerate_urls, 2,
+        "https://doi.org/ and http://doi.org/"
+    );
+}
+
+#[test]
+fn dotless_registered_hosts_produce_no_ambiguity_rows() {
+    let inner = index(
+        &["10.25768/a", "10.25768/b"],
+        &[("http://www/", &["10.25768/a", "10.25768/b"])],
+    );
+    for reference in [
+        json!({"unstructured": "Quotes and Poems.com Web site. http://www .quotesandpoem.com/quotes/showquotes/author /alan-k.simpson/12505"}),
+        json!({"unstructured": "http://www .example.com"}),
+        json!({"URL": "http://www"}),
+        json!({"URL": "http://www/"}),
+    ] {
+        let counting = CountingIndex::new(&inner);
+        let matches = run(&counting, reference.clone());
+        assert!(matches.confirmed.is_empty(), "{reference}");
+        assert!(matches.ambiguous.is_empty(), "{reference}");
+        assert_eq!(counters(&matches), (0, 0, 0, 0), "{reference}");
+        assert_eq!(matches.degenerate_urls, 1, "{reference}");
+        assert_eq!(
+            counting.url_lookups.load(Ordering::SeqCst),
+            0,
+            "{reference}"
+        );
+    }
+    // A DOI of the shared registration is still found as a DOI, with no
+    // URL evidence left to report.
+    let direct = run(
+        &inner,
+        json!({"DOI": "10.25768/a", "unstructured": "http://www .example.com"}),
+    );
+    assert_eq!(
+        confirmed(&direct),
+        vec![(
+            "10.25768/a",
+            Provenance::Mined,
+            MatchType::Doi,
+            "10.25768/a"
+        )]
+    );
+    assert!(direct.ambiguous.is_empty());
+    assert_eq!(direct.degenerate_urls, 1);
+}
+
+#[test]
+fn registered_bare_site_roots_never_match_but_their_pages_do() {
+    let inner = index(
+        &["10.1234/root", "10.1234/a", "10.1234/q"],
+        &[
+            ("https://example.org/", &["10.1234/root"]),
+            ("https://example.org/a", &["10.1234/a"]),
+            ("https://example.org/?q=1", &["10.1234/q"]),
+        ],
+    );
+    for reference in [
+        json!({"URL": "https://example.org/"}),
+        json!({"URL": "https://example.org"}),
+        json!({"unstructured": "see https://Example.org:443/."}),
+        json!({"unstructured": "see example.org/ for data"}),
+    ] {
+        let counting = CountingIndex::new(&inner);
+        let matches = run(&counting, reference.clone());
+        assert!(matches.confirmed.is_empty(), "{reference}");
+        assert!(matches.ambiguous.is_empty(), "{reference}");
+        assert_eq!(counters(&matches), (0, 0, 0, 0), "{reference}");
+        assert_eq!(matches.degenerate_urls, 1, "{reference}");
+        assert_eq!(
+            counting.url_lookups.load(Ordering::SeqCst),
+            0,
+            "{reference}"
+        );
+    }
+    for (text, doi, raw) in [
+        (
+            "See https://example.org/a.",
+            "10.1234/a",
+            "https://example.org/a",
+        ),
+        (
+            "See https://example.org/?q=1",
+            "10.1234/q",
+            "https://example.org/?q=1",
+        ),
+    ] {
+        let matches = run(&inner, json!({"unstructured": text}));
+        assert_eq!(
+            confirmed(&matches),
+            vec![(doi, Provenance::Mined, MatchType::Url, raw)],
+            "{text}"
+        );
+        assert_eq!(counters(&matches), (0, 0, 0, 0), "{text}");
+        assert_eq!(matches.degenerate_urls, 0, "{text}");
+    }
+    // Trailing punctuation that normalizes to the root is degenerate, not unmatched.
+    let punctuated = run(&inner, json!({"unstructured": "https://example.org/,"}));
+    assert!(punctuated.confirmed.is_empty());
+    assert_eq!(counters(&punctuated), (0, 0, 0, 0));
+    assert_eq!(punctuated.degenerate_urls, 1);
 }

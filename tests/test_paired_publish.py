@@ -620,6 +620,13 @@ def test_datacite_card_declares_configs_license_counts_and_policy() -> None:
     assert "doi-asserted-by" in mined
     policy = card.split("### Provenance and Ambiguity Policy")[1].split("###")[0]
     assert "structured `DOI` field" in " ".join(policy.split())
+    # Degenerate registered landing pages are a documented limitation.
+    limitations = " ".join(card.split("## Limitations")[1].split("## License")[0].split())
+    assert (
+        "Registered landing pages on DOI resolver hosts (`doi.org`, `dx.doi.org`, "
+        "`www.doi.org`), bare site roots, and hosts without a dot are ignored for "
+        "URL matching" in limitations
+    )
 
 
 def test_datacite_card_size_category_follows_counts() -> None:
