@@ -134,6 +134,28 @@ Remove surrounding citation punctuation only through bounded candidate
 variants validated against the URL index. Never scan across a reference
 field boundary to manufacture a DOI or URL.
 
+Ignore degenerate registered landing pages at match time. Before any
+index lookup or ambiguity record, skip every normalized lookup key
+(including both scheme keys of a scheme-less reference) that meets any of
+these conditions:
+
+- (a) its host is a DOI resolver host: `doi.org`, `dx.doi.org`, or
+  `www.doi.org`, with any path. Such URLs are DOI evidence for the DOI
+  path, never landing-page evidence.
+- (b) it is a bare site root: path exactly `/` with no query and no
+  fragment, after normalization.
+- (c) its host contains no `.` (for example `www` or `localhost`). IP
+  address hosts are not domain names, so only (b) applies to them.
+
+A skipped key yields no lookup, no confirmed match, and no ambiguity row.
+Skipped candidates are counted in a `degenerate_urls` diagnostic, distinct
+from `unmatched_urls`. The index bundle is unchanged, and DOI and arXiv
+matching of the same text are unaffected: a resolver URL with a DOI path
+still matches by DOI.
+This rule was adopted on 2026-09-16 after the first production run, where
+registered landing pages `https://doi.org/`, `http://dx.doi.org/`, and
+`http://www` produced about half of all URL matches and most ambiguity rows.
+
 ### arXiv compatibility
 
 Keep the recognizers in `src/extract/arxiv.rs`, including modern IDs,
