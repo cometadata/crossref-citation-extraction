@@ -67,6 +67,15 @@ class FakeStore:
 class FakeApi:
     def __init__(self) -> None:
         self.known_revisions: set[str] = set()
+        self.paired_manifest: bytes | None = None
+
+    def file_exists(self, repo_id, filename, *, repo_type=None, revision=None, token=None):
+        return filename == "metadata/pipeline-manifest.json" and self.paired_manifest is not None
+
+    def hf_hub_download(self, *, repo_id, filename, repo_type, revision, token, cache_dir):
+        target = Path(cache_dir) / "manifest.json"
+        target.write_bytes(self.paired_manifest)
+        return str(target)
 
     def dataset_info(self, repo_id, revision=None, token=None):
         if revision is not None and revision not in self.known_revisions:
@@ -236,6 +245,18 @@ def test_production_completes_via_mirror(tmp_path: Path) -> None:
     assert pipeline_markers[0]["raw_prefix"] is None  # mirror provenance
     # derived generation uploaded before markers
     assert harness.store.trees and harness.store.trees[0][1].name.startswith("2026-07-")
+
+
+def test_legacy_production_refuses_a_dataset_owned_by_the_full_pipeline(
+    tmp_path: Path,
+) -> None:
+    harness = Harness(tmp_path)
+    harness.api.paired_manifest = b'{"kind": "citation-dataset", "manifest_version": 2}'
+    with pytest.raises(PipelineError, match="full DataCite pipeline"):
+        run_pipeline(harness.config(), harness.deps())
+    # Refused before any build, extraction or publication work.
+    assert harness.calls == []
+    assert not marker_payloads(harness.store, "_PIPELINE_COMPLETE.json")
 
 
 def test_source_digest_mismatch_fails(tmp_path: Path) -> None:

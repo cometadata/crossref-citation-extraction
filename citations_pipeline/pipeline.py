@@ -27,6 +27,8 @@ from .pipeline_io import compress_file as _compress_file
 from .pipeline_io import count_lines as _count_lines
 from .publish import (
     ConfigStats,
+    PublishError,
+    ensure_not_paired_publication,
     publish_dataset,
     render_dataset_card,
     transform_outputs,
@@ -353,6 +355,14 @@ def _run_production(
     events = deps.events
     paths = PipelinePaths.from_roots(config.bucket_root, config.work_root)
     api = deps.api_factory(config.hf_token)
+    # The full DataCite pipeline owns the arXiv dataset once it has published
+    # it; refuse before any build or extraction work (publication checks
+    # again at the commit's parent revision).
+    with events.phase("check_dataset_ownership"):
+        try:
+            ensure_not_paired_publication(api, config.hf_token)
+        except PublishError as error:
+            raise PipelineError(str(error)) from error
     store = deps.store_factory(
         api=api, token=config.hf_token, mount_root=config.bucket_root
     )

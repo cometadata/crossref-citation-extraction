@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ import pytest
 from citations_pipeline.publish import (
     ConfigStats,
     PublishError,
+    ensure_not_paired_publication,
     publish_dataset,
     render_dataset_card,
 )
@@ -77,6 +79,20 @@ class FakeApi:
         self.tip = "a" * 40
         self.commits: list[dict] = []
         self.fail_create = False
+        # Repository files at `tip` beyond the legacy data (path -> bytes).
+        self.files: dict[str, bytes] = {}
+        self.file_checks: list[tuple[str, str | None]] = []
+
+    def file_exists(self, repo_id, filename, *, repo_type=None, revision=None, token=None):
+        assert repo_id == "cometadata/crossref-arxiv-citations" and repo_type == "dataset"
+        self.file_checks.append((filename, revision))
+        return filename in self.files
+
+    def hf_hub_download(self, *, repo_id, filename, repo_type, revision, token, cache_dir):
+        target = Path(cache_dir) / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(self.files[filename])
+        return str(target)
 
     def dataset_info(self, repo_id, revision=None, token=None):
         if revision is None:
@@ -127,6 +143,47 @@ def test_publish_guarded_by_parent_commit(tmp_path: Path) -> None:
     ]
     assert "2026-07" in commit["commit_message"]
     assert result.commit_sha == "b" * 40
+
+
+def paired_manifest(version: object = 2) -> bytes:
+    return json.dumps(
+        {"kind": "citation-dataset", "manifest_version": version, "dataset_kind": "arxiv"}
+    ).encode()
+
+
+def test_legacy_publication_checks_the_parent_revision_for_a_paired_manifest(
+    tmp_path: Path,
+) -> None:
+    api = FakeApi()
+    publish_dataset(
+        api=api, token="secret", parquet=_parquet_files(tmp_path), card="c",
+        snapshot_id="2026-07", events=EventLogger(),
+    )
+    assert api.file_checks == [("metadata/pipeline-manifest.json", "a" * 40)]
+    assert len(api.commits) == 1
+
+
+@pytest.mark.parametrize("payload", [paired_manifest(2), paired_manifest(3), b"{not json"])
+def test_legacy_publication_refuses_to_commit_over_the_paired_dataset(
+    tmp_path: Path, payload: bytes
+) -> None:
+    api = FakeApi()
+    api.files["metadata/pipeline-manifest.json"] = payload
+    with pytest.raises(PublishError, match="full DataCite pipeline") as excinfo:
+        publish_dataset(
+            api=api, token="secret", parquet=_parquet_files(tmp_path), card="c",
+            snapshot_id="2026-07", events=EventLogger(),
+        )
+    assert api.commits == []
+    assert "secret" not in str(excinfo.value)
+
+
+def test_legacy_publication_guard_allows_a_repository_without_a_paired_manifest() -> None:
+    api = FakeApi()
+    ensure_not_paired_publication(api, "secret")
+    assert api.file_checks == [("metadata/pipeline-manifest.json", None)]
+    api.files["metadata/pipeline-manifest.json"] = paired_manifest(1)
+    ensure_not_paired_publication(api, "secret", revision="b" * 40)
 
 
 def test_publish_wraps_commit_failure(tmp_path: Path) -> None:

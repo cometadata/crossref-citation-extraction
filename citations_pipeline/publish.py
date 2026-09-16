@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -484,6 +485,69 @@ This dataset is released under
 """
 
 
+# The artifact manifest a paired publication (`paired_publish.py`) commits
+# with every dataset revision. The legacy arXiv pipeline never writes one.
+PAIRED_MANIFEST_PATH = "metadata/pipeline-manifest.json"
+PAIRED_MANIFEST_VERSION = 2
+
+
+def ensure_not_paired_publication(
+    api: Any, token: str | None, *, revision: str | None = None
+) -> None:
+    """Refuse a legacy arXiv publication over a paired one.
+
+    Once the full DataCite pipeline publishes `cometadata/crossref-arxiv-citations`,
+    the repository carries `metadata/pipeline-manifest.json` (manifest version
+    2). A legacy commit would replace the data and card while leaving that
+    manifest stale, so the full pipeline's verification would report a
+    concurrent change. A manifest that cannot be read, or that declares
+    version 2 or later, refuses the publication; an absent one allows it."""
+    where = f"{DATASET_REPO}@{revision or 'HEAD'}"
+    try:
+        present = api.file_exists(
+            DATASET_REPO,
+            PAIRED_MANIFEST_PATH,
+            repo_type="dataset",
+            revision=revision,
+            token=token,
+        )
+    except Exception as error:
+        raise PublishError(
+            f"cannot check {where} for {PAIRED_MANIFEST_PATH}: {error}"
+        ) from error
+    if not present:
+        return
+    version: Any = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="legacy-publication-guard-") as cache_dir:
+            local = api.hf_hub_download(
+                repo_id=DATASET_REPO,
+                filename=PAIRED_MANIFEST_PATH,
+                repo_type="dataset",
+                revision=revision,
+                token=token,
+                cache_dir=cache_dir,
+            )
+            manifest = json.loads(Path(local).read_bytes().decode("utf-8"))
+        if isinstance(manifest, dict):
+            version = manifest.get("manifest_version")
+    except Exception:
+        version = None
+    if (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version < PAIRED_MANIFEST_VERSION
+    ):
+        return
+    raise PublishError(
+        f"{DATASET_REPO} is owned by the full DataCite pipeline: {where} carries "
+        f"{PAIRED_MANIFEST_PATH} (manifest_version {version!r}). A legacy arXiv "
+        "publication would replace its data and card and leave that manifest "
+        "stale, so it is refused; publish through the full DataCite pipeline "
+        "(`uv run submit_job.py`) instead."
+    )
+
+
 def publish_dataset(
     *,
     api: Any,
@@ -516,6 +580,7 @@ def publish_dataset(
     with events.phase("publish_dataset"):
         try:
             parent = api.dataset_info(DATASET_REPO, token=token).sha
+            ensure_not_paired_publication(api, token, revision=parent)
             commit = api.create_commit(
                 repo_id=DATASET_REPO,
                 repo_type="dataset",
