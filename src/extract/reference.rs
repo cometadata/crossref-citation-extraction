@@ -4,9 +4,9 @@
 //!
 //! Nothing here consults an index or applies arXiv rules: it reports which
 //! searchable fields hold text, where DOI- and URL-shaped candidates start,
-//! how far each whitespace-delimited token runs, and which trailing
-//! citation punctuation a caller may try removing. Fields are handled one
-//! at a time; text is never joined across fields.
+//! how far each token runs, and which trailing citation punctuation a
+//! caller may try removing. Fields are handled one at a time; text is never
+//! joined across fields.
 
 use std::ops::Range;
 use std::sync::LazyLock;
@@ -31,6 +31,13 @@ pub const URL_FIELD: usize = 1;
 /// Most trailing characters removed from one token while generating
 /// variants, so a token is tried at most this many plus one times.
 pub const MAX_BOUNDARY_STRIPS: usize = 4;
+
+/// Longest DOI token, in bytes, that is ever looked up. DataCite stores
+/// DOIs of at most 255 characters, so the bound is generous; a DOI-shaped
+/// token that runs past it without whitespace or another DOI start is
+/// reported as [`Token::overlong`] and capped just past the bound, and
+/// nothing beyond the bound is matched.
+pub const MAX_DOI_TOKEN_BYTES: usize = 1024;
 
 /// Trailing characters that may be citation punctuation rather than part
 /// of the identifier.
@@ -86,13 +93,18 @@ pub enum TokenKind {
     Url,
 }
 
-/// A candidate token: byte offsets into the scanned text, ending at the
-/// next whitespace or control character.
+/// A candidate token: byte offsets into the scanned text. A URL token ends
+/// at the next whitespace or control character; a DOI token also ends at
+/// the next DOI start and never runs far past [`MAX_DOI_TOKEN_BYTES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
     pub kind: TokenKind,
     pub start: usize,
     pub end: usize,
+    /// A DOI token longer than [`MAX_DOI_TOKEN_BYTES`]: `end` is the first
+    /// character boundary past the bound, and the token must not be looked
+    /// up.
+    pub overlong: bool,
 }
 
 /// A DOI start: `10.`, a registrant of digit groups, and the slash.
@@ -104,19 +116,38 @@ static URL_START: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)https?://|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}/").unwrap()
 });
 
-/// Append every DOI token in `text`. Each start is extended to the end of
-/// its whitespace-delimited token; starts inside an earlier token are
-/// kept, so `10.1/a,10.2/b` yields both.
+/// Append every DOI token in `text`. Each start is extended to the next
+/// whitespace or control character, the next DOI start, or just past
+/// [`MAX_DOI_TOKEN_BYTES`], whichever comes first, so `10.1/a,10.2/b`
+/// yields `10.1/a,` and `10.2/b`. Tokens never overlap, which keeps the
+/// scanned bytes linear in the length of the field however many DOIs it
+/// joins without whitespace.
 pub fn scan_doi_tokens(text: &str, out: &mut Vec<Token>) {
-    let mut position = 0;
-    while let Some(found) = DOI_START.find_at(text, position) {
+    let mut starts = DOI_START
+        .find_iter(text)
+        .map(|found| found.start())
+        .peekable();
+    while let Some(start) = starts.next() {
+        let next_start = starts.peek().copied().unwrap_or(text.len());
+        let limit = ceil_char_boundary(text, start + MAX_DOI_TOKEN_BYTES + 1).min(next_start);
+        let end = token_end(&text[..limit], start);
         out.push(Token {
             kind: TokenKind::Doi,
-            start: found.start(),
-            end: token_end(text, found.start()),
+            start,
+            end,
+            overlong: end - start > MAX_DOI_TOKEN_BYTES,
         });
-        position = found.end();
     }
+}
+
+/// The first character boundary of `text` at or after `index`, or the end.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    (index..text.len())
+        .find(|&candidate| text.is_char_boundary(candidate))
+        .unwrap_or(text.len())
 }
 
 /// Append every URL token in `text`. The scan resumes after each accepted
@@ -134,6 +165,7 @@ pub fn scan_url_tokens(text: &str, out: &mut Vec<Token>) {
                 kind: TokenKind::Url,
                 start,
                 end,
+                overlong: false,
             });
             position = end;
         } else {
@@ -375,15 +407,37 @@ mod tests {
     }
 
     #[test]
-    fn doi_tokens_start_at_word_boundaries_and_run_to_whitespace() {
+    fn doi_tokens_start_at_word_boundaries_and_end_at_whitespace_or_the_next_start() {
         assert_eq!(
             tokens(
                 TokenKind::Doi,
                 "doi:10.1234/abc, then 10.1000.10/x.y) and 10.1/a,10.2/b"
             ),
-            vec!["10.1234/abc,", "10.1000.10/x.y)", "10.1/a,10.2/b", "10.2/b"]
+            vec!["10.1234/abc,", "10.1000.10/x.y)", "10.1/a,", "10.2/b"]
         );
         assert!(tokens(TokenKind::Doi, "arXiv:2410.12345 x10.1234/y 10.abc/z").is_empty());
+    }
+
+    #[test]
+    fn doi_tokens_are_capped_just_past_the_length_bound() {
+        let fits = format!("10.1/{}", "a".repeat(MAX_DOI_TOKEN_BYTES - 5));
+        let mut out = Vec::new();
+        scan_doi_tokens(&format!("{fits} next"), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].end, out[0].overlong), (MAX_DOI_TOKEN_BYTES, false));
+
+        // A multi-byte character straddling the bound is kept whole.
+        let long = format!(
+            "10.1/{}é{}",
+            "a".repeat(MAX_DOI_TOKEN_BYTES - 5),
+            "b".repeat(4096)
+        );
+        out.clear();
+        scan_doi_tokens(&long, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].overlong);
+        assert_eq!(out[0].end, MAX_DOI_TOKEN_BYTES + 2);
+        assert!(long.is_char_boundary(out[0].end));
     }
 
     #[test]

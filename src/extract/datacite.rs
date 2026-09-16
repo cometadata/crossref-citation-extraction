@@ -183,6 +183,11 @@ struct UrlSighting {
     offset: usize,
 }
 
+/// Longest DOI whose failed membership probe is memoized. Longer misses do
+/// not repeat in practice and would otherwise keep a copy of every long
+/// token a reference contains.
+const MAX_MEMOIZED_MISS_BYTES: usize = 256;
+
 /// Per-reference memoization of index lookups, so repeated tokens and
 /// variants do not repeat FST probes or posting decodes.
 struct LookupCache<'a> {
@@ -199,7 +204,9 @@ impl LookupCache<'_> {
             return hit;
         }
         let hit = self.index.contains_doi(doi);
-        self.dois.insert(doi.to_owned(), hit);
+        if hit || doi.len() <= MAX_MEMOIZED_MISS_BYTES {
+            self.dois.insert(doi.to_owned(), hit);
+        }
         hit
     }
 
@@ -321,8 +328,13 @@ impl<'a> Matcher<'a> {
                 continue;
             }
             let text = &decoded.text[token.start..token.end];
-            let raw_of = |length: usize| raw_from(field, &decoded, token.start, length);
-            let miss = self.evaluate_doi(field.field, token.start, boundary_variants(text), raw_of);
+            let miss = if token.overlong {
+                // Longer than any registrable DOI: counted, never looked up.
+                normalize_doi(text).map(Miss::Doi)
+            } else {
+                let raw_of = |length: usize| raw_from(field, &decoded, token.start, length);
+                self.evaluate_doi(field.field, token.start, boundary_variants(text), raw_of)
+            };
             self.note_miss(miss);
         }
         Ok(())

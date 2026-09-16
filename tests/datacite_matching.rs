@@ -790,3 +790,106 @@ fn field_order_then_offset_picks_the_representative() {
         )]
     );
 }
+
+/// Delegates to a `MemoryIndex` while counting DOI membership probes and
+/// the candidate bytes they carry.
+struct ProbeCountingIndex<'a> {
+    inner: &'a MemoryIndex,
+    doi_probes: AtomicUsize,
+    doi_probe_bytes: AtomicUsize,
+}
+
+impl TargetLookup for ProbeCountingIndex<'_> {
+    fn contains_doi(&self, doi: &str) -> bool {
+        self.doi_probes.fetch_add(1, Ordering::SeqCst);
+        self.doi_probe_bytes.fetch_add(doi.len(), Ordering::SeqCst);
+        self.inner.contains_doi(doi)
+    }
+
+    fn contains_host(&self, host: &str) -> bool {
+        self.inner.contains_host(host)
+    }
+
+    fn url_dois(&self, key: &str, max_bytes: usize) -> anyhow::Result<Vec<String>> {
+        self.inner.url_dois(key, max_bytes)
+    }
+}
+
+#[test]
+fn thousands_of_comma_joined_dois_in_one_field_match_with_linear_work() {
+    const COUNT: usize = 8_000;
+    let dois: Vec<String> = (0..COUNT)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!("10.1234/registered-{i}")
+            } else {
+                format!("10.5555/unregistered-{i}")
+            }
+        })
+        .collect();
+    let registered: Vec<&str> = dois.iter().step_by(2).map(String::as_str).collect();
+    let memory = index(&registered, &[]);
+    let counting = ProbeCountingIndex {
+        inner: &memory,
+        doi_probes: AtomicUsize::new(0),
+        doi_probe_bytes: AtomicUsize::new(0),
+    };
+    // One field, no whitespace: every DOI start sits inside the text that
+    // follows the previous one.
+    let field = dois.join(",");
+    let matches = run(&counting, json!({ "unstructured": field }));
+
+    let mut expected: Vec<(&str, Provenance, MatchType, &str)> = registered
+        .iter()
+        .map(|doi| (*doi, Provenance::Mined, MatchType::Doi, *doi))
+        .collect();
+    expected.sort_by_key(|entry| entry.0);
+    assert_eq!(confirmed(&matches), expected);
+    assert_eq!(counters(&matches), ((COUNT / 2) as u64, 0, 0, 0));
+
+    // Structural bound, independent of wall time: each DOI start yields one
+    // token of at most MAX_BOUNDARY_STRIPS + 1 variants, and the tokens do
+    // not overlap, so the probed bytes stay linear in the field length.
+    let variants = crossref_citation_extraction::extract::reference::MAX_BOUNDARY_STRIPS + 1;
+    let probes = counting.doi_probes.load(Ordering::SeqCst);
+    let probe_bytes = counting.doi_probe_bytes.load(Ordering::SeqCst);
+    assert!(probes <= COUNT * variants, "{probes} DOI probes");
+    assert!(
+        probe_bytes <= field.len() * variants,
+        "{probe_bytes} probed bytes for a {}-byte field",
+        field.len()
+    );
+}
+
+#[test]
+fn a_doi_token_ends_at_the_next_doi_start_and_long_tokens_are_never_looked_up() {
+    let memory = index(&["10.1234/a", "10.1234/b"], &[]);
+    let adjacent = run(&memory, json!({"unstructured":"10.1234/a;10.1234/b"}));
+    assert_eq!(
+        confirmed(&adjacent),
+        vec![
+            ("10.1234/a", Provenance::Mined, MatchType::Doi, "10.1234/a"),
+            ("10.1234/b", Provenance::Mined, MatchType::Doi, "10.1234/b"),
+        ]
+    );
+    assert_eq!(counters(&adjacent), (0, 0, 0, 0));
+
+    // A DOI-shaped token longer than any registrable DOI is counted once as
+    // unmatched and never probed, whatever it would have matched.
+    let bound = crossref_citation_extraction::extract::reference::MAX_DOI_TOKEN_BYTES;
+    let long_suffix = "x".repeat(bound);
+    let long = format!("10.1234/{long_suffix}");
+    let long_index = index(&[long.as_str()], &[]);
+    let counting = ProbeCountingIndex {
+        inner: &long_index,
+        doi_probes: AtomicUsize::new(0),
+        doi_probe_bytes: AtomicUsize::new(0),
+    };
+    let overlong = run(
+        &counting,
+        json!({ "unstructured": format!("see {long} and more") }),
+    );
+    assert!(overlong.confirmed.is_empty());
+    assert_eq!(counters(&overlong), (1, 0, 0, 0));
+    assert_eq!(counting.doi_probes.load(Ordering::SeqCst), 0);
+}
