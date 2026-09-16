@@ -1059,13 +1059,14 @@ fn extract_member(
         };
         for (index, raw_reference) in references.iter().enumerate() {
             stats.references += 1;
-            let reference: Value =
-                serde_json::from_str(raw_reference.get()).with_context(|| {
-                    format!(
-                        "member {} work {citing} reference {index} is not JSON",
-                        entry.filename
-                    )
-                })?;
+            // The member already parsed as JSON, so a reference that cannot
+            // become a `Value` (nesting past serde_json's recursion limit, a
+            // number out of range) is one malformed reference, not a fatal
+            // source error.
+            let Ok(reference) = serde_json::from_str::<Value>(raw_reference.get()) else {
+                stats.malformed_references += 1;
+                continue;
+            };
             if !reference.is_object() {
                 stats.malformed_references += 1;
                 continue;

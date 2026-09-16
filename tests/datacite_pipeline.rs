@@ -815,6 +815,37 @@ fn provenance_filter_drops_rows_and_is_recorded() -> Result<()> {
 }
 
 #[test]
+fn a_reference_nested_past_the_parser_depth_limit_is_malformed_not_fatal() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let bundle = build_bundle(tmp.path(), &[("10.1234/a", None)])?;
+    // Valid JSON nested 201 levels deep: past serde_json's recursion limit
+    // for a `Value`, but the member itself is well-formed.
+    let deep = format!(
+        r#"{{"key":"r0","deep":{}{}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let bytes = format!(
+        r#"{{"items":[{{"DOI":"10.9999/citer","reference":[{deep},{{"key":"r1","DOI":"10.1234/a"}}]}}]}}"#
+    )
+    .into_bytes();
+    let archive = tmp.path().join("crossref.tar.gz");
+    write_tar_gz(&archive, &[("0.json", bytes)])?;
+    let output_dir = tmp.path().join("out");
+    let run = Run::new(&archive, &bundle, &output_dir, &tmp.path().join("parts"))
+        .args(&["--partitions", "1"]);
+    let report = run.succeed()?;
+    assert_eq!(report["files_processed"], 1);
+    assert_eq!(stat(&report, "references"), 2);
+    assert_eq!(stat(&report, "malformed_references"), 1);
+    assert_eq!(stat(&report, "confirmed_matches"), 1);
+    let valid = grouped(&output_dir.join("crossref_valid.jsonl"))?;
+    assert_eq!(valid["10.1234/a"].len(), 1);
+    assert_eq!(valid["10.1234/a"][0]["ref_index"], 1);
+    Ok(())
+}
+
+#[test]
 fn non_string_doi_fields_count_as_malformed_without_aborting() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let bundle = build_bundle(tmp.path(), &[("10.1234/a", None)])?;
