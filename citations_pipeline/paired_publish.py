@@ -43,7 +43,13 @@ from .full_state import (
     _is_int,
 )
 from .paths import ARXIV_PUBLISH_SCHEMA_VERSION, DATACITE_PUBLISH_SCHEMA_VERSION
-from .publish import ConfigStats, PublishError, render_dataset_card
+from .publish import (
+    MINED_FIELDS,
+    ConfigStats,
+    PublishError,
+    render_dataset_card,
+    size_category,
+)
 from .state import StateError, sha256_file
 
 MANIFEST_KIND = "citation-dataset"
@@ -78,18 +84,6 @@ Download = Callable[..., str]
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}$")
-_SIZE_CATEGORIES = (
-    (1_000, "n<1K"),
-    (10_000, "1K<n<10K"),
-    (100_000, "10K<n<100K"),
-    (1_000_000, "100K<n<1M"),
-    (10_000_000, "1M<n<10M"),
-    (100_000_000, "10M<n<100M"),
-    (1_000_000_000, "100M<n<1B"),
-    (10_000_000_000, "1B<n<10B"),
-    (100_000_000_000, "10B<n<100B"),
-    (1_000_000_000_000, "100B<n<1T"),
-)
 
 
 @dataclass(frozen=True)
@@ -123,13 +117,6 @@ def _count(value: int) -> str:
     return f"{value:,}"
 
 
-def _size_category(works: int) -> str:
-    for limit, label in _SIZE_CATEGORIES:
-        if works < limit:
-            return label
-    return "n>1T"
-
-
 def render_datacite_card(
     stats: dict[str, ConfigStats],
     ambiguity_rows: int,
@@ -156,7 +143,7 @@ tags:
   - landing-pages
 pretty_name: Crossref DataCite Citations
 size_categories:
-  - {_size_category(stats["all"].works)}
+  - {size_category(stats["all"].works)}
 configs:
   - config_name: all
     data_files:
@@ -198,10 +185,12 @@ version {extractor_version}.
 
 ### Provenance and Ambiguity Policy
 
-- `publisher` and `crossref` matches come from references whose DOI was
-  asserted by the publisher or matched by Crossref. `mined` matches were
-  extracted from unstructured reference text: DOIs, arXiv identifiers, and
-  landing-page URLs.
+- `publisher` and `crossref` matches come from references whose structured
+  `DOI` field holds the cited DOI with a `doi-asserted-by` value of
+  `publisher` or `crossref`. Every other match is `mined`: a DOI, arXiv
+  identifier, or registered landing-page URL found in the reference's `DOI`
+  (without that assertion), `URL`, `article-title`, `journal-title`, or
+  `unstructured` field.
 - A landing-page URL registered by more than one DataCite record never
   produces a citation. Such references are published separately in the
   `ambiguous_urls` configuration with every candidate DOI and are excluded
@@ -215,7 +204,7 @@ version {extractor_version}.
 |--------|-------------|-------------|--------------|-------------------|
 | `all` | All confirmed citations (default) | {_count(stats["all"].works)} | {_count(stats["all"].citations)} | {_count(stats["all"].references)} |
 | `asserted` | Citations whose DOI was asserted by the publisher or matched by Crossref | {_count(stats["asserted"].works)} | {_count(stats["asserted"].citations)} | {_count(stats["asserted"].references)} |
-| `mined` | Citations extracted from unstructured reference text | {_count(stats["mined"].works)} | {_count(stats["mined"].citations)} | {_count(stats["mined"].references)} |
+| `mined` | Citations mined from reference metadata without a publisher or Crossref DOI assertion | {_count(stats["mined"].works)} | {_count(stats["mined"].citations)} | {_count(stats["mined"].references)} |
 
 The `ambiguous_urls` configuration holds {_count(ambiguity_rows)} unresolved
 URL references. It is evidence for downstream resolution, not citations, and
@@ -272,7 +261,7 @@ Each match contains:
 |-------|------|-------------|
 | `provenance` | string | How this match was obtained (see below) |
 | `match_type` | string | What was matched: {match_types} |
-| `raw_match` | string | The exact substring that matched |
+| `raw_match` | string | The exact reference text that matched (a substring, or a whole structured value) |
 | `reference` | struct | The Crossref reference metadata (string-valued fields; absent keys are null) |
 
 ### `ambiguous_urls`
@@ -288,9 +277,9 @@ Each match contains:
 
 ### Provenance Values
 
-- `publisher` - the reference carries an explicit DataCite DOI with `doi-asserted-by: publisher`
-- `crossref` - the reference carries an explicit DataCite DOI with `doi-asserted-by: crossref`
-- `mined` - the identifier was extracted from unstructured reference text
+- `publisher` - the reference's structured `DOI` field holds the DataCite DOI with `doi-asserted-by: publisher`
+- `crossref` - the reference's structured `DOI` field holds the DataCite DOI with `doi-asserted-by: crossref`
+- `mined` - any other match: a DOI, arXiv identifier, or registered landing-page URL found in the reference's {MINED_FIELDS} field (a structured `DOI` counts as mined unless `doi-asserted-by` is `publisher` or `crossref`)
 
 The `asserted` config contains only `publisher` and `crossref` matches; the
 `mined` config contains only `mined` matches.
@@ -323,8 +312,8 @@ registered by several records are recorded as ambiguous evidence instead.
 - References whose URL is registered by several DataCite records appear only
   in `ambiguous_urls` and are never counted as citations.
 - Reference parsing depends on successful identifier extraction from
-  unstructured references; the `mined` subset may contain lower-quality
-  matches from noisy reference text.
+  reference metadata; the `mined` subset may contain lower-quality matches
+  from noisy reference text.
 
 ## License
 
@@ -361,7 +350,7 @@ def _render_card(
             identity_fingerprint=identity.fingerprint(),
             extractor_version=extractor_version,
         )
-    # The existing arXiv dataset keeps its card verbatim.
+    # The existing arXiv dataset keeps its card layout and schema description.
     return render_dataset_card(
         stats,
         snapshot_id=snapshot_id,

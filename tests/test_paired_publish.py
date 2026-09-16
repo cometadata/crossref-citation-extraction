@@ -608,6 +608,17 @@ def test_datacite_card_declares_configs_license_counts_and_policy() -> None:
     assert "ambigu" in lower and "landing" in lower and "historical" in lower
     assert "cometadata/crossref-datacite-citations" in card
     assert "crossref-arxiv-citations" not in card
+    # `mined` is every match without a recognized DOI assertion, from any
+    # searchable field, not only unstructured text.
+    assert "unstructured reference text" not in card
+    mined_row = next(line for line in card.splitlines() if line.startswith("| `mined` |"))
+    assert "unstructured" not in mined_row
+    mined = next(line for line in card.splitlines() if line.startswith("- `mined`"))
+    for field in ("`DOI`", "`URL`", "`article-title`", "`journal-title`", "`unstructured`"):
+        assert field in mined
+    assert "doi-asserted-by" in mined
+    policy = card.split("### Provenance and Ambiguity Policy")[1].split("###")[0]
+    assert "structured `DOI` field" in " ".join(policy.split())
 
 
 def test_datacite_card_size_category_follows_counts() -> None:

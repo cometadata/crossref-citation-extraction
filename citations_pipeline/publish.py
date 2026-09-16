@@ -299,6 +299,33 @@ def _count(value: int) -> str:
     return f"{value:,}"
 
 
+# The Hub's `size_categories` buckets, by record count.
+SIZE_CATEGORIES = (
+    (1_000, "n<1K"),
+    (10_000, "1K<n<10K"),
+    (100_000, "10K<n<100K"),
+    (1_000_000, "100K<n<1M"),
+    (10_000_000, "1M<n<10M"),
+    (100_000_000, "10M<n<100M"),
+    (1_000_000_000, "100M<n<1B"),
+    (10_000_000_000, "1B<n<10B"),
+    (100_000_000_000, "10B<n<100B"),
+    (1_000_000_000_000, "100B<n<1T"),
+)
+
+# How `publisher`, `crossref` and `mined` provenance is decided, shared by
+# both dataset cards.
+MINED_FIELDS = "`DOI`, `URL`, `article-title`, `journal-title`, or `unstructured`"
+
+
+def size_category(works: int) -> str:
+    """The Hub `size_categories` bucket for a dataset of `works` records."""
+    for limit, label in SIZE_CATEGORIES:
+        if works < limit:
+            return label
+    return "n>1T"
+
+
 def render_dataset_card(
     stats: dict[str, ConfigStats],
     *,
@@ -323,7 +350,7 @@ tags:
   - doi
 pretty_name: Crossref arXiv Citations
 size_categories:
-  - 100K<n<1M
+  - {size_category(stats["all"].works)}
 configs:
   - config_name: all
     data_files:
@@ -362,7 +389,7 @@ version {extractor_version}.
 |--------|-------------|-------------|--------------|-------------------|
 | `all` | All validated citations (default) | {_count(stats["all"].works)} | {_count(stats["all"].citations)} | {_count(stats["all"].references)} |
 | `asserted` | Citations where the DOI was explicitly provided by the publisher or matched by Crossref | {_count(stats["asserted"].works)} | {_count(stats["asserted"].citations)} | {_count(stats["asserted"].references)} |
-| `mined` | Citations where the DOI was extracted from unstructured text | {_count(stats["mined"].works)} | {_count(stats["mined"].citations)} | {_count(stats["mined"].references)} |
+| `mined` | Citations mined from reference metadata without a publisher or Crossref DOI assertion | {_count(stats["mined"].works)} | {_count(stats["mined"].citations)} | {_count(stats["mined"].references)} |
 
 ### Loading the Dataset
 
@@ -399,14 +426,14 @@ Each match contains:
 | Field | Type | Description |
 |-------|------|-------------|
 | `provenance` | string | How this match was obtained (see below) |
-| `raw_match` | string | The exact substring that matched an arXiv identifier pattern |
+| `raw_match` | string | The exact reference text that identified the arXiv work (a substring, or a whole structured value): an arXiv identifier, a DOI, or a URL such as the work's registered landing page |
 | `reference` | struct | The Crossref reference metadata (string-valued fields; absent keys are null) |
 
 ### Provenance Values
 
-- `publisher` - the reference carries an explicit arXiv DOI with `doi-asserted-by: publisher`
-- `crossref` - the reference carries an explicit arXiv DOI with `doi-asserted-by: crossref`
-- `mined` - the arXiv identifier was extracted from unstructured reference text
+- `publisher` - the reference's structured `DOI` field holds the arXiv DOI with `doi-asserted-by: publisher`
+- `crossref` - the reference's structured `DOI` field holds the arXiv DOI with `doi-asserted-by: crossref`
+- `mined` - any other match: an arXiv identifier, DOI, or URL found in the reference's {MINED_FIELDS} field (a structured `DOI` counts as mined unless `doi-asserted-by` is `publisher` or `crossref`)
 
 The `asserted` config contains only `publisher` and `crossref` matches; the
 `mined` config contains only `mined` matches. A citing work appears in a
@@ -421,7 +448,9 @@ legacy (`arXiv:cs.DM/9910013`), DOI (`10.48550/arXiv.2403.03542`), and URL
 (`arxiv.org/abs/2403.03542`) forms. Identifiers are normalized (lowercase,
 version suffixes removed). Extracted arXiv DOIs are validated against an
 index of DOIs built from the DataCite monthly data file `{datacite_release}`;
-only arXiv works registered in DataCite are included.
+only arXiv works registered in DataCite are included. When the dataset is
+built by the full DataCite pipeline, an arXiv work can also be matched by its
+DOI anywhere in the reference or by its registered DataCite landing-page URL.
 
 ## Data Sources
 
@@ -433,7 +462,7 @@ only arXiv works registered in DataCite are included.
 
 - Only includes citations registered in Crossref metadata
 - Reference parsing depends on successful identifier extraction from
-  unstructured references
+  reference metadata
 - The `mined` subset may contain lower-quality matches from noisy reference
   text
 

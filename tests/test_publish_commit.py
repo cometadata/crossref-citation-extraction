@@ -36,6 +36,42 @@ def test_card_contains_yaml_configs_and_counts() -> None:
     assert "January 2025" not in card
 
 
+@pytest.mark.parametrize(
+    ("works", "category"),
+    [
+        (999, "n<1K"),
+        (1_000, "1K<n<10K"),
+        (923_302, "100K<n<1M"),
+        (1_040_000, "1M<n<10M"),
+        (12_000_000, "10M<n<100M"),
+    ],
+)
+def test_arxiv_card_size_category_follows_the_work_count(works: int, category: str) -> None:
+    stats = {**STATS, "all": ConfigStats(works=works, citations=works, references=works)}
+    card = render_dataset_card(
+        stats, snapshot_id="2026-07", datacite_release="2026-07", extractor_version="2.1.0"
+    )
+    header = card.split("---\n")[1]
+    assert f"size_categories:\n  - {category}\n" in header
+    assert header.count("size_categories:") == 1
+
+
+def test_arxiv_card_describes_mined_provenance_and_raw_match_evidence() -> None:
+    card = render_dataset_card(
+        STATS, snapshot_id="2026-07", datacite_release="2026-07", extractor_version="2.1.0"
+    )
+    # `mined` covers every unasserted match, not just unstructured text, and
+    # the evidence can be a DOI or a landing-page URL as well as an arXiv id.
+    assert "extracted from unstructured reference text" not in card
+    assert "exact substring that matched an arXiv identifier pattern" not in card
+    raw_match = next(line for line in card.splitlines() if line.startswith("| `raw_match`"))
+    assert "DOI" in raw_match and "URL" in raw_match and "arXiv identifier" in raw_match
+    mined = next(line for line in card.splitlines() if line.startswith("- `mined`"))
+    for field in ("`DOI`", "`URL`", "`article-title`", "`journal-title`", "`unstructured`"):
+        assert field in mined
+    assert "doi-asserted-by" in mined
+
+
 class FakeApi:
     def __init__(self) -> None:
         self.tip = "a" * 40
