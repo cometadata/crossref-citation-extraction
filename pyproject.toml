@@ -1,6 +1,7 @@
 [project]
 name = "crossref-arxiv-citations-hf-job"
 version = "0.1.0"
+description = "Hugging Face Job orchestration for full DataCite citation mining of Crossref snapshots, publishing the DataCite and arXiv citation datasets"
 requires-python = ">=3.11"
 dependencies = [
   "duckdb>=1.3,<2",

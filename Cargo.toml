@@ -1,10 +1,10 @@
 [package]
 name = "crossref-citation-extraction"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 # std::sync::LazyLock needs 1.80; unsigned `is_multiple_of` needs 1.87.
 rust-version = "1.87"
-description = "CLI for extracting, inverting, and validating DOI references from Crossref data"
+description = "Mine Crossref references for every DataCite DOI and registered landing-page URL (full DataCite mining) plus arXiv identifiers, and aggregate citations by cited work"
 
 [dependencies]
 # CLI
