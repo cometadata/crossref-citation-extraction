@@ -29,6 +29,7 @@ from citations_pipeline.benchmark import (
     SETTINGS_KEYS,
     BenchmarkDependencies,
     MemoryReading,
+    ResourceWatermark,
     compare_arxiv_projection,
     cost_estimate,
     create_synthetic_stress,
@@ -37,6 +38,7 @@ from citations_pipeline.benchmark import (
     fetch_pricing,
     maxrss_to_bytes,
     read_cgroup_peak,
+    read_cgroup_resident,
     run_benchmark,
     sample_crossref_archive,
     select_configuration,
@@ -230,6 +232,46 @@ def test_cgroup_peak_reader_prefers_v2_then_v1(tmp_path):
     assert read_cgroup_peak(tmp_path) == MemoryReading(4096, "cgroup-v1")
 
 
+def test_cgroup_resident_excludes_page_cache_and_tracks_a_maximum(tmp_path):
+    assert read_cgroup_resident(tmp_path) == MemoryReading(None, "unavailable")
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "memory" / "memory.stat").write_text(
+        "cache 900000\nrss 4096\ntotal_cache 950000\ntotal_rss 5120\n"
+    )
+    assert read_cgroup_resident(tmp_path) == MemoryReading(5120, "cgroup-v1-stat")
+    # v2: anon + kernel, never the file-backed page cache that dominates
+    # memory.current/memory.peak while the archive is staged and streamed.
+    (tmp_path / "memory.stat").write_text(
+        "anon 1000\nfile 50000000\nkernel 200\nfile_mapped 40000000\nshmem 0\n"
+    )
+    assert read_cgroup_resident(tmp_path) == MemoryReading(1200, "cgroup-v2-stat")
+    (tmp_path / "memory.peak").write_text("50001200\n")
+    assert read_cgroup_peak(tmp_path).peak_bytes == 50001200
+
+    readings = iter([1000, 5000, 2000, 700, 900])
+    watermark = ResourceWatermark(
+        tmp_path / "work",
+        interval=3600.0,
+        memory_sampler=lambda: MemoryReading(next(readings), "cgroup-v2-stat"),
+    )
+    watermark.work_root.mkdir()
+    for _ in range(3):
+        watermark.poll()
+    assert watermark.memory_peak == 5000 and watermark.phase_memory_peak == 5000
+    assert watermark.memory_source == "cgroup-v2-stat"
+    watermark.mark_phase()
+    watermark.poll()
+    # The phase mark resets the per-phase maximum; the run-wide one persists.
+    assert watermark.phase_memory_peak == 900 and watermark.memory_peak == 5000
+    unavailable = ResourceWatermark(
+        tmp_path / "work",
+        interval=3600.0,
+        memory_sampler=lambda: MemoryReading(None, "unavailable"),
+    )
+    unavailable.poll()
+    assert unavailable.memory_peak is None and unavailable.phase_memory_peak is None
+
+
 # --- extrapolation ----------------------------------------------------------------------
 
 
@@ -238,6 +280,10 @@ def measured_numbers() -> dict[str, Any]:
         "total_members": 1000,
         "sampled_members": 10,
         "window_seconds_per_member": [1.5, 2.0, 1.0],
+        # Three windows of differing density; the sample mean is 5 matches
+        # and 10 raw bytes per member, the densest window 8 and 20.
+        "window_confirmed_matches_per_member": [4.0, 8.0, 3.0],
+        "window_raw_bytes_per_member": [8.0, 20.0, 6.0],
         "sample_confirmed_matches": 50,
         "sample_ambiguous_urls": 5,
         "source_transfer_seconds": 100.0,
@@ -259,7 +305,7 @@ def measured_numbers() -> dict[str, Any]:
         "transform_self_peak_bytes": 500,
         "extraction_budget_bytes": 1_200,
         "transform_budget_bytes": 600,
-        "cgroup_peak_bytes": None,
+        "cgroup_resident_peak_bytes": None,
     }
 
 
@@ -268,25 +314,34 @@ def test_extrapolation_formulas_on_synthetic_numbers():
     components = result["components_seconds"]
     # Slowest representative window x total members.
     assert components["extraction"] == pytest.approx(2.0 * 1000)
-    assert result["projected_confirmed_matches"] == pytest.approx(50 * 100)
-    # Fixed costs are measured at full scale; transform/compression/persistence
-    # scale by the matched-row ratio (100x).
+    # Rows and bytes follow the densest window (8 matches, 20 raw bytes per
+    # member), not the sample mean (5 and 10): 160x rows, 200x bytes.
+    assert result["densest_window_matches_per_member"] == 8.0
+    assert result["densest_window_raw_bytes_per_member"] == 20.0
+    assert result["projected_confirmed_matches"] == pytest.approx(8.0 * 1000)
+    assert result["projected_raw_output_bytes"] == pytest.approx(20.0 * 1000)
+    assert result["row_ratio"] == pytest.approx(160.0)
+    assert result["byte_ratio"] == pytest.approx(200.0)
+    assert result["projected_ambiguous_urls"] == pytest.approx(5 * 160)
+    # Fixed costs are measured at full scale; the transform scales by rows,
+    # compression and persistence by bytes.
     assert components["source_transfer"] == 100.0
     assert components["index_preparation"] == 200.0
-    assert components["transform"] == pytest.approx(400.0)
-    assert components["compression"] == pytest.approx(200.0)
-    assert components["persistence"] == pytest.approx(100.0)
+    assert components["transform"] == pytest.approx(4.0 * 160)
+    assert components["compression"] == pytest.approx(2.0 * 200)
+    assert components["persistence"] == pytest.approx(1.0 * 200)
     # Publication uploads the projected derived bytes at the persistence rate.
-    assert components["publication"] == pytest.approx((30 * 100) / (1000 / 1.0))
+    assert components["publication"] == pytest.approx((30 * 200) / (1000 / 1.0))
     point = sum(components.values())
     assert result["projected_total_seconds_point"] == pytest.approx(point)
     assert result["projected_total_seconds"] == pytest.approx(point * 1.25)
     assert result["projected_total_seconds_low"] == pytest.approx(point * 0.75)
     # Disk: before deletion = fixed + archive + segments + 2x segments + raw;
-    # after deletion drops the archive but adds scratch, derived, compressed.
-    segments = 100 * 100  # raw bytes are the floor for segments (40 < 100), scaled
-    before = 700 + 5000 + segments + 2 * segments + 100 * 100
-    after = 700 + 100 * 100 + 60 * 100 + 30 * 100 + 20 * 100
+    # after deletion drops the archive but adds scratch, derived, compressed;
+    # every byte term scales by the densest window's byte ratio (200x).
+    segments = 100 * 200  # raw bytes are the floor for segments (40 < 100), scaled
+    before = 700 + 5000 + segments + 2 * segments + 100 * 200
+    after = 700 + 100 * 200 + 60 * 200 + 30 * 200 + 20 * 200
     assert result["disk"]["before_release_bytes"] == pytest.approx(before)
     assert result["disk"]["after_release_bytes"] == pytest.approx(after)
     assert result["projected_peak_disk_bytes_point"] == pytest.approx(max(before, after))
@@ -298,9 +353,44 @@ def test_extrapolation_formulas_on_synthetic_numbers():
     assert set(result["formulas"]) >= {"extraction", "transform", "disk", "memory", "total"}
 
 
-def test_extrapolation_uses_the_cgroup_peak_when_larger():
+def test_extrapolation_follows_the_densest_window():
+    uniform = measured_numbers()
+    uniform["window_confirmed_matches_per_member"] = [5.0, 5.0, 5.0]
+    uniform["window_raw_bytes_per_member"] = [10.0, 10.0, 10.0]
+    flat = extrapolate(uniform)
+    # Uniform windows reproduce the sample mean x member scale (100x).
+    assert flat["projected_confirmed_matches"] == pytest.approx(50 * 100)
+    assert flat["projected_raw_output_bytes"] == pytest.approx(100 * 100)
+    assert flat["row_ratio"] == pytest.approx(100.0)
+    assert flat["byte_ratio"] == pytest.approx(100.0)
+    skewed = measured_numbers()
+    skewed["window_confirmed_matches_per_member"] = [5.0, 15.0, 5.0]
+    skewed["window_raw_bytes_per_member"] = [10.0, 30.0, 10.0]
+    dense = extrapolate(skewed)
+    # One dense window triples every projected row and byte term, before
+    # the uncertainty band is applied on top.
+    assert dense["projected_confirmed_matches"] == pytest.approx(3 * 50 * 100)
+    assert dense["projected_raw_output_bytes"] == pytest.approx(3 * 100 * 100)
+    assert dense["disk"]["raw_output_bytes"] == pytest.approx(3 * flat["disk"]["raw_output_bytes"])
+    assert dense["disk"]["segments_bytes"] == pytest.approx(3 * flat["disk"]["segments_bytes"])
+    assert dense["disk"]["derived_bytes"] == pytest.approx(3 * flat["disk"]["derived_bytes"])
+    assert dense["components_seconds"]["transform"] == pytest.approx(3 * flat["components_seconds"]["transform"])
+    assert dense["components_seconds"]["compression"] == pytest.approx(3 * flat["components_seconds"]["compression"])
+    assert dense["components_seconds"]["extraction"] == flat["components_seconds"]["extraction"]
+    assert dense["projected_peak_disk_bytes"] == pytest.approx(
+        dense["projected_peak_disk_bytes_point"] * 1.5
+    )
+    assert dense["projected_peak_disk_bytes"] > 3 * flat["projected_peak_disk_bytes_point"]
+    # A sample that matched nothing falls back to the member scale.
+    empty = measured_numbers()
+    empty["sample_confirmed_matches"] = 0
+    empty["window_confirmed_matches_per_member"] = [0.0, 0.0, 0.0]
+    assert extrapolate(empty)["row_ratio"] == pytest.approx(100.0)
+
+
+def test_extrapolation_uses_the_cgroup_resident_peak_when_larger():
     numbers = measured_numbers()
-    numbers["cgroup_peak_bytes"] = 9_000
+    numbers["cgroup_resident_peak_bytes"] = 9_000
     assert extrapolate(numbers)["peak_memory_bytes"] == 9_000
 
 
@@ -553,6 +643,7 @@ class Case:
             resources=ResourceSettings(duckdb_memory_mb=256),
         )
         self.memory_readings = itertools.count(1_000_000, 1_000_000)
+        self.resident_readings = itertools.count(500_000, 250_000)
 
     def deps(self) -> BenchmarkDependencies:
         def refuse(name: str):
@@ -575,6 +666,7 @@ class Case:
             run_legacy_extraction=self._run_legacy_extraction,
             list_hardware=lambda: [Hardware("cpu-basic", 0.000167), Hardware("cpu-upgrade", 0.0005), Hardware("cpu-xl", 1 / 60), Hardware("cpu-performance", 1.9 / 60)],
             memory_probe=lambda: MemoryReading(next(self.memory_readings), "cgroup-v2"),
+            resident_probe=lambda: MemoryReading(next(self.resident_readings), "cgroup-v2-stat"),
             prepare_dataset=refuse("prepare_dataset"),
             publish_pair=refuse("publish_pair"),
             publish_prepared=refuse("publish_prepared"),
@@ -724,7 +816,30 @@ def test_run_benchmark_measures_reports_and_never_publishes(tmp_path):
         assert stress["transform"]["elapsed_seconds"] >= 0
         assert stress["output_bytes"]["raw"] > 0
     assert "high_degree" not in json.dumps(report["extrapolation"])
-    assert report["measurement"]["memory_source"] == "cgroup-v2"
+    # The non-reclaimable high-water mark feeds the projection; memory.peak
+    # (page cache included) is reported for information only.
+    assert report["measurement"]["memory_source"] == "cgroup-v2-stat"
+    assert report["measurement"]["memory_peak_source"] == "cgroup-v2"
+    resident = report["measurement"]["cgroup_resident_peak_bytes"]
+    assert resident >= 500_000
+    assert report["extrapolation"]["inputs"]["cgroup_resident_peak_bytes"] == resident
+    assert "cgroup_peak_bytes" not in report["extrapolation"]["inputs"]
+    assert report["measurement"]["cgroup_peak_bytes"] >= 1_000_000
+    assert report["extrapolation"]["memory"]["cgroup_resident_bytes"] == resident
+    assert report["phases"]["extract_sample"]["memory"]["cgroup_resident_peak_bytes"] >= 500_000
+    # Rows and bytes are projected from the densest window's per-member rates.
+    windows = report["extraction"]["windows"]
+    assert all(w["member_count"] == len(w["members"]) for w in windows)
+    assert report["extrapolation"]["inputs"]["window_raw_bytes_per_member"] == [
+        w["raw_bytes_per_member"] for w in windows
+    ]
+    assert report["extrapolation"]["projected_raw_output_bytes"] == pytest.approx(
+        max(w["raw_bytes_per_member"] for w in windows) * ARCHIVE_MEMBERS
+    )
+    assert report["extrapolation"]["projected_confirmed_matches"] == pytest.approx(
+        max(w["confirmed_matches_per_member"] for w in windows) * ARCHIVE_MEMBERS
+    )
+    assert isinstance(report["samples"]["doi_heavy"]["members"], list)
     assert report["measurement"]["disk_source"] == "shutil.disk_usage+tree"
     assert set(report["phases"]) >= {
         "prepare_index", "source_transfer", "sample_archive", "extract_window_00",

@@ -382,6 +382,39 @@ def read_cgroup_peak(root: Path = Path("/sys/fs/cgroup")) -> MemoryReading:
     return MemoryReading(None, "unavailable")
 
 
+def _stat_counters(path: Path) -> dict[str, int]:
+    counters: dict[str, int] = {}
+    for line in path.read_text().splitlines():
+        name, _, value = line.partition(" ")
+        if name and value.strip().isdigit():
+            counters[name] = int(value)
+    return counters
+
+
+def read_cgroup_resident(root: Path = Path("/sys/fs/cgroup")) -> MemoryReading:
+    """The job's cgroup non-reclaimable memory right now: v2 `memory.stat`
+    `anon + kernel`, else v1 `memory/memory.stat` `total_rss` (or `rss`),
+    else unavailable. Unlike `memory.peak`/`memory.current`, this excludes
+    the file-backed page cache that staging and streaming the archive fill,
+    so a high-water mark over samples reflects the process footprint."""
+    try:
+        counters = _stat_counters(root / "memory.stat")
+        if "anon" in counters:
+            return MemoryReading(
+                counters["anon"] + counters.get("kernel", 0), "cgroup-v2-stat"
+            )
+    except OSError:
+        pass
+    try:
+        counters = _stat_counters(root / "memory" / "memory.stat")
+        for name in ("total_rss", "rss"):
+            if name in counters:
+                return MemoryReading(counters[name], "cgroup-v1-stat")
+    except OSError:
+        pass
+    return MemoryReading(None, "unavailable")
+
+
 def rusage_children_bytes() -> int:
     return maxrss_to_bytes(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
 
@@ -404,14 +437,22 @@ def tree_bytes(root: Path) -> int:
     return total
 
 
-class DiskWatermark:
-    """A sampler thread polling the work volume's usage every `interval`
-    seconds, keeping the run-wide and per-phase high-water marks, plus an
-    optional watched tree whose size is polled alongside."""
+class ResourceWatermark:
+    """A sampler thread polling every `interval` seconds: the work volume's
+    usage (run-wide and per-phase high-water marks, plus an optional watched
+    tree) and, through `memory_sampler`, the cgroup's non-reclaimable memory,
+    kept as a high-water mark over samples (run-wide and per phase)."""
 
-    def __init__(self, work_root: Path, *, interval: float = 1.0) -> None:
+    def __init__(
+        self,
+        work_root: Path,
+        *,
+        interval: float = 1.0,
+        memory_sampler: Callable[[], MemoryReading] | None = None,
+    ) -> None:
         self.work_root = work_root
         self.interval = interval
+        self.memory_sampler = memory_sampler
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -421,13 +462,16 @@ class DiskWatermark:
         self.phase_peak_used = 0
         self.watch_peak = 0
         self.samples = 0
+        self.memory_peak: int | None = None
+        self.phase_memory_peak: int | None = None
+        self.memory_source = "unavailable"
 
     def start(self) -> None:
         self.work_root.mkdir(parents=True, exist_ok=True)
         self.baseline_used = self._used()
         self.poll()
         self._thread = threading.Thread(
-            target=self._run, name="disk-watermark", daemon=True
+            target=self._run, name="resource-watermark", daemon=True
         )
         self._thread.start()
 
@@ -449,11 +493,18 @@ class DiskWatermark:
         used = self._used()
         watch = self._watch
         watched = tree_bytes(watch) if watch is not None else 0
+        memory = self.memory_sampler() if self.memory_sampler is not None else None
         with self._lock:
             self.samples += 1
             self.peak_used = max(self.peak_used, used)
             self.phase_peak_used = max(self.phase_peak_used, used)
             self.watch_peak = max(self.watch_peak, watched)
+            if memory is not None and memory.peak_bytes is not None:
+                self.memory_source = memory.source
+                self.memory_peak = max(self.memory_peak or 0, memory.peak_bytes)
+                self.phase_memory_peak = max(
+                    self.phase_memory_peak or 0, memory.peak_bytes
+                )
         return used
 
     def mark_phase(self, watch: Path | None = None) -> int:
@@ -461,6 +512,7 @@ class DiskWatermark:
             self._watch = watch
             self.watch_peak = 0
             self.phase_peak_used = 0
+            self.phase_memory_peak = None
         return self.poll()
 
     def unwatch(self) -> None:
@@ -470,19 +522,20 @@ class DiskWatermark:
 
 class PhaseMeter:
     """Wraps `events.phase` and records wall-clock, `getrusage` deltas for
-    children and self, the cgroup peak, and the disk marks per phase."""
+    children and self, the cgroup peak (informational, page cache included),
+    the cgroup non-reclaimable high-water mark, and the disk marks per phase."""
 
     def __init__(
         self,
         events: Any,
         *,
         memory_probe: Callable[[], MemoryReading],
-        disk: DiskWatermark,
+        watermark: ResourceWatermark,
         work_root: Path,
     ) -> None:
         self.events = events
         self.memory_probe = memory_probe
-        self.disk = disk
+        self.disk = watermark
         self.work_root = work_root
         self.phases: dict[str, dict[str, Any]] = {}
         self.memory_source = "rusage"
@@ -503,8 +556,9 @@ class PhaseMeter:
         self.disk.unwatch()
         children_after = rusage_children_bytes()
         cgroup_after = self.memory_probe()
-        if cgroup_after.peak_bytes is not None:
-            self.memory_source = cgroup_after.source
+        resident_peak = self.disk.phase_memory_peak
+        if resident_peak is not None:
+            self.memory_source = self.disk.memory_source
         record.update(
             {
                 "elapsed_seconds": elapsed,
@@ -516,6 +570,8 @@ class PhaseMeter:
                     "cgroup_peak_before_bytes": cgroup_before.peak_bytes,
                     "cgroup_peak_after_bytes": cgroup_after.peak_bytes,
                     "cgroup_source": cgroup_after.source,
+                    "cgroup_resident_peak_bytes": resident_peak,
+                    "cgroup_resident_source": self.disk.memory_source,
                 },
                 "disk": {
                     "used_before_bytes": used_before,
@@ -536,6 +592,7 @@ class PhaseMeter:
             elapsed_seconds=round(elapsed, 3),
             children_maxrss_after_bytes=children_after,
             cgroup_peak_after_bytes=cgroup_after.peak_bytes,
+            cgroup_resident_peak_bytes=resident_peak,
             phase_peak_used_bytes=self.disk.phase_peak_used,
         )
 
@@ -565,23 +622,36 @@ def transform_budget_bytes(resources: ResourceSettings) -> int:
 
 def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
     """Project a complete run from the measured numbers, printing every
-    formula. Time comes from the slowest representative window; disk and
-    output sizes scale with the matched-row ratio; memory takes the measured
-    child peaks scaled for larger cited-work groups, never below the
-    configured budgets."""
+    formula. Time comes from the slowest representative window; matched rows
+    and output bytes from the densest representative window (per-member
+    rates x total members), so every scaled term follows the worst window
+    rather than the sample mean; memory takes the measured child peaks
+    scaled for larger cited-work groups, never below the configured
+    budgets."""
     total = numbers["total_members"]
     sampled = max(numbers["sampled_members"], 1)
     member_scale = total / sampled
     slowest = max(numbers["window_seconds_per_member"] or [0.0])
     sample_matches = numbers["sample_confirmed_matches"]
-    projected_matches = sample_matches * member_scale
+    sample_raw = numbers["raw_output_bytes"]
+    # Densest-window rates; the sample mean is the floor when a run had no
+    # windows (never the case after sampling, but keeps the formula total).
+    matches_per_member = max(
+        numbers["window_confirmed_matches_per_member"] or [sample_matches / sampled]
+    )
+    raw_per_member = max(
+        numbers["window_raw_bytes_per_member"] or [sample_raw / sampled]
+    )
+    projected_matches = matches_per_member * total
+    projected_raw = raw_per_member * total
     row_ratio = projected_matches / sample_matches if sample_matches else member_scale
-    projected_ambiguous = numbers["sample_ambiguous_urls"] * member_scale
+    byte_ratio = projected_raw / sample_raw if sample_raw else member_scale
+    projected_ambiguous = numbers["sample_ambiguous_urls"] * row_ratio
 
     persistence_seconds = numbers["persistence_seconds"]
     persisted = numbers["persisted_bytes"]
-    derived_projected = numbers["derived_bytes"] * row_ratio
-    persistence_projected = persistence_seconds * row_ratio
+    derived_projected = numbers["derived_bytes"] * byte_ratio
+    persistence_projected = persistence_seconds * byte_ratio
     if persistence_seconds > 0 and persisted > 0:
         publication = derived_projected / (persisted / persistence_seconds)
     else:
@@ -591,14 +661,14 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         "index_preparation": float(numbers["index_preparation_seconds"]),
         "extraction": slowest * total,
         "transform": numbers["transform_seconds"] * row_ratio,
-        "compression": numbers["compression_seconds"] * row_ratio,
+        "compression": numbers["compression_seconds"] * byte_ratio,
         "persistence": persistence_projected,
         "publication": publication,
     }
     point = sum(components.values())
 
-    segments = max(numbers["segment_bytes"], numbers["raw_output_bytes"]) * row_ratio
-    raw = numbers["raw_output_bytes"] * row_ratio
+    segments = max(numbers["segment_bytes"], sample_raw) * byte_ratio
+    raw = sample_raw * byte_ratio
     fixed = numbers["fixed_work_bytes"]
     before = (
         fixed
@@ -610,9 +680,9 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
     after = (
         fixed
         + raw
-        + numbers["transform_scratch_bytes"] * row_ratio
+        + numbers["transform_scratch_bytes"] * byte_ratio
         + derived_projected
-        + numbers["compressed_output_bytes"] * row_ratio
+        + numbers["compressed_output_bytes"] * byte_ratio
     )
     disk_point = max(before, after)
 
@@ -629,21 +699,36 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
         transform_memory,
         float(numbers["legacy_child_peak_bytes"]),
     ]
-    cgroup = numbers.get("cgroup_peak_bytes")
+    cgroup = numbers.get("cgroup_resident_peak_bytes")
     if cgroup is not None:
         candidates.append(float(cgroup))
     peak_memory = max(candidates)
 
     formulas = {
         "extraction": "slowest representative window seconds per member x total members",
-        "member_scale": "total members / sampled members",
+        "member_scale": "total members / sampled members (informational)",
+        "projected_confirmed_matches": (
+            "max over representative windows of (confirmed matches / members) "
+            "x total members (the densest window, not the sample mean)"
+        ),
+        "projected_raw_output_bytes": (
+            "max over representative windows of (raw output bytes / members) "
+            "x total members"
+        ),
         "row_ratio": (
-            "projected confirmed matches / sample confirmed matches "
-            "(projected = sample x member scale; member scale when the sample matched nothing)"
+            "projected confirmed matches / sample confirmed matches; scales the "
+            "row-driven terms (transform seconds, ambiguity rows); member scale "
+            "when the sample matched nothing"
+        ),
+        "byte_ratio": (
+            "projected raw output bytes / sample raw output bytes; scales every "
+            "byte-driven term (raw, segments, scratch, derived, compressed, "
+            "compression and persistence seconds); member scale when the sample "
+            "produced no output"
         ),
         "transform": "measured transform seconds x row ratio",
-        "compression": "measured compression seconds x row ratio",
-        "persistence": "measured persistence seconds x row ratio",
+        "compression": "measured compression seconds x byte ratio",
+        "persistence": "measured persistence seconds x byte ratio",
         "publication": (
             "projected derived bytes / measured persistence bytes per second "
             "(assumes Hub uploads run at the bucket persistence rate)"
@@ -658,21 +743,26 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
             "before release = fixed work tree + staged archive + segments + "
             "AGGREGATION_TEMP_FACTOR x segments + raw outputs; after release = fixed work "
             "tree + raw outputs + transform scratch + derived + compressed outputs; "
-            "segments = max(observed temp peak, raw output bytes) x row ratio; every "
-            "output term scales by row ratio; peak = max(before, after) x DISK_UNCERTAINTY"
+            "segments = max(observed temp peak, raw output bytes) x byte ratio; every "
+            "output term scales by byte ratio; peak = max(before, after) x DISK_UNCERTAINTY"
         ),
         "memory": (
             "max(extraction child peak x GROUP_SCALE, configured extraction budget), "
             "max(transform self peak x GROUP_SCALE, DuckDB limit x (1 + PYARROW_HEADROOM)), "
-            "legacy child peak, cgroup peak; the largest wins"
+            "legacy child peak, cgroup non-reclaimable high-water mark (anon + kernel, "
+            "page cache excluded); the largest wins"
         ),
     }
     return {
         "inputs": dict(numbers),
         "member_scale": member_scale,
         "row_ratio": row_ratio,
+        "byte_ratio": byte_ratio,
+        "densest_window_matches_per_member": matches_per_member,
+        "densest_window_raw_bytes_per_member": raw_per_member,
         "slowest_window_seconds_per_member": slowest,
         "projected_confirmed_matches": projected_matches,
+        "projected_raw_output_bytes": projected_raw,
         "projected_ambiguous_urls": projected_ambiguous,
         "components_seconds": components,
         "projected_total_seconds_point": point,
@@ -691,7 +781,7 @@ def extrapolate(numbers: dict[str, Any]) -> dict[str, Any]:
             "extraction_bytes": extraction_memory,
             "transform_bytes": transform_memory,
             "legacy_bytes": numbers["legacy_child_peak_bytes"],
-            "cgroup_bytes": cgroup,
+            "cgroup_resident_bytes": cgroup,
         },
         "peak_memory_bytes": peak_memory,
         "uncertainty": {
@@ -1098,8 +1188,10 @@ def compare_arxiv_projection(
 
 @dataclass(frozen=True)
 class BenchmarkDependencies:
-    """`FullDependencies` plus the legacy path, pricing and the memory probe.
-    The publication callables are present only so the full-pipeline phases
+    """`FullDependencies` plus the legacy path, pricing and the memory probes
+    (`memory_probe` reads the cgroup peak for information; `resident_probe`
+    reads the non-reclaimable footprint the watermark thread samples). The
+    publication callables are present only so the full-pipeline phases
     duck-type; the benchmark never calls them."""
 
     events: Any
@@ -1120,6 +1212,7 @@ class BenchmarkDependencies:
     publish_pair: Callable[..., Any]
     publish_prepared: Callable[..., Any]
     verify_current: Callable[..., Any]
+    resident_probe: Callable[[], MemoryReading] = read_cgroup_resident
     stride: int = DEFAULT_STRIDE
     window: int = DEFAULT_WINDOW
     synthetic_degree: int = SYNTHETIC_DEGREE
@@ -1259,11 +1352,14 @@ def _run_summary(
     stats = run.report.stats
     elapsed = measured["elapsed_seconds"]
     references = stats["references"]
+    raw_bytes = _raw_output_bytes(run.outputs)
     return {
         "files_processed": run.report.files_processed,
-        "members": members,
+        "member_count": members,
         "elapsed_seconds": elapsed,
         "seconds_per_member": elapsed / max(members, 1),
+        "confirmed_matches_per_member": stats["confirmed_matches"] / max(members, 1),
+        "raw_bytes_per_member": raw_bytes / max(members, 1),
         "references_per_second": _rate(references, elapsed),
         "members_per_second": _rate(members, elapsed),
         "match_rate": _rate(stats["confirmed_matches"], references),
@@ -1277,7 +1373,7 @@ def _run_summary(
         ),
         "stats": dict(stats),
         "aggregation": dict(run.report.aggregation),
-        "raw_output_bytes": _raw_output_bytes(run.outputs),
+        "raw_output_bytes": raw_bytes,
         "identity_sha256": run.identity.fingerprint(),
         "children_maxrss_after_bytes": measured["memory"][
             "children_maxrss_after_bytes"
@@ -1395,10 +1491,13 @@ def run_benchmark(
     store = deps.store_factory(
         api=api, token=config.hf_token, mount_root=config.bucket_root
     )
-    disk = DiskWatermark(config.work_root)
+    disk = ResourceWatermark(config.work_root, memory_sampler=deps.resident_probe)
     disk.start()
     meter = PhaseMeter(
-        events, memory_probe=deps.memory_probe, disk=disk, work_root=config.work_root
+        events,
+        memory_probe=deps.memory_probe,
+        watermark=disk,
+        work_root=config.work_root,
     )
 
     def progress(payload: dict[str, object]) -> None:
@@ -1538,6 +1637,10 @@ def run_benchmark(
             "total_members": sampling["total_members"],
             "sampled_members": sampling["selected_members"],
             "window_seconds_per_member": [w["seconds_per_member"] for w in windows],
+            "window_confirmed_matches_per_member": [
+                w["confirmed_matches_per_member"] for w in windows
+            ],
+            "window_raw_bytes_per_member": [w["raw_bytes_per_member"] for w in windows],
             "sample_confirmed_matches": sample.report.stats["confirmed_matches"],
             "sample_ambiguous_urls": sample.report.stats["ambiguous_urls"],
             "source_transfer_seconds": phases["source_transfer"]["elapsed_seconds"],
@@ -1569,7 +1672,7 @@ def run_benchmark(
                 config.resources, bundle_bytes, workers
             ),
             "transform_budget_bytes": transform_budget_bytes(config.resources),
-            "cgroup_peak_bytes": max(cgroup_peaks) if cgroup_peaks else None,
+            "cgroup_resident_peak_bytes": disk.memory_peak,
         }
         extrapolation = extrapolate(numbers)
         pricing = fetch_pricing(deps.list_hardware)
@@ -1661,12 +1764,22 @@ def run_benchmark(
             "phases": phases,
             "measurement": {
                 "memory_source": meter.memory_source,
+                "cgroup_resident_peak_bytes": disk.memory_peak,
+                "memory_peak_source": (
+                    meter.phases["extract_sample"]["memory"]["cgroup_source"]
+                ),
+                "cgroup_peak_bytes": max(cgroup_peaks) if cgroup_peaks else None,
+                "cgroup_peak_note": (
+                    "memory.peak counts file-backed page cache and is reported for "
+                    "information only; peak_memory_bytes uses the non-reclaimable "
+                    "high-water mark and the getrusage peaks"
+                ),
                 "rusage_unit": "bytes"
                 if sys.platform.startswith("darwin")
                 else "kibibytes",
                 "disk_source": "shutil.disk_usage+tree",
-                "disk_interval_seconds": disk.interval,
-                "disk_samples": disk.samples,
+                "sample_interval_seconds": disk.interval,
+                "samples": disk.samples,
                 "disk_peak_used_bytes": disk.peak_used,
             },
             "extrapolation": extrapolation,
