@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -12,7 +11,15 @@ import pyarrow.parquet as pq
 
 from .paths import CONFIG_NAMES, CONFIG_PROVENANCES, DATASET_REPO
 
-REFERENCE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:-]*$")
+# The quoting/stringification conventions are shared with the DataCite
+# transform; the private names stay importable for compatibility.
+from .publish_common import (
+    REFERENCE_KEY_RE,
+    quote_identifier as _quote_identifier,
+    quote_path as _quote_path,
+    stringify_value as _stringify,
+)
+
 ARXIV_DOI_PREFIX = "10.48550/arXiv."
 FLAT_BATCH_ROWS = 50_000
 ROW_GROUP_SIZE = 262_144
@@ -99,12 +106,6 @@ def scan_reference_keys(valid_path: Path) -> ReferenceKeyScan:
     )
 
 
-def _stringify(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
 def flatten_valid_jsonl(
     valid_path: Path, flat_path: Path, keys: tuple[str, ...]
 ) -> int:
@@ -156,14 +157,6 @@ def flatten_valid_jsonl(
     finally:
         writer.close()
     return total
-
-
-def _quote_identifier(name: str) -> str:
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _quote_path(path: Path) -> str:
-    return "'" + str(path).replace("'", "''") + "'"
 
 
 def build_config_parquet(
