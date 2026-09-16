@@ -11,6 +11,7 @@ import hashlib
 import json
 from collections import Counter
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -53,8 +54,14 @@ from citations_pipeline.paths import (
 )
 from citations_pipeline.pipeline import PipelineConfig, PipelineError
 from citations_pipeline.publish import PublishError
+from citations_pipeline.snapshot import DownloadResult, SnapshotIdentity
 from citations_pipeline.state import read_json
 from citations_pipeline.telemetry import EventLogger
+from citations_pipeline.transfer import (
+    TransferError,
+    TransferServices,
+    fallback_download_snapshot,
+)
 
 RUN = "9" * 32
 MIRROR_RUN = "7" * 32
@@ -238,6 +245,7 @@ class FullPipelineCase:
         self.calls: list[str] = []
         self.extraction_calls = 0
         self.extraction_kwargs: dict[str, Any] = {}
+        self.fallback_kwargs: dict[str, Any] = {}
         self.bundle_calls = 0
         self.publication_calls: Counter[str] = Counter()
         self.verify_calls: list[str] = []
@@ -324,8 +332,15 @@ class FullPipelineCase:
 
     def _fallback_transfer(self, **kwargs: Any) -> ResolvedSnapshot:
         self.calls.append("fallback_transfer")
+        self.fallback_kwargs = kwargs
         assert kwargs["credential"] == "crossref-token"
         assert kwargs["paths"].prefix == self.paths.prefix
+        expected = kwargs.get("expected_snapshot_id")
+        if expected is not None and expected != "2026-07":
+            raise TransferError(
+                f"resolved Crossref snapshot 2026-07 does not match the expected "
+                f"snapshot {expected}"
+            )
         raw_prefix = f"raw-generations/2026-07-{RUN}"
         generation = self.paths.raw_generation(raw_prefix)
         generation.archive.parent.mkdir(parents=True, exist_ok=True)
@@ -612,9 +627,12 @@ def test_fallback_source_reuses_the_verified_local_archive(
 ) -> None:
     case = full_pipeline_case
     case.mirror_error = MirrorError("gone")
-    case.config = replace(case.config, crossref_token="crossref-token")
+    case.config = replace(
+        case.config, crossref_token="crossref-token", expected_snapshot_id="2026-07"
+    )
     result = run_full_pipeline(case.config, case.dependencies())
     assert "fallback_transfer" in case.calls
+    assert case.fallback_kwargs["expected_snapshot_id"] == "2026-07"
     assert result["status"] == "completed"
     assert case.extraction_kwargs["archive"] == case.paths.snapshot_local
     assert "stage_snapshot" not in [e.get("phase") for e in case.events()]
@@ -648,6 +666,56 @@ def test_expected_snapshot_mismatch_fails_before_bundle_and_extraction(
     assert case.bundle_calls == 0
     assert case.extraction_calls == 0
     assert not case.paths.snapshot_local.exists()
+
+
+def test_expected_snapshot_mismatch_fails_before_the_fallback_download(
+    full_pipeline_case: FullPipelineCase,
+) -> None:
+    """The real transfer code, with fake Crossref services: the pin is checked
+    as soon as the snapshot is resolved, before any byte is downloaded and
+    before a raw generation or transfer marker exists."""
+    case = full_pipeline_case
+    case.mirror_error = MirrorError("gone")
+    case.config = replace(
+        case.config, crossref_token="crossref-token", expected_snapshot_id="2026-06"
+    )
+    downloads: list[Path] = []
+
+    def download(session, identity, credential, part_path, resume_path, **kwargs):
+        downloads.append(part_path)
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path.write_bytes(ARCHIVE_BYTES)
+        return DownloadResult(
+            path=part_path, size=len(ARCHIVE_BYTES), sha256=sha256(ARCHIVE_BYTES)
+        )
+
+    services = TransferServices(
+        session_factory=lambda: object(),
+        preflight=lambda session, credential: None,
+        resolve=lambda session, credential: SnapshotIdentity(
+            snapshot_id="2026-07",
+            alias_url="https://api.crossref.org/snapshots/monthly/latest/all.json.tar.gz",
+            effective_url="https://example.org/signed",
+            content_length=len(ARCHIVE_BYTES),
+            etag='"etag"',
+            last_modified=None,
+            content_disposition=None,
+        ),
+        download=download,
+    )
+    deps = replace(
+        case.dependencies(),
+        fallback_transfer=partial(fallback_download_snapshot, services=services),
+    )
+    with pytest.raises(TransferError, match="2026-06.*2026-07|2026-07.*2026-06"):
+        run_full_pipeline(case.config, deps)
+    assert downloads == []
+    assert not case.paths.download_staging.exists()
+    assert not case.paths.snapshot_local.exists()
+    assert not (case.paths.prefix / "raw-generations").exists()
+    assert not case.paths.transfer_marker.exists()
+    assert case.bundle_calls == 0 and case.extraction_calls == 0
+    assert case.persisted_marker_kinds == []
 
 
 def test_expected_snapshot_match_proceeds(full_pipeline_case: FullPipelineCase) -> None:

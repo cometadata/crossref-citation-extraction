@@ -239,7 +239,8 @@ def resolve_snapshot(
 ) -> ResolvedSnapshot:
     """Resolve the Crossref snapshot from the affiliations mirror, falling
     back to the authenticated download, and pin it to `expected_snapshot_id`
-    before anything expensive happens."""
+    before anything expensive happens: the mirror result is checked here, and
+    the fallback checks the id it resolves before downloading a byte."""
     events = deps.events
     resolved: ResolvedSnapshot | None
     with events.phase("resolve_snapshot"):
@@ -266,12 +267,15 @@ def resolve_snapshot(
             source_tree_sha256=config.source_digest,
             events=events,
             run_id=config.run_id,
+            expected_snapshot_id=config.expected_snapshot_id,
         )
         events.emit(
             "snapshot_resolved",
             provenance=resolved.provenance,
             snapshot_id=resolved.snapshot_id,
         )
+    # Belt and braces for both sources; the fallback has already refused a
+    # mismatch before downloading.
     expected = config.expected_snapshot_id
     if expected is not None and resolved.snapshot_id != expected:
         raise PipelineError(

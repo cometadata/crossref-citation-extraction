@@ -80,7 +80,12 @@ def fallback_download_snapshot(
     events: Any,
     services: TransferServices | None = None,
     run_id: str | None = None,
+    expected_snapshot_id: str | None = None,
 ) -> ResolvedSnapshot:
+    """Download the current Crossref snapshot, or reuse this prefix's own
+    verified transfer of it. With `expected_snapshot_id`, the resolved
+    snapshot must carry that id; the check happens as soon as the identity
+    is known, before any byte is downloaded or any raw generation written."""
     services = services or default_transfer_services()
     run_id = run_id or uuid.uuid4().hex
     session = services.session_factory()
@@ -89,6 +94,14 @@ def fallback_download_snapshot(
         services.preflight(session, credential)
     with events.phase("resolve_crossref_snapshot"):
         identity = services.resolve(session, credential)
+        if (
+            expected_snapshot_id is not None
+            and identity.snapshot_id != expected_snapshot_id
+        ):
+            raise TransferError(
+                f"resolved Crossref snapshot {identity.snapshot_id} does not match "
+                f"the expected snapshot {expected_snapshot_id}"
+            )
 
     reusable = _reusable_own_transfer(paths, identity)
     if reusable is not None:

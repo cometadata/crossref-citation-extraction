@@ -1,11 +1,14 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from citations_pipeline.paths import PipelinePaths
 from citations_pipeline.snapshot import DownloadResult, SnapshotIdentity
 from citations_pipeline.state import utc_now
 from citations_pipeline.telemetry import EventLogger
 from citations_pipeline.transfer import (
+    TransferError,
     TransferServices,
     fallback_download_snapshot,
 )
@@ -133,3 +136,49 @@ def test_stale_marker_triggers_fresh_download(tmp_path: Path) -> None:
     )
     assert len(downloaded) == 1
     assert resolved.archive_is_local is True
+
+
+def test_expected_snapshot_mismatch_fails_before_any_download(tmp_path: Path) -> None:
+    paths = PipelinePaths.from_roots(tmp_path / "mnt", tmp_path / "work")
+    store = RecordingStore()
+    downloaded: list = []
+    lines: list[str] = []
+    with pytest.raises(TransferError, match="2026-06.*2026-07|2026-07.*2026-06"):
+        fallback_download_snapshot(
+            paths=paths,
+            store=store,
+            credential="token",
+            source_tree_sha256="c" * 64,
+            events=EventLogger(output=lines.append),
+            services=make_services(downloaded),
+            run_id=RUN,
+            expected_snapshot_id="2026-06",
+        )
+    assert downloaded == []
+    assert store.files == [] and store.jsons == []
+    assert not paths.download_staging.exists()
+    assert not paths.snapshot_local.exists()
+    assert not (paths.prefix / "raw-generations").exists()
+    events = [json.loads(line.removeprefix("PIPELINE_EVENT=")) for line in lines]
+    failed = [event for event in events if event["event"] == "phase_failed"]
+    assert failed == [
+        {**failed[0], "phase": "resolve_crossref_snapshot", "error_type": "TransferError"}
+    ]
+    assert "download_snapshot" not in [event.get("phase") for event in events]
+
+
+def test_expected_snapshot_match_downloads_normally(tmp_path: Path) -> None:
+    paths = PipelinePaths.from_roots(tmp_path / "mnt", tmp_path / "work")
+    downloaded: list = []
+    resolved = fallback_download_snapshot(
+        paths=paths,
+        store=RecordingStore(),
+        credential="token",
+        source_tree_sha256="c" * 64,
+        events=EventLogger(),
+        services=make_services(downloaded),
+        run_id=RUN,
+        expected_snapshot_id="2026-07",
+    )
+    assert len(downloaded) == 1
+    assert resolved.snapshot_id == "2026-07"
