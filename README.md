@@ -40,7 +40,10 @@ cargo build --release
 
 The binary will be at `target/release/crossref-citation-extraction`. The
 declared Rust floor is 1.87 (`rust-version` in `Cargo.toml`); `Cargo.lock` is
-pinned so that `cargo +1.87.0 check --locked` passes.
+pinned so that `cargo +1.87.0 check --locked` passes. That floor depends on
+the lockfile pins, not on `Cargo.toml` alone: a plain `cargo update` can pull
+dependency releases that need a newer compiler, so rerun
+`cargo +1.87.0 check --locked` after any lockfile change.
 
 ## Full DataCite mode
 
@@ -242,12 +245,15 @@ Ambiguity rows:
 
 `doi_matches + url_matches + arxiv_matches == confirmed_matches`. An
 unreadable archive, a member over `--max-entry-mb`, or invalid top-level JSON
-in a member is fatal; a malformed individual reference or a non-string
-searchable field is counted (`malformed_references`, `malformed_fields`) and
-the rest of the work keeps being mined. Progress goes to stdout as
-`event=phase`, `event=progress` (members, every counter, throughput,
-buffered bytes), `event=checkpoint`, `event=resource_estimate`,
-`event=identity`, `event=resume`, and `event=cleanup` lines.
+in a member is fatal; a malformed individual reference (including one nested
+too deeply for the JSON parser inside an otherwise valid member) or a
+non-string searchable field is counted (`malformed_references`,
+`malformed_fields`) and the rest of the work keeps being mined. Progress goes
+to stdout as `event=phase`, `event=progress` (members, every counter,
+throughput, buffered bytes), `event=checkpoint`, `event=resource_estimate`,
+`event=identity`, `event=resume`, and `event=cleanup` lines; the
+`phase=index_load` and `phase=aggregation` completion lines carry their own
+`elapsed_s`.
 
 ### Matching and normalization rules
 
@@ -262,7 +268,10 @@ boundary. One implementation (`src/common/identifiers.rs`) normalizes both
 the registry during the bundle build and the candidates during matching.
 
 **DOIs.** Recognized forms are the structured `DOI` field, bare `10.…`
-tokens in text, `doi:` wrappers (case-insensitive, whitespace after the
+tokens in text (a token runs to the next whitespace or the next
+`10.<registrant>/` start, so comma-joined DOIs are separate tokens; a
+DOI-shaped token longer than 1,024 bytes is counted as unmatched and never
+looked up), `doi:` wrappers (case-insensitive, whitespace after the
 colon allowed), and resolver URLs on `doi.org`, `dx.doi.org`, or
 `www.doi.org` with or without a scheme (the DOI is the resolver path,
 percent-decoded once; a query or fragment is not part of it). The canonical
@@ -602,9 +611,11 @@ pipeline by default.
    `--datacite-release` pins one; a pinned release that is incomplete fails
    rather than falling back to an older one.
 2. **Bundle** — `indexes/<release>-v2-<inventory-digest>/` is reused after
-   its pointer and every file are verified by size and digest; otherwise the
-   bundle is built in-job with `build-datacite-index`, verified, and
-   persisted as a new immutable generation with the pointer written last.
+   its pointer and every file are verified by size and digest (a transient
+   read error while copying a cached file is retried twice before the cache
+   is rejected); otherwise the bundle is built in-job with
+   `build-datacite-index`, verified, and persisted as a new immutable
+   generation with the pointer written last.
 3. **Stage** — the archive is copied to local disk while its SHA-256 is
    checked against the mirror's recorded digest.
 4. **Extract** — this crate is built in-job (`cargo build --release
@@ -617,13 +628,18 @@ pipeline by default.
    (count invariants, the arXiv projection check); production requires
    nonempty `all` results for both datasets.
 6. **Persist** — the derived generation (prepared datasets, the six raw
-   outputs as `.jsonl.zst`, the extraction report) is uploaded, read back
-   through the mount and re-hashed, and only then is
-   `_EXTRACTION_COMPLETE.json` written.
-7. **Publish** — the DataCite dataset is committed and verified, its receipt
+   outputs as `.jsonl.zst`, the extraction report, and its own copy of the
+   extraction marker) is uploaded, read back through the mount and
+   re-hashed, and only then is `_EXTRACTION_COMPLETE.json` written. Files
+   the mount does not show yet (missing, or the wrong size) are checked
+   again with backoff for about five minutes (`upload_verification_retry`
+   events) before the upload fails; a digest mismatch fails at once.
+7. **Publish** — every prepared file is hashed against its manifest locally,
+   then the DataCite dataset is committed and verified, its receipt
    journaled, then the arXiv dataset likewise.
-8. **Activate** — `_PIPELINE_COMPLETE.json` records both commits; prior
-   generations owned by this pipeline are cleaned up afterwards.
+8. **Activate** — `_PIPELINE_COMPLETE.json` records both commits; then every
+   derived and raw generation under the owned prefix other than this run's
+   is deleted.
 
 The run identity that names every reusable artifact covers the Crossref
 archive digest, the DataCite release and its inventory digest, the bundle
@@ -669,8 +685,17 @@ Retried jobs never trust a marker by existence. A valid
 `_EXTRACTION_COMPLETE.json` with an equal identity makes the job fetch every
 listed derived file, verify each size and SHA-256 against both the marker
 and the dataset manifests, and publish only what is missing; any mismatch
-is a named error, never a silent recompute. `--force` recomputes the
-reusable phases but keeps every verification.
+is a named error, never a silent recompute. When the root marker is absent
+or names another identity (a job died, or the marker upload failed, after
+the generation was uploaded), the job looks in `derived-generations/*` for a
+generation whose own `_EXTRACTION_COMPLETE.json` carries the current
+identity, names its own prefix and the resolved snapshot, lists every
+required output, and verifies file by file; the newest such generation
+passes the same reuse checks and then becomes the root marker
+(`extraction_generation_adopted`) instead of a re-extraction. Partial,
+corrupt, or mismatched generations are reported
+(`extraction_generation_rejected`) and never adopted. `--force` recomputes
+the reusable phases, never adopts, and keeps every verification.
 
 Each dataset update is one parent-SHA-guarded commit carrying its data
 files, card, and `metadata/pipeline-manifest.json`; the manifest's digest
@@ -686,9 +711,31 @@ repository head and verifies it without a new commit. Before activation, and
 before answering "no-op" to a rerun with the same identity, the current
 repository files are compared with the recorded artifacts; if they no
 longer match, the run reports a concurrent change rather than treating a
-historical commit as the current dataset. A result is a success only when
-the commit was verified and the marker written — never because a dataset
-exists or a commit request returned an id.
+historical commit as the current dataset; a failure to read the Hub during
+that check is reported as that failure, not as a concurrent change. A
+result is a success only when the commit was verified and the marker
+written — never because a dataset exists or a commit request returned an
+id.
+
+Operational limits:
+
+- **One job at a time.** Cleanup after activation deletes every derived and
+  raw generation under `crossref-datacite-citations-latest/` except the
+  current run's, including one another job may still be writing. Concurrent
+  full-pipeline jobs are unsupported.
+- **A failed `--force` run needs another `--force`.** A `--force` run that
+  published the DataCite dataset and then failed before activation leaves
+  `_PIPELINE_COMPLETE.json` naming the previous commits with the same
+  identity, so a plain rerun reports a concurrent change on the DataCite
+  repository. Rerun with `--force`: the recomputed artifact is recognized at
+  the DataCite head without a new commit, and the arXiv dataset is
+  published.
+- **The legacy pipeline cannot publish over the paired dataset.**
+  `--legacy-arxiv` checks `cometadata/crossref-arxiv-citations` before any
+  work and again at its commit's parent revision; if the repository carries
+  `metadata/pipeline-manifest.json` with `manifest_version` 2 (or the
+  manifest cannot be read), the full DataCite pipeline owns the dataset and
+  the legacy run fails instead of committing data and a card over it.
 
 ### Submitting jobs
 
@@ -697,7 +744,7 @@ hf auth login                                                     # once
 uv run submit_job.py --smoke                                      # deterministic smoke: no bucket, no secrets
 uv run submit_job.py --benchmark                                  # measure the workload, write production settings
 uv run submit_job.py --settings /tmp/datacite-production-settings.json   # full DataCite run at measured settings
-uv run submit_job.py --legacy-arxiv                               # the legacy arXiv-only pipeline
+uv run submit_job.py --legacy-arxiv                               # the legacy arXiv-only pipeline (refused once the full pipeline owns the arXiv dataset)
 uv run submit_job.py                                              # full DataCite run at the default settings
 ```
 
@@ -790,12 +837,37 @@ on the same sample and checks that every legacy `(citing, arXiv DOI)` pair is
 present in the full-mode projection, transforms the sample, compresses and
 persists the outputs to measure the persistence rate, and runs two
 synthetic stress cases (a DOI cited by 200,000 works and a shared URL cited
-by 200,000 works) that are reported but never extrapolated. It records index
-build time, references per second, match/ambiguity/arXiv/unmatched/malformed
-rates, peak resident memory (cgroup non-reclaimable memory when available,
-otherwise `rusage`), the disk high-water mark, transform and persistence
-time, and a projection of the full run driven by the densest window (never
-the sample mean), with a 25% time band and a 1.5× disk band.
+by 200,000 works) that are reported but never extrapolated; the shared-URL
+case confirms nothing by design and is recorded as a zero-citation transform
+with its ambiguity counts. The legacy comparison reuses the legacy pipeline's
+verified arXiv FST from `crossref-arxiv-citations-latest/fst/<release>-v1/`
+(read-only) when one verifies for the selected release and builds one only
+otherwise (`legacy.fst_source` is `cache` or `built`). Sampling decompresses
+the full archive a second time, in single-core Python (about an hour on the
+2026-07 snapshot); that is a known cost of the benchmark.
+
+It records index build time, references per second,
+match/ambiguity/arXiv/unmatched/malformed rates, memory, disk, transform and
+persistence time, and a projection of the full run with a 25% time band and
+a 1.5× disk band:
+
+- **Time.** Each window's extraction time minus the index load and
+  aggregation seconds its extractor logged is its variable cost; the
+  slowest window's variable cost per member × total members is the
+  extraction estimate, and the full run adds one index load (the slowest
+  measured) and one aggregation (the sample's aggregation × the row ratio,
+  never below the slowest measured). Rows and bytes follow the densest
+  window, never the sample mean.
+- **Memory.** Every extractor child's own peak resident set size
+  (`os.wait4`), scaled for larger cited-work groups and never below the
+  configured budgets, and the cgroup non-reclaimable high-water mark of the
+  phases production runs. The Rust build, the legacy index build and
+  extraction, and the stress cases are reported but never count.
+- **Disk.** The sizes of the trees the job owns under the work root (staged
+  archive, bundle copy, build, partitions, outputs, transform scratch),
+  sampled every second and at phase boundaries, never below the observed
+  high-water mark. The node filesystem's usage (`shutil.disk_usage`, which
+  includes other tenants) is recorded for context only.
 
 Readiness for a `(flavor, timeout)` requires projected peak memory ≤ 75% of
 the flavor's RAM, projected peak disk ≤ 75% of its ephemeral storage, and
@@ -872,6 +944,11 @@ cargo test --locked
 cargo build --release --locked
 cargo +1.87.0 check --locked            # the declared Rust floor; rustup toolchain install 1.87.0 if absent
 ```
+
+The 1.87 check guards the declared floor through the pins in `Cargo.lock`;
+a plain `cargo update` can move dependencies to releases that require a
+newer Rust and silently undo it, so never skip this check after touching
+the lockfile.
 
 With `CARGO_TARGET_DIR` set, `tests/test_datacite_smoke.py` builds into (and
 reuses) `target/`; without it each real-binary test builds the release
